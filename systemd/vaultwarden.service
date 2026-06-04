@@ -1,0 +1,35 @@
+[Unit]
+Description=Vaultwarden (Bitwarden-compatible) secrets vault for the SOC wall
+Documentation=https://github.com/dani-garcia/vaultwarden
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vaultwarden
+Group=vaultwarden
+EnvironmentFile=/etc/soc-display/vaultwarden.env
+ExecStart=/usr/local/bin/vaultwarden
+WorkingDirectory=/var/lib/vaultwarden
+StateDirectory=vaultwarden
+Restart=always
+RestartSec=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/vaultwarden
+# Vaultwarden listens on localhost only (see ROCKET_ADDRESS in vaultwarden.env).
+
+[Install]
+WantedBy=multi-user.target
