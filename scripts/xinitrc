@@ -1,0 +1,13 @@
+#!/bin/sh
+# Installed as the kiosk user's ~/.xinitrc — launched by `startx` on tty1.
+# Exports the project root, fixes screen geometry, then hands off to Openbox.
+
+export SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
+
+# Make sure DPMS/blanking is off even before Openbox autostart runs.
+xset s off -dpms s noblank 2>/dev/null || true
+
+# Optional: force a specific output/resolution here if auto-detect is wrong, e.g.
+#   xrandr --output HDMI-1 --mode 1920x1080
+
+exec openbox-session

@@ -1,0 +1,113 @@
+/* =========================================================================
+ * SOC kiosk — auto-login + keep-alive + auto re-login
+ * Injected into every panel page by the kiosk host (WebKit via user script,
+ * Chromium via CDP addScriptToEvaluateOnNewDocument).
+ *
+ * Placeholders ({{...}}) are substituted by host/inject.py. This bootstrap
+ * NEVER contains credentials — it only detects login state and sets up
+ * keep-alive. Credentials are delivered just-in-time:
+ *   - WebKit:   page posts window.webkit.messageHandlers.socCreds; host replies
+ *               by evaluating socLogin({user,pass}).
+ *   - Chromium: host polls window.__SOC.needLogin via CDP and evaluates
+ *               socLogin({user,pass}) when true.
+ * ========================================================================= */
+(function () {
+  if (window.__SOC && window.__SOC.installed) return;   // idempotent
+  var CFG = {
+    id:          "{{PANEL_ID}}",
+    mode:        "{{MODE}}",            // "webkit" | "chromium"
+    userSel:     "{{USER_SEL}}",
+    passSel:     "{{PASS_SEL}}",
+    submitSel:   "{{SUBMIT_SEL}}",
+    loginMarker: "{{LOGIN_MARKER}}",   // selector present ONLY on the login page
+    keepalive:   {{KEEPALIVE_JSON}}    // {strategy,intervalSec,url?,target?}
+  };
+
+  window.__SOC = { installed: true, cfg: CFG, needLogin: false, lastLogin: 0 };
+
+  // React/Vue-safe value setter (bypasses framework input shadowing).
+  function setValue(el, val) {
+    try {
+      var proto = Object.getPrototypeOf(el);
+      var desc = Object.getOwnPropertyDescriptor(proto, "value");
+      (desc && desc.set ? desc.set : function (v) { this.value = v; }).call(el, val);
+    } catch (e) { el.value = val; }
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function onLoginPage() {
+    try { return !!document.querySelector(CFG.loginMarker); }
+    catch (e) { return false; }
+  }
+
+  // Called by the host with real creds. Returns true if it submitted.
+  window.socLogin = function (creds) {
+    try {
+      var u = document.querySelector(CFG.userSel);
+      var p = document.querySelector(CFG.passSel);
+      if (!u || !p) return false;
+      setValue(u, creds.user);
+      setValue(p, creds.pass);
+      creds.pass = "";                                   // scrub ASAP
+      window.__SOC.lastLogin = Date.now();
+      window.__SOC.needLogin = false;
+      var btn = CFG.submitSel ? document.querySelector(CFG.submitSel) : null;
+      if (btn) { btn.click(); }
+      else if (u.form && u.form.requestSubmit) { u.form.requestSubmit(); }
+      else if (u.form) { u.form.submit(); }
+      return true;
+    } catch (e) { return false; }
+  };
+
+  function requestLogin(reason) {
+    // Debounce: don't hammer login within 4s of the last attempt.
+    if (Date.now() - window.__SOC.lastLogin < 4000) return;
+    window.__SOC.needLogin = true;
+    if (CFG.mode === "webkit" &&
+        window.webkit && window.webkit.messageHandlers &&
+        window.webkit.messageHandlers.socCreds) {
+      window.webkit.messageHandlers.socCreds.postMessage({ id: CFG.id, reason: reason });
+    }
+    // chromium: host polls window.__SOC.needLogin and injects socLogin().
+  }
+
+  // ---- keep-alive --------------------------------------------------------
+  function startKeepAlive() {
+    var ka = CFG.keepalive || {};
+    var ms = (ka.intervalSec || 600) * 1000;
+    if (ka.strategy === "reload") {
+      setInterval(function () { if (!onLoginPage()) location.reload(); }, ms);
+    } else if (ka.strategy === "click") {
+      setInterval(function () {
+        var t = ka.target && document.querySelector(ka.target);
+        if (t) t.click();
+      }, ms);
+    } else if (ka.strategy === "xhr") {
+      setInterval(function () {
+        try { fetch(ka.url, { credentials: "include", cache: "no-store" }).catch(function () {}); }
+        catch (e) {}
+      }, ms);
+    }
+  }
+
+  // ---- login-state watcher ----------------------------------------------
+  function check() {
+    if (onLoginPage()) requestLogin("marker");
+  }
+
+  function boot() {
+    check();                                   // initial
+    startKeepAlive();
+    try {
+      var mo = new MutationObserver(function () { check(); });
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+    // periodic safety re-check (covers SPA states the observer may miss)
+    setInterval(check, 5000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else { boot(); }
+})();

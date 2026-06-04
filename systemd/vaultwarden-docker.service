@@ -1,0 +1,19 @@
+[Unit]
+Description=Vaultwarden (Docker) secrets vault for the SOC wall
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f soc-vaultwarden
+ExecStart=/usr/bin/docker run --rm --name soc-vaultwarden \
+  --env-file /etc/soc-display/vaultwarden.env \
+  -v /var/lib/vaultwarden:/data \
+  -p 127.0.0.1:8222:8222 \
+  vaultwarden/server:latest
+ExecStop=/usr/bin/docker stop soc-vaultwarden
+
+[Install]
+WantedBy=multi-user.target

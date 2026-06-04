@@ -1,0 +1,107 @@
+# =============================================================================
+# SOC video-wall panel configuration  (TEMPLATE — edit for your environment)
+# =============================================================================
+# This is the single source of truth for the wall. The kiosk host reads it to
+# decide what to render, where to place each window, how to log in, and how to
+# keep the session alive.
+#
+# Copy this to /etc/soc-display/panels.yaml on the Pi (install.sh does it) and
+# replace the placeholder IPs / vault items / selectors with your real ones.
+#
+# For local development against the dummy panels, use config/panels.dev.yaml
+# (the Makefile `dev`/`verify` targets point there).
+# -----------------------------------------------------------------------------
+
+display:
+  # Total screen geometry. Leave `auto: true` to detect from xrandr at launch;
+  # the host divides it into a `cols` x `rows` grid. Override width/height only
+  # if auto-detection picks the wrong mode.
+  auto: true
+  width: 1920
+  height: 1080
+  cols: 2
+  rows: 2
+  gap: 0            # pixels of gap between cells (0 = seamless 2x2)
+
+panels:
+  # --- Panel 1 -------------------------------------------------------------
+  - id: p1
+    engine: webkit              # webkit (default, light) | chromium (fallback)
+    grid: [0, 0]                # [col, row]  -> top-left
+    mode: direct                # direct | tunnel
+    url: "http://192.168.1.50:3000/login"
+    vault_item: "SOC Panel 1"   # name of the Bitwarden/Vaultwarden login item
+    selectors:
+      user: "#username"
+      pass: "#password"
+      submit: "button[type=submit]"
+    # Detect "we got logged out" by the login form reappearing. If the app's
+    # login URL differs from its dashboard, you can also match on URL.
+    login_marker: "#password"   # CSS selector that only exists on the login page
+    keepalive:
+      strategy: reload          # reload | click | xhr | none
+      intervalSec: 600
+
+  # --- Panel 2 -------------------------------------------------------------
+  - id: p2
+    engine: webkit
+    grid: [1, 0]                # top-right
+    mode: direct
+    url: "http://192.168.1.60:8080/login"
+    vault_item: "SOC Panel 2"
+    selectors:
+      user: "input[name=user]"
+      pass: "input[name=pass]"
+      submit: ".login-btn"
+    login_marker: "input[name=pass]"
+    keepalive:
+      strategy: xhr
+      url: "http://192.168.1.60:8080/api/ping"
+      intervalSec: 300
+
+  # --- Panel 3 (behind the SSH jump host, reached via the autossh tunnel) ---
+  - id: p3
+    engine: chromium            # example: a Chrome-only app
+    grid: [0, 1]                # bottom-left
+    mode: tunnel
+    tunnel:
+      local_port: 19103         # autossh -L 127.0.0.1:19103:10.20.0.7:8443
+      remote_host: 10.20.0.7
+      remote_port: 8443
+    # effective_url is derived as http://127.0.0.1:19103/<path>; set the path here:
+    path: "/login"
+    scheme: "http"              # http | https (the *local* side of the tunnel)
+    vault_item: "SOC Panel 3"
+    selectors:
+      user: "#user"
+      pass: "#pw"
+      submit: "#submit"
+    login_marker: "#pw"
+    keepalive:
+      strategy: reload
+      intervalSec: 900
+
+  # --- Panel 4 -------------------------------------------------------------
+  - id: p4
+    engine: webkit
+    grid: [1, 1]                # bottom-right
+    mode: direct
+    url: "http://192.168.1.70:9000/login"
+    vault_item: "SOC Panel 4"
+    selectors:
+      user: "#email"
+      pass: "#password"
+      submit: "button.submit"
+    login_marker: "#password"
+    keepalive:
+      strategy: reload
+      intervalSec: 600
+
+# Tunnel targets (consumed by scripts/gen-autossh-args.sh to build the autossh
+# -L forwards). Keep in sync with any panel that has mode: tunnel.
+tunnel:
+  enabled: true
+  jump_host: "tunneluser@jump.example.net"
+  identity: "/etc/soc-display/keys/tunnel_ed25519"
+  # forwards are auto-derived from panels[].tunnel, but you can add extras here:
+  extra_forwards: []

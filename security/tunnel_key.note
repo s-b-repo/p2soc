@@ -1,0 +1,40 @@
+SSH JUMP-HOST TUNNEL KEY — setup & hardening
+============================================
+
+The autossh tunnel authenticates to the jump host with a dedicated, restricted
+ed25519 key. It is NOT your personal key and should only be able to forward.
+
+1) Generate the key ON THE PI (no passphrase so autossh can run unattended;
+   the key's power is limited by the restrictions in step 3):
+
+     sudo install -d -m 0700 -o socsvc -g socsvc /etc/soc-display/keys
+     sudo -u socsvc ssh-keygen -t ed25519 -N '' \
+          -C 'soc-wall-tunnel' \
+          -f /etc/soc-display/keys/tunnel_ed25519
+     sudo chmod 600 /etc/soc-display/keys/tunnel_ed25519
+
+2) Point config/panels.yaml `tunnel.identity` at that path and set
+   `tunnel.jump_host` to user@jumphost.
+
+3) On the JUMP HOST, add the public key to the tunnel account's
+   ~/.ssh/authorized_keys with restrictions so it can ONLY port-forward
+   (no shell, no agent, no X11), and ideally pin the exact forwards:
+
+     restrict,permitopen="10.20.0.7:8443",permitopen="10.20.0.5:80",\
+     command="/usr/sbin/nologin" ssh-ed25519 AAAA... soc-wall-tunnel
+
+   - `restrict` disables pty/agent/port/X11/exec, then we re-enable only
+     `permitopen` for the exact remote panels.
+   - Add one permitopen per `remote_host:remote_port` you tunnel to.
+   - `command="/usr/sbin/nologin"` ensures no interactive shell even if asked.
+
+4) First connection: StrictHostKeyChecking=accept-new (in the service) pins the
+   jump host key on first use. For stricter security, pre-populate
+   /home/socsvc/.ssh/known_hosts with the jump host key and switch to
+   StrictHostKeyChecking=yes.
+
+5) Verify from the Pi as socsvc:
+     sudo -u socsvc ssh -i /etc/soc-display/keys/tunnel_ed25519 \
+          -o StrictHostKeyChecking=accept-new user@jumphost -N \
+          -L 127.0.0.1:19103:10.20.0.7:8443
+   then `curl http://127.0.0.1:19103/...` in another terminal.

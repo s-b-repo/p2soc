@@ -1,0 +1,28 @@
+[project]
+name = "soc-kiosk-host"
+version = "1.0.0"
+description = "SOC video-wall kiosk host: renders 4 panels (WebKitGTK + Chromium fallback), injects logins from Vaultwarden, keeps sessions alive."
+requires-python = ">=3.9"
+# NOTE: PyGObject + WebKit2 come from SYSTEM packages, not pip:
+#   apt install python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+# Create the venv with --system-site-packages so `gi` is importable.
+dependencies = [
+  "PyYAML>=6.0",
+  "websocket-client>=1.6",   # Chrome DevTools Protocol (CDP) client for the chromium fallback
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "flask>=3.0",              # dummy panel server
+]
+
+[project.scripts]
+soc-kiosk-host = "host.main:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["host"]
