@@ -11,6 +11,11 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **Faster, idempotent deploy.** `install.sh` stamps `$ETC/.installed` on a
+  successful run and **skips the slow OS-package step** on re-runs (the
+  package-manager refresh + re-resolution) unless `--fresh` / `SOC_FRESH=1`.
+  `setup.py deploy` detects an existing install and **skips it automatically**,
+  offering a fresh reinstall (or force with `setup.py deploy --fresh`).
 - **Performance + robustness pass (1 GB Pi tuning).** WebKit applies `WebKitMemoryPressureSettings` on low-memory boards (per web/network-process cap + GC thresholds; webkit2gtk-4.1, no-op on 4.0; `SOC_WEBKIT_MEM_LIMIT_MB`) and disables WebGL/WebAudio/media by default — opt back in per panel with `allow_media: true`. Chromium gains `--disable-dev-shm-usage`, `--renderer-process-limit=1` (low-mem) and `--disable-3d-apis` (unless `allow_media`). The vault config note is cached as last-known-good so a boot paints even if the note is briefly unreadable. On-screen ⚙ edits write the merged config **back** into the vault note (off-thread, via `config.to_yaml()`) so it stays the source of truth. `doctor` now test-unseals the secret (catches `machine-id` drift after a re-image) and `repair` converges the sealed-secret dir + rbw pinentry.
 - **Secrets + config moved into Vaultwarden; no plaintext `.env`.** The wall
   config now lives in the vault as a `SOC Wall Config` secure-note (the source of

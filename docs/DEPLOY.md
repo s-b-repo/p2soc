@@ -18,7 +18,9 @@ sudo python3 setup.py deploy        # or run `setup.py` and pick "Deploy" from t
 
 End-to-end: OS installer → config wizard → start Vaultwarden → **seal the master
 password (one-time PIN)** → push the config + logins into the vault → `doctor`.
-Add `--clean` to wipe generated config/state first. The manual equivalent:
+Add `--clean` to wipe generated config/state first. On a box that is already
+installed, deploy **skips the slow OS-package step** (it asks first; pass
+`--fresh` to force a full reinstall). The manual equivalent:
 
 ```bash
 sudo ./install.sh                 # packages, users, /opt + /etc, systemd units, autologin
