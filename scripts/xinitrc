@@ -3,11 +3,34 @@
 # Exports the project root, fixes screen geometry, then hands off to Openbox.
 
 export SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
+ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
 
 # Make sure DPMS/blanking is off even before Openbox autostart runs.
 xset s off -dpms s noblank 2>/dev/null || true
 
 # Optional: force a specific output/resolution here if auto-detect is wrong, e.g.
 #   xrandr --output HDMI-1 --mode 1920x1080
+
+# Regenerate the Openbox placement rules for the *actual* resolution, so a
+# different monitor still gets a correct grid (only when display.auto is true).
+RES="$(xrandr --current 2>/dev/null | awk '/\*/{print $1; exit}')"
+case "$RES" in
+  [0-9]*x[0-9]*)
+    PYBIN="$SOC_ROOT/.venv/bin/python"
+    [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+    "$PYBIN" "$SOC_ROOT/scripts/gen-openbox-rc.py" \
+        --panels "${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}" \
+        --template "$SOC_ROOT/openbox/rc.xml.tmpl" \
+        --out "$HOME/.config/openbox/rc.xml" \
+        --width "${RES%x*}" --height "${RES#*x}" --if-auto \
+      || echo "[xinitrc] WARNING could not regenerate openbox rc.xml" >&2
+    ;;
+esac
 
 exec openbox-session

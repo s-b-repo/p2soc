@@ -29,7 +29,8 @@ if [ ! -f dev/run/dev-vault.json ]; then
   "SOC Dev Panel 1": {"username": "viewer1", "password": "devpass1"},
   "SOC Dev Panel 2": {"username": "viewer2", "password": "devpass2"},
   "SOC Dev Panel 3": {"username": "viewer3", "password": "devpass3"},
-  "SOC Dev Panel 4": {"username": "viewer4", "password": "devpass4"}
+  "SOC Dev Panel 4": {"username": "viewer4", "password": "devpass4"},
+  "SOC Dev VPN": {"username": "vpnuser", "password": "vpnpass"}
 }
 EOF
 fi
@@ -55,9 +56,12 @@ waitport 19102 || { echo "FAIL: tunnel forward not up"; exit 1; }
 echo "[verify] starting kiosk host"
 PYTHONPATH=kiosk-host timeout 55 "$PY" -m host.main >dev/run/host.log 2>&1 & pids+=($!)
 
-# give windows time to load + log in
-for _ in $(seq 1 22); do
-  [ "$(grep -c 'injected login' dev/run/host.log 2>/dev/null)" -ge 4 ] && break
+# give windows time to load + log in (chromium cold start can take ~10s)
+distinct_logins(){ grep -oE '\[p[0-9]+\] injected login' dev/run/host.log 2>/dev/null | sort -u | wc -l; }
+for _ in $(seq 1 35); do
+  if [ "$(distinct_logins)" -ge 4 ] && grep -q 'chromium CDP attached' dev/run/host.log 2>/dev/null; then
+    break
+  fi
   sleep 1
 done
 
@@ -67,8 +71,8 @@ echo "----- host.log -----"; grep -E "panels|tunnel|injected|chromium|WARNING|FA
 echo "--------------------"
 
 fail=0
-logins=$(grep -c "injected login" dev/run/host.log 2>/dev/null || echo 0)
-[ "$logins" -ge 4 ] && echo "PASS: all 4 panels injected login" || { echo "FAIL: only $logins/4 logins"; fail=1; }
+logins=$(distinct_logins)
+[ "$logins" -ge 4 ] && echo "PASS: all 4 panels injected login" || { echo "FAIL: only $logins/4 panels logged in"; fail=1; }
 grep -q "\[p2\] tunnel up" dev/run/host.log && echo "PASS: tunnel readiness gate" || { echo "FAIL: tunnel gate"; fail=1; }
 grep -q "chromium CDP attached" dev/run/host.log && echo "PASS: chromium CDP path" || { echo "FAIL: chromium CDP"; fail=1; }
 [ -s dev/run/verify.png ] && echo "PASS: screenshot dev/run/verify.png" || { echo "FAIL: no screenshot"; fail=1; }

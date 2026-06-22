@@ -22,6 +22,13 @@ display:
   cols: 2
   rows: 2
   gap: 0            # pixels of gap between cells (0 = seamless 2x2)
+  # How the grid is realised on screen:
+  #   auto    -> one window per panel on X11 (Openbox places them); on Wayland,
+  #              a single fullscreen grid window when every panel is webkit
+  #   windows -> always one OS window per panel (placed by Openbox/labwc rules)
+  #   single  -> always one fullscreen window holding the whole grid (webkit
+  #              panels only — the most robust choice, works on any compositor)
+  layout: auto
 
 panels:
   # --- Panel 1 -------------------------------------------------------------
@@ -105,3 +112,68 @@ tunnel:
   identity: "/etc/soc-display/keys/tunnel_ed25519"
   # forwards are auto-derived from panels[].tunnel, but you can add extras here:
   extra_forwards: []
+
+# VPN — one supervised tunnel, run by forti-vpn.service as root, so panels on a
+# VPN-side network can use mode: direct with their real IPs. Pick the backend
+# with `type` (default fortinet). Leave enabled: false to skip the VPN.
+#
+#   type: fortinet   (default) openfortivpn — gateway + vault_item below
+#   type: openvpn    config: /path/to/profile.ovpn  (+ vault_item for user/pass
+#                    auth, injected over OpenVPN's management socket; omit for a
+#                    certificate-only .ovpn)
+#   type: wireguard  config: /etc/wireguard/wg0.conf  (or a bare interface name;
+#                    keys live in the .conf — protect it 0600; no vault login)
+#
+# Examples for the other two backends:
+#   vpn: { enabled: true, type: openvpn,   config: "/etc/openvpn/soc.ovpn",
+#          vault_item: "SOC OpenVPN", ready_probe: "10.50.0.5:443" }
+#   vpn: { enabled: true, type: wireguard, config: "/etc/wireguard/wg0.conf",
+#          ready_probe: "10.50.0.5:443", health_check_interval: 30 }
+#
+# Fortinet (the default) logs in with the FortiGate username + password stored in
+# the vault under `vault_item`; the password is fed to openfortivpn via a pinentry
+# helper, never on the command line or disk.
+vpn:
+  enabled: false
+  type: fortinet                 # fortinet | openvpn | wireguard
+  gateway: "vpn.example.com"     # FortiGate SSL-VPN host
+  port: 443
+  vault_item: "SOC FortiGate VPN"  # Vaultwarden login (FortiGate user + password)
+  # Pin the gateway cert (recommended). Get the digest from the first connect
+  # attempt's error, or: openssl s_client -connect host:443 </dev/null \
+  #   | openssl x509 -noout -fingerprint -sha256 | sed 's/.*=//;s/://g' | tr A-Z a-z
+  trusted_cert: ""
+  realm: ""                       # FortiGate realm, if your gateway uses one
+  set_routes: true                # accept routes pushed by the gateway
+  set_dns: false                  # usually keep the local resolver
+  half_internet_routes: false     # true to avoid replacing the default route
+  # Reconnection: keep persistent at 0 (recommended). The supervisor in
+  # forti-vpn.service then owns reconnects with exponential backoff and backs
+  # off MUCH longer on auth/cert failures (rapid retries with a bad password
+  # can lock the FortiGate account). persistent > 0 instead lets openfortivpn
+  # itself reconnect blindly every N seconds.
+  persistent: 0
+  otp_from_vault: false           # true: pull a TOTP from the vault item (rbw code)
+  # Readiness probe: host:port that is reachable only once the VPN is up.
+  # The kiosk host waits on it before opening VPN-side panels (best-effort),
+  # and the VPN supervisor uses it for the liveness check below.
+  ready_probe: ""                 # e.g. "10.50.0.5:443"
+  # Liveness: every N seconds (0 = off) probe ready_probe; after
+  # health_check_failures consecutive misses, restart the VPN connection.
+  # Catches the "connected but dead tunnel" failure mode.
+  health_check_interval: 0        # e.g. 60
+  health_check_failures: 3
+  extra_args: []                  # any additional openfortivpn flags, e.g. ["-v"]
+
+# Outbound proxy for the panel browsers (corporate HTTP(S)/SOCKS proxy).
+# If the proxy requires authentication, put the username/password in a vault
+# login and name it in vault_item — the host answers the proxy's challenge in
+# memory (WebKit auth signal / Chromium DevTools), so the credentials never
+# appear in this file, on a command line, or on disk.
+# Loopback (localhost/127.0.0.1) always bypasses the proxy, so tunnels and the
+# local Vaultwarden keep working; add internal hosts to ignore_hosts.
+proxy:
+  enabled: false
+  url: "http://proxy.example.com:3128"   # http | https | socks5 ://host:port
+  vault_item: ""                         # e.g. "SOC Proxy" (blank = no auth)
+  ignore_hosts: []                       # e.g. ["*.corp.lan", "10.0.0.0/8"]

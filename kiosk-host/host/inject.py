@@ -55,3 +55,12 @@ def bootstrap_js(panel, mode: str) -> str:
 def login_call(creds: dict) -> str:
     payload = json.dumps({"user": creds.get("user", ""), "pass": creds.get("pass", "")})
     return f"try{{window.socLogin && window.socLogin({payload});}}catch(e){{}}"
+
+
+def prompt_call(msg: str) -> str:
+    """JS to show the in-page 'sign-in needed' popup."""
+    return f"try{{window.socPrompt && window.socPrompt({json.dumps(msg)});}}catch(e){{}}"
+
+
+def prompt_clear_call() -> str:
+    return "try{window.socPromptClear && window.socPromptClear();}catch(e){}"
