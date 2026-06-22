@@ -61,3 +61,9 @@ tunnel:
   jump_host: "localhost"                     # fake jump = ssh to localhost
   identity: "~/.ssh/id_ed25519"
   extra_forwards: []
+
+# Fortinet VPN is off for the standard dev run (no FortiGate on the dev box).
+# To exercise the cred-resolution + command assembly without a gateway, use
+# config/panels.vpn-dev.yaml via `make vpn-check`.
+vpn:
+  enabled: false

@@ -23,7 +23,40 @@
     keepalive:   {{KEEPALIVE_JSON}}    // {strategy,intervalSec,url?,target?}
   };
 
-  window.__SOC = { installed: true, cfg: CFG, needLogin: false, lastLogin: 0 };
+  window.__SOC = { installed: true, cfg: CFG, needLogin: false,
+                   justLoggedIn: false, lastLogin: 0 };
+
+  // Post a short reason string to the host (WebKit message handler).
+  function postMsg(s) {
+    if (CFG.mode === "webkit" &&
+        window.webkit && window.webkit.messageHandlers &&
+        window.webkit.messageHandlers.socCreds) {
+      window.webkit.messageHandlers.socCreds.postMessage(s);
+    }
+  }
+
+  // In-page popup (rendered inside the document, so it shows over the page and
+  // the user can still sign in below it — a GTK overlay would be painted over
+  // by the native webview). socPrompt(msg) shows it; socPromptClear() removes it.
+  window.socPrompt = function (msg) {
+    try {
+      var el = document.getElementById("__soc_prompt");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "__soc_prompt";
+        el.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:2147483647;" +
+          "background:#1b2b4a;color:#e7ecff;font:bold 14px/1.5 system-ui,sans-serif;" +
+          "padding:9px 14px;border-bottom:2px solid #7e96ff;text-align:center;" +
+          "box-shadow:0 2px 10px rgba(0,0,0,.5)";
+        (document.body || document.documentElement).appendChild(el);
+      }
+      el.textContent = "🔑 " + msg;
+    } catch (e) {}
+  };
+  window.socPromptClear = function () {
+    try { var el = document.getElementById("__soc_prompt"); if (el) el.remove(); }
+    catch (e) {}
+  };
 
   // React/Vue-safe value setter (bypasses framework input shadowing).
   function setValue(el, val) {
@@ -37,38 +70,62 @@
   }
 
   function onLoginPage() {
-    try { return !!document.querySelector(CFG.loginMarker); }
-    catch (e) { return false; }
+    try {
+      // configured marker if present; otherwise heuristic (a visible password
+      // field), so a panel set at the glass without selectors still works.
+      if (CFG.loginMarker) return !!document.querySelector(CFG.loginMarker);
+      return !!document.querySelector('input[type="password"]');
+    } catch (e) { return false; }
+  }
+
+  function passField() {
+    if (CFG.passSel) return document.querySelector(CFG.passSel);
+    return document.querySelector('input[type="password"]');
+  }
+
+  function userField(p) {
+    if (CFG.userSel) { var u = document.querySelector(CFG.userSel); if (u) return u; }
+    // heuristic: a visible text/email/username field, preferably before pass
+    var sel = 'input[type="email"],input[type="text"],input[name*="user" i],' +
+              'input[name*="email" i],input[id*="user" i],input[id*="email" i]';
+    var cands = document.querySelectorAll(sel), best = null;
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      if (c.type === "hidden" || c.offsetParent === null) continue;
+      if (p && (c.compareDocumentPosition(p) & Node.DOCUMENT_POSITION_FOLLOWING))
+        return c;                                        // sits before the pass field
+      if (!best) best = c;
+    }
+    return best;
   }
 
   // Called by the host with real creds. Returns true if it submitted.
   window.socLogin = function (creds) {
     try {
-      var u = document.querySelector(CFG.userSel);
-      var p = document.querySelector(CFG.passSel);
-      if (!u || !p) return false;
+      var p = passField();
+      if (!p) return false;
+      var u = userField(p);
+      if (!u) return false;
       setValue(u, creds.user);
       setValue(p, creds.pass);
       creds.pass = "";                                   // scrub ASAP
       window.__SOC.lastLogin = Date.now();
       window.__SOC.needLogin = false;
       var btn = CFG.submitSel ? document.querySelector(CFG.submitSel) : null;
+      if (!btn && p.form)
+        btn = p.form.querySelector('button[type="submit"],input[type="submit"],button');
       if (btn) { btn.click(); }
-      else if (u.form && u.form.requestSubmit) { u.form.requestSubmit(); }
-      else if (u.form) { u.form.submit(); }
+      else if (p.form && p.form.requestSubmit) { p.form.requestSubmit(); }
+      else if (p.form) { p.form.submit(); }
       return true;
     } catch (e) { return false; }
   };
 
-  function requestLogin(reason) {
+  function requestLogin() {
     // Debounce: don't hammer login within 4s of the last attempt.
     if (Date.now() - window.__SOC.lastLogin < 4000) return;
     window.__SOC.needLogin = true;
-    if (CFG.mode === "webkit" &&
-        window.webkit && window.webkit.messageHandlers &&
-        window.webkit.messageHandlers.socCreds) {
-      window.webkit.messageHandlers.socCreds.postMessage({ id: CFG.id, reason: reason });
-    }
+    postMsg("login");
     // chromium: host polls window.__SOC.needLogin and injects socLogin().
   }
 
@@ -92,8 +149,23 @@
   }
 
   // ---- login-state watcher ----------------------------------------------
+  // Track the page's login state and tell the host on each change. Reporting
+  // the non-login ("ok") state — not just an in-place form disappearing — means
+  // a login that navigates to a new page still resets the host's attempt
+  // counter and records the domain (the new page reports "ok" on load).
+  var _state = "";                     // "" | "login" | "ok"
   function check() {
-    if (onLoginPage()) requestLogin("marker");
+    var now = onLoginPage() ? "login" : "ok";
+    if (now === "login") requestLogin();
+    if (now !== _state) {
+      _state = now;
+      if (now === "ok") {
+        window.__SOC.justLoggedIn = true;
+        window.__SOC.needLogin = false;
+        postMsg("loggedin");
+        window.socPromptClear();
+      }
+    }
   }
 
   function boot() {

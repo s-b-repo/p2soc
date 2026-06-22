@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 from typing import Dict, Tuple
 
@@ -79,6 +80,15 @@ class RbwBackend:
             raise VaultError(f"vault item '{item}' has no password (or not found)")
         return user, password
 
+    def notes(self, item: str) -> str:
+        """The item's Notes field (used to hold a VPN config — wg .conf / .ovpn —
+        so its keys live in Vaultwarden instead of on disk). '' if empty."""
+        out = self._rbw("get", "--field", "notes", item, check=False)
+        if out:
+            return out
+        # secure-note items return the note as the main value
+        return self._rbw("get", item, check=False)
+
 
 class DevFileBackend:
     """JSON: { "Item Name": {"username": "...", "password": "..."}, ... }"""
@@ -111,6 +121,10 @@ class DevFileBackend:
             raise VaultError(f"dev vault has no item '{item}'")
         return rec.get("username", ""), rec["password"]
 
+    def notes(self, item: str) -> str:
+        rec = self._load().get(item) or {}
+        return rec.get("notes", "")
+
 
 def _make_backend():
     name = os.environ.get("SOC_VAULT_BACKEND", "rbw").lower()
@@ -129,6 +143,7 @@ class Vault:
         self.backend = _make_backend()
         self.ttl = ttl
         self._cache: Dict[str, Tuple[float, Tuple[str, str]]] = {}
+        self._lock = threading.Lock()      # creds()/prewarm run on worker threads
         self._ready = False
 
     def open(self):
@@ -140,18 +155,52 @@ class Vault:
     def ready(self) -> bool:
         return self._ready
 
+    def cached(self, item: str) -> bool:
+        """True if a fresh credential is in the cache (no backend call needed)."""
+        with self._lock:
+            hit = self._cache.get(item)
+            return bool(hit and (time.time() - hit[0]) < self.ttl)
+
     def creds(self, item: str) -> dict:
-        now = time.time()
-        hit = self._cache.get(item)
-        if hit and (now - hit[0]) < self.ttl:
-            user, pw = hit[1]
-        else:
-            user, pw = self.backend.get(item)
-            self._cache[item] = (now, (user, pw))
+        with self._lock:
+            hit = self._cache.get(item)
+            if hit and (time.time() - hit[0]) < self.ttl:
+                user, pw = hit[1]
+                return {"user": user, "pass": pw}
+        # fetch outside the lock — rbw is a subprocess; don't serialise all
+        # callers (a duplicate fetch of the same item is harmless)
+        user, pw = self.backend.get(item)
+        with self._lock:
+            self._cache[item] = (time.time(), (user, pw))
         return {"user": user, "pass": pw}
 
+    def prewarm(self, items, log=None) -> int:
+        """Fetch creds for many items in parallel (off the GTK thread) so each
+        panel's first login is served from cache instead of blocking the UI on
+        an rbw call. Per-item failures are logged, not raised."""
+        from concurrent.futures import ThreadPoolExecutor
+        uniq = [i for i in dict.fromkeys(items) if i]
+        if not uniq:
+            return 0
+
+        def one(it):
+            try:
+                self.creds(it)
+                return True
+            except VaultError as e:
+                if log:
+                    log(f"prewarm '{it}': {e}")
+                return False
+        with ThreadPoolExecutor(max_workers=min(4, len(uniq))) as ex:
+            return sum(1 for r in ex.map(one, uniq) if r)
+
+    def notes(self, item: str) -> str:
+        """Fetch the item's Notes field (not cached — read once at connect)."""
+        return self.backend.notes(item)
+
     def invalidate(self, item: str = None):
-        if item:
-            self._cache.pop(item, None)
-        else:
-            self._cache.clear()
+        with self._lock:
+            if item:
+                self._cache.pop(item, None)
+            else:
+                self._cache.clear()

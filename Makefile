@@ -13,7 +13,7 @@ help:  ## show this help
 .venv:  ## create the venv (system-site-packages for PyGObject/WebKit)
 	python3 -m venv --system-site-packages .venv
 	$(PIP) install -q --upgrade pip
-	$(PIP) install -q PyYAML websocket-client pytest
+	$(PIP) install -q PyYAML websocket-client pytest cryptography
 
 .PHONY: venv
 venv: .venv  ## alias for creating the venv
@@ -25,7 +25,8 @@ dev-vault:  ## write dev/run/dev-vault.json (dev vault backend, no server needed
 	  '  "SOC Dev Panel 1": {"username": "viewer1", "password": "devpass1"},' \
 	  '  "SOC Dev Panel 2": {"username": "viewer2", "password": "devpass2"},' \
 	  '  "SOC Dev Panel 3": {"username": "viewer3", "password": "devpass3"},' \
-	  '  "SOC Dev Panel 4": {"username": "viewer4", "password": "devpass4"}' \
+	  '  "SOC Dev Panel 4": {"username": "viewer4", "password": "devpass4"},' \
+	  '  "SOC Dev VPN": {"username": "vpnuser", "password": "vpnpass"}' \
 	  '}' > dev/run/dev-vault.json
 	@echo "wrote dev/run/dev-vault.json"
 
@@ -49,20 +50,45 @@ dev: .venv dev-vault  ## run the wall in a Xephyr window (interactive; Ctrl-C to
 verify: .venv dev-vault  ## headless end-to-end check (Xvfb) — asserts logins + tunnel + screenshot
 	bash dev/verify.sh
 
+.PHONY: verify-single
+verify-single: .venv dev-vault  ## headless check of the single-window (Wayland) layout
+	bash dev/verify-single.sh
+
+.PHONY: verify-proxy
+verify-proxy: .venv dev-vault  ## headless check of the authenticated-proxy path
+	bash dev/verify-proxy.sh
+
 .PHONY: test
 test: .venv  ## run unit tests (no display needed)
 	cd kiosk-host && ../$(PY) -m pytest tests/ -q
+
+.PHONY: verify-vpn
+verify-vpn: .venv  ## behavioral check of all 3 VPN backends (fortinet/openvpn/wireguard) with fake clients
+	bash dev/verify-vpn.sh
+
+.PHONY: vpn-check
+vpn-check: .venv dev-vault  ## dry-run the Fortinet VPN: resolve creds + print the openfortivpn command (no connect)
+	SOC_PANELS_FILE=config/panels.vpn-dev.yaml SOC_VAULT_BACKEND=dev \
+	  SOC_DEV_VAULT=dev/run/dev-vault.json SOC_VPN_DRY_RUN=1 \
+	  PYTHONPATH=kiosk-host $(PY) scripts/forti-vpn-connect.py
+	@echo "--- non-secret args (forti-vpn-args.py) ---"
+	@SOC_PANELS_FILE=config/panels.vpn-dev.yaml PYTHONPATH=kiosk-host $(PY) scripts/forti-vpn-args.py
 
 .PHONY: gen-openbox
 gen-openbox: .venv  ## render openbox rc.xml from config/panels.yaml
 	$(PY) scripts/gen-openbox-rc.py --panels config/panels.yaml \
 	  --template openbox/rc.xml.tmpl --out dev/run/openbox/rc.xml --width 1920 --height 1080
 
+.PHONY: gen-labwc
+gen-labwc: .venv  ## render labwc rc.xml (Wayland) from config/panels.yaml
+	$(PY) scripts/gen-labwc-rc.py --panels config/panels.yaml \
+	  --template labwc/rc.xml.tmpl --out dev/run/labwc/rc.xml
+
 .PHONY: lint
 lint: .venv  ## syntax-check shell + python
 	@bash -n install.sh && echo "install.sh: ok"
 	@for s in scripts/*.sh dev/*.sh; do bash -n "$$s" && echo "$$s: ok"; done
-	@$(PY) -m py_compile kiosk-host/host/*.py scripts/*.py dev/*.py && echo "python: ok"
+	@$(PY) -m py_compile setup.py kiosk-host/host/*.py scripts/*.py dev/*.py && echo "python: ok"
 
 .PHONY: install
 install:  ## install on the Pi (run as root)

@@ -16,9 +16,14 @@ dummy panels — no Pi or real infrastructure required.
 | `make venv` | create the venv (`--system-site-packages` for PyGObject/WebKit) |
 | `make dev-vault` | write `dev/run/dev-vault.json` (dev vault backend; no server) |
 | `make verify` | **headless** end-to-end: dummy panels + host under Xvfb; asserts logins, tunnel gate, Chromium CDP; writes `dev/run/verify.png` |
+| `make verify-single` | **headless** check of the single-window (Wayland) layout — all panels in one fullscreen grid window |
+| `make verify-proxy` | **headless** check of the authenticated-proxy path: panels reach unresolvable hostnames *only* via the dev auth-proxy, exercising WebKit + Chromium vault-backed proxy auth and the loopback bypass |
+| `make vpn-check` | dry-run the Fortinet VPN: resolve vault creds + print the openfortivpn command (no connect; password never shown) |
+| `make verify-vpn` | behavioral check of **all three** VPN backends (fortinet/openvpn/wireguard) with fake clients: log classification, mgmt-socket creds, config-from-vault, connect/reconnect |
+| `make gen-labwc` / `make gen-openbox` | render the Wayland/X11 window-placement rules from `config/panels.yaml` |
 | `make dev` | **interactive**: the wall in a Xephyr window (Openbox if installed) |
 | `make vault` | start Vaultwarden in Docker, register an account, seed via API, verify `rbw` reads it |
-| `make test` | unit tests (geometry, injection escaping, vault backend) |
+| `make test` | unit tests (geometry, injection escaping, vault, config validation, VPN supervisor, proxy, perf, WM generators) |
 | `make lint` | `bash -n` + `py_compile` everything |
 | `make clean` / `make distclean` | stop dev procs / also remove venv + Docker container |
 
@@ -60,6 +65,9 @@ Both engines inject the same `inject/login.js.tmpl` bootstrap (rendered by
 | `SOC_DEV_VAULT` | path to the dev vault JSON |
 | `SOC_CHROMIUM_NO_SANDBOX=1` | **dev only** — Chromium can't sandbox in some CI envs |
 | `SOC_LAUNCH_STAGGER` / `SOC_READY_TIMEOUT` | launch pacing / readiness gate |
+| `SOC_LAYOUT` | force `windows`/`single` (the session scripts set this; e.g. cage uses `single`) |
+| `SOC_LOW_MEMORY` / `SOC_WEBKIT_HWACCEL` | force the low-memory profile / WebKit GPU policy (default auto-detected) |
+| `SOC_COMPOSITOR` | force a specific Wayland compositor (e.g. `cage`, `sway`) |
 | `SOC_DRY_RUN=1` | print the resolved plan (engines, URLs, geometry) and exit |
 
 ## Gotchas

@@ -45,7 +45,8 @@ cat > dev/run/dev-vault.json <<'EOF'
   "SOC Dev Panel 1": {"username": "viewer1", "password": "devpass1"},
   "SOC Dev Panel 2": {"username": "viewer2", "password": "devpass2"},
   "SOC Dev Panel 3": {"username": "viewer3", "password": "devpass3"},
-  "SOC Dev Panel 4": {"username": "viewer4", "password": "devpass4"}
+  "SOC Dev Panel 4": {"username": "viewer4", "password": "devpass4"},
+  "SOC Dev VPN": {"username": "vpnuser", "password": "vpnpass"}
 }
 EOF
 

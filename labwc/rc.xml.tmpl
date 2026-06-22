@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SOC video-wall labwc config (TEMPLATE) — the Wayland twin of openbox/rc.xml.tmpl.
+     scripts/gen-labwc-rc.py replaces the SOC_APPS placeholder (inside
+     <windowRules> below) with per-panel placement rules and writes the result
+     to ~/.config/labwc/rc.xml (done by scripts/wayland-session.sh at login).
+
+     Placement matching:
+       identifier  = app_id (native Wayland) / WM_CLASS (XWayland, e.g. Chromium)
+       title       = window title (the host sets it to the same soc-<id> value,
+                     because one GTK process cannot set per-window app_ids)
+
+     Design: no panel/taskbar, single workspace, windows draggable, only the two
+     keybinds we want (no <default/> so labwc's stock bindings stay off). -->
+<labwc_config>
+
+  <core>
+    <!-- prefer server-side decorations so MoveTo/ResizeTo geometry is exact -->
+    <decoration>server</decoration>
+    <gap>0</gap>
+  </core>
+
+  <desktops number="1">
+    <names><name>SOC</name></names>
+  </desktops>
+
+  <focus>
+    <followMouse>no</followMouse>
+    <raiseOnFocus>no</raiseOnFocus>
+  </focus>
+
+  <theme>
+    <titlebar layout="icon:iconify,max,close"/>
+    <font place="ActiveWindow"><name>sans</name><size>9</size><weight>bold</weight></font>
+    <font place="InactiveWindow"><name>sans</name><size>9</size></font>
+  </theme>
+
+  <!-- Keep a safe close/recover shortcut; everything else stays unbound. -->
+  <keyboard>
+    <keybind key="A-F4"><action name="Close"/></keybind>
+    <keybind key="W-Tab"><action name="NextWindow"/></keybind>
+  </keyboard>
+
+  <windowRules>
+  <!-- SOC_APPS -->
+  </windowRules>
+
+</labwc_config>
