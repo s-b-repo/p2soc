@@ -27,6 +27,12 @@ def test_inode_helpers():
     assert config.inode_extra_args({}) == []
 
 
+def test_inode_script_defaults_to_bundled(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOC_ROOT", str(tmp_path))
+    assert config.inode_script({}) == str(
+        tmp_path / "vendor" / "iNode-VPN-Client" / "svpn-connect.sh")
+
+
 def test_inode_driver_classify():
     d = vpndrivers.get_driver({"type": "inode"})
     assert d.kind == "inode" and d.needs_creds({}) is True
@@ -62,7 +68,12 @@ def test_inode_config_validation():
     with pytest.raises(config.ConfigError) as e:
         config.load_str(bad, "t")
     msg = str(e.value)
-    assert "gateway" in msg and "vault_item" in msg and "config" in msg
+    assert "gateway" in msg and "vault_item" in msg
+    # config is now OPTIONAL (defaults to the bundled client) — valid without it
+    nocfg = ("vpn: {enabled: true, type: inode, gateway: g, vault_item: I}\n"
+             "display: {cols: 1, rows: 1}\n"
+             "panels:\n  - {id: a, grid: [0,0], mode: direct, url: 'http://x/'}\n")
+    assert config.vpn_kind(config.load_str(nocfg, "t").vpn) == "inode"
 
 
 def test_inode_render_roundtrips():

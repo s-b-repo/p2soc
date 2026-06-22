@@ -153,7 +153,7 @@ backend with **`type`** (default `fortinet`):
 | `fortinet` (default) | openfortivpn | `gateway`, `port`, `vault_item`, `trusted_cert` | FortiGate user+pass from the vault, via pinentry |
 | `openvpn` | openvpn | `config` (`.ovpn` path), optional `vault_item` | user+pass over the OpenVPN management socket; or certificate-only |
 | `wireguard` | wg-quick | `config` (`.conf` path or interface name) | keys in the `.conf` (no interactive login) |
-| `inode` | H3C iNode SSL VPN (bundled `svpn-connect.sh`) | `gateway`, `port`, `vault_item`, `config` (iNode client dir), `domain`, `trusted_cert`/`insecure` | SSL-VPN user+pass from the vault, via `$H3C_SVPN_PASSWORD` (never argv) |
+| `inode` | H3C iNode SSL VPN (**bundled** in `vendor/iNode-VPN-Client`) | `gateway`, `port`, `vault_item`, optional `config` (defaults to the bundled client), `domain`, `trusted_cert`/`insecure` | SSL-VPN user+pass from the vault, via `$H3C_SVPN_PASSWORD` (never argv) |
 
 ```yaml
 # OpenVPN (username/password auth — creds injected over the management socket):
@@ -164,11 +164,12 @@ vpn: { enabled: true, type: openvpn, config: "/etc/openvpn/soc.ovpn",
 vpn: { enabled: true, type: wireguard, config: "/etc/wireguard/wg0.conf",
        ready_probe: "10.50.0.5:443", health_check_interval: 30 }
 
-# iNode (H3C SSL VPN — point config at the bundled iNode-VPN-Client dir; needs
-# tesseract for the gateway CAPTCHA and root for the TUN, which the service has):
+# iNode (H3C SSL VPN — the client is BUNDLED in vendor/iNode-VPN-Client, so no
+# `config` is needed; set it only to use a client elsewhere. Needs tesseract for
+# the gateway CAPTCHA and root for the TUN, which the service has):
 vpn: { enabled: true, type: inode, gateway: "vpn.example.com", port: 3000,
-       vault_item: "SOC iNode VPN", config: "/opt/soc-display/vendor/iNode-VPN-Client",
-       domain: "system", trusted_cert: "AA:BB:CC:...", ready_probe: "10.50.0.5:443" }
+       vault_item: "SOC iNode VPN", domain: "system",
+       trusted_cert: "AA:BB:CC:...", ready_probe: "10.50.0.5:443" }
 ```
 
 All four share the supervisor: backoff on drops, a long hold on auth/cert

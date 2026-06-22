@@ -240,13 +240,19 @@ def inode_gateway(vpn: dict) -> str:
     return f"{host}:{int(vpn.get('port', 443) or 443)}" if host else ""
 
 
+def _bundled_inode_dir() -> str:
+    """The iNode SSL-VPN client shipped with the wall (vendor/iNode-VPN-Client),
+    under $SOC_ROOT (the Pi install) or the repo (dev)."""
+    root = os.environ.get("SOC_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(root, "vendor", "iNode-VPN-Client")
+
+
 def inode_script(vpn: dict) -> str:
-    """Resolve vpn.config (the iNode-VPN-Client directory, or a direct
-    svpn-connect.sh path) to the connect script the supervisor runs. '' when
-    unset."""
-    base = str((vpn or {}).get("config", "") or "").strip()
-    if not base:
-        return ""
+    """Resolve the connect script. vpn.config may be the iNode-VPN-Client dir or a
+    direct svpn-connect.sh path; when unset, the BUNDLED client shipped with the
+    wall (vendor/iNode-VPN-Client) is used."""
+    base = str((vpn or {}).get("config", "") or "").strip() or _bundled_inode_dir()
     base = os.path.expanduser(base)
     return base if base.endswith(".sh") else os.path.join(base, "svpn-connect.sh")
 
@@ -579,9 +585,6 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
         if not vpn.get("vault_item"):
             errs.append("vpn: type 'inode' but 'vault_item' is not set (the vault "
                         "login holding the SSL-VPN username + password)")
-        if not vpn.get("config"):
-            errs.append("vpn: type 'inode' requires 'config' = the iNode-VPN-Client "
-                        "directory (or its svpn-connect.sh path)")
         if "port" in vpn and (not _is_int(vpn["port"]) or not (0 < vpn["port"] < 65536)):
             errs.append(f"vpn.port: must be a port number (1-65535), got {vpn['port']!r}")
         if "insecure" in vpn and not isinstance(vpn["insecure"], bool):

@@ -382,6 +382,9 @@ tar -C "$SRC_DIR" \
     -cf - . | tar -C "$SOC_ROOT" -xf -
 chown -R root:root "$SOC_ROOT"
 chmod +x "$SOC_ROOT"/scripts/*.sh "$SOC_ROOT"/scripts/*.py 2>/dev/null || true
+# the bundled iNode SSL-VPN client (vendor/) — its connect script + helpers
+chmod +x "$SOC_ROOT"/vendor/iNode-VPN-Client/svpn-connect.sh \
+         "$SOC_ROOT"/vendor/iNode-VPN-Client/scripts/* 2>/dev/null || true
 
 log "Creating Python venv"
 if [ ! -x "$SOC_ROOT/.venv/bin/python" ]; then

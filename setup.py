@@ -415,7 +415,8 @@ def render_panels_yaml(cfg: dict) -> str:
             L.append(f"  gateway: {yq(v['gateway'])}")
             L.append(f"  port: {v.get('port', 443)}")
             L.append(f"  vault_item: {yq(v['vault_item'])}")
-            L.append(f"  config: {yq(v['config'])}")
+            if v.get("config"):
+                L.append(f"  config: {yq(v['config'])}")
             if v.get("domain"):
                 L.append(f"  domain: {yq(v['domain'])}")
             L.append(f"  trusted_cert: {yq(v.get('trusted_cert', ''))}")
@@ -661,9 +662,9 @@ def section_vpn(prev) -> dict:
         port = ask_int("gateway port", int(pv.get("port", 443)))
         vault_item = ask("vault item (SSL-VPN username + password)",
                          pv.get("vault_item", "SOC iNode VPN"), allow_empty=False)
-        config = ask("path to the iNode-VPN-Client dir (holds svpn-connect.sh)",
-                     pv.get("config", "/opt/soc-display/vendor/iNode-VPN-Client"),
-                     allow_empty=False)
+        note("Leave config blank to use the iNode client bundled with the wall "
+             "(vendor/iNode-VPN-Client).")
+        config = ask("iNode client dir (blank = bundled)", pv.get("config", ""))
         domain = ask("auth domain (blank if none)", pv.get("domain", ""))
         note("Self-signed gateway: pin its sha256 (AA:BB:.. form), or allow insecure.")
         trusted = ask("trusted_cert sha256 pin (blank = none)", pv.get("trusted_cert", ""))
