@@ -126,7 +126,11 @@ def build_cmd(vpn: dict, user: str, pinentry: str, otp: str = "") -> list:
 
 
 def probe_tcp(probe: str, timeout: float = 3.0) -> bool:
-    host, _, port = probe.rpartition(":")
+    host, sep, port = (probe or "").rpartition(":")
+    # Validate host:port up front: a malformed ready_probe must return False,
+    # not raise ValueError inside the health-check loop and kill it silently.
+    if not (sep and host and port.isdigit() and 0 < int(port) < 65536):
+        return False
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
             return True
@@ -147,10 +151,10 @@ class Supervisor:
         self._materialized = None       # transient VPN config file from the vault
         self.watchdog = SdWatchdog()
         self.backoff = Backoff(
-            initial=float(os.environ.get("SOC_VPN_BACKOFF_INITIAL", "5")),
-            maximum=float(os.environ.get("SOC_VPN_BACKOFF_MAX", "60")))
-        self.auth_delay = float(os.environ.get("SOC_VPN_AUTH_RETRY_DELAY", "300"))
-        self.cert_delay = float(os.environ.get("SOC_VPN_CERT_RETRY_DELAY", "300"))
+            initial=cfg.env_float("SOC_VPN_BACKOFF_INITIAL", 5.0, lo=0.1, hi=3600.0),
+            maximum=cfg.env_float("SOC_VPN_BACKOFF_MAX", 60.0, lo=0.1, hi=3600.0))
+        self.auth_delay = cfg.env_float("SOC_VPN_AUTH_RETRY_DELAY", 300.0, lo=0.0)
+        self.cert_delay = cfg.env_float("SOC_VPN_CERT_RETRY_DELAY", 300.0, lo=0.0)
         # per-attempt state, set by the reader thread
         self._tunnel_up = False
         self._saw = set()
@@ -447,7 +451,7 @@ class Supervisor:
         if self.driver.is_interface:
             return self._run_interface()
 
-        timeout = float(os.environ.get("SOC_READY_TIMEOUT", "120"))
+        timeout = cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
         needs = self.driver.needs_creds(self.vpn)
 
         # dry-run is a config check — it must work even without the binary present

@@ -76,7 +76,7 @@ def _apply_memory_pressure():
         return                                   # webkit2gtk-4.0 — feature absent
     try:
         mps = MPS.new()
-        limit = int(os.environ.get("SOC_WEBKIT_MEM_LIMIT_MB", "256"))
+        limit = cfg.env_int("SOC_WEBKIT_MEM_LIMIT_MB", 256, lo=16, hi=4096)
         if hasattr(mps, "set_memory_limit"):
             mps.set_memory_limit(limit)          # MB, per web/network process
         if hasattr(mps, "set_conservative_threshold"):
