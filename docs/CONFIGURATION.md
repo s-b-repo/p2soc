@@ -133,7 +133,7 @@ tunnel:
 
 `-L` forwards are derived automatically from every `mode: tunnel` panel.
 
-## `vpn` (Fortinet, OpenVPN, or WireGuard)
+## `vpn` (Fortinet, OpenVPN, WireGuard, or iNode)
 
 For panels that live on a network reached through a VPN, enable the `vpn`
 section. One supervised tunnel is brought up by `forti-vpn.service` (root);
@@ -145,6 +145,7 @@ backend with **`type`** (default `fortinet`):
 | `fortinet` (default) | openfortivpn | `gateway`, `port`, `vault_item`, `trusted_cert` | FortiGate user+pass from the vault, via pinentry |
 | `openvpn` | openvpn | `config` (`.ovpn` path), optional `vault_item` | user+pass over the OpenVPN management socket; or certificate-only |
 | `wireguard` | wg-quick | `config` (`.conf` path or interface name) | keys in the `.conf` (no interactive login) |
+| `inode` | H3C iNode SSL VPN (bundled `svpn-connect.sh`) | `gateway`, `port`, `vault_item`, `config` (iNode client dir), `domain`, `trusted_cert`/`insecure` | SSL-VPN user+pass from the vault, via `$H3C_SVPN_PASSWORD` (never argv) |
 
 ```yaml
 # OpenVPN (username/password auth — creds injected over the management socket):
@@ -154,14 +155,20 @@ vpn: { enabled: true, type: openvpn, config: "/etc/openvpn/soc.ovpn",
 # WireGuard (keys live in the .conf — chmod 0600 it):
 vpn: { enabled: true, type: wireguard, config: "/etc/wireguard/wg0.conf",
        ready_probe: "10.50.0.5:443", health_check_interval: 30 }
+
+# iNode (H3C SSL VPN — point config at the bundled iNode-VPN-Client dir; needs
+# tesseract for the gateway CAPTCHA and root for the TUN, which the service has):
+vpn: { enabled: true, type: inode, gateway: "vpn.example.com", port: 3000,
+       vault_item: "SOC iNode VPN", config: "/opt/soc-display/vendor/iNode-VPN-Client",
+       domain: "system", trusted_cert: "AA:BB:CC:...", ready_probe: "10.50.0.5:443" }
 ```
 
-All three share the supervisor: backoff on drops, a long hold on auth/cert
+All four share the supervisor: backoff on drops, a long hold on auth/cert
 failures, the systemd watchdog, and the `ready_probe` health check (which forces
 a reconnect when the tunnel goes stale — for WireGuard it falls back to the
 peer's last handshake age when no `ready_probe` is set). `make vpn-check`
 dry-runs any type without connecting; `make verify-vpn` behaviorally tests all
-three with fake clients.
+four with fake clients.
 
 **Keys in the vault, not on disk** (`config_from_vault: true`). By default the
 OpenVPN `.ovpn` / WireGuard `.conf` lives in a file (which holds the client

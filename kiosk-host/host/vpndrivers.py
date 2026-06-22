@@ -43,6 +43,11 @@ class Driver:
     def needs_creds(self, vpn: dict) -> bool:
         return False
 
+    def resolve_binary(self, vpn: dict) -> str:
+        """The executable to check for presence — a PATH name, or an absolute
+        path for drivers whose entrypoint is shipped with the client."""
+        return self.binary
+
     def classify(self, line: str):
         return None
 
@@ -128,10 +133,52 @@ class WireGuardDriver(Driver):
         return base[:-5] if base.endswith(".conf") else base
 
 
+class INodeDriver(Driver):
+    """H3C iNode SSL VPN, driven through the bundled headless wrapper
+    (svpn-connect.sh). A process driver like Fortinet: long-lived, classified by
+    log lines; the password is injected via the child env ($H3C_SVPN_PASSWORD),
+    never argv. vpn.config points at the iNode-VPN-Client dir (or the script)."""
+    kind = "inode"
+    binary = "svpn-connect.sh"
+    # strings emitted by the bundled clean-room h3csvpn backend (run with -v)
+    _PATTERNS = (
+        ("tunnel up:", EVENT_UP),
+        ("authentication failed", EVENT_AUTH),
+        ("incorrect username or password", EVENT_AUTH),
+        ("authentication server error", EVENT_AUTH),
+        ("certificate pin mismatch", EVENT_CERT),
+        ("certificate verify failed", EVENT_CERT),
+        ("CERTIFICATE_VERIFY_FAILED", EVENT_CERT),
+        ("disconnecting", EVENT_DOWN),
+        ("Connection reset", EVENT_DOWN),
+        ("Connection refused", EVENT_DOWN),
+    )
+
+    def needs_creds(self, vpn):
+        return True
+
+    def resolve_binary(self, vpn):
+        return cfg.inode_script(vpn) or self.binary
+
+    def build_cmd(self, vpn, user):
+        """svpn-connect.sh <gw:port> <user> [domain] [-- pin/insecure + extra].
+        The password is NOT here — the supervisor sets $H3C_SVPN_PASSWORD."""
+        cmd = [cfg.inode_script(vpn), cfg.inode_gateway(vpn), user]
+        domain = str(vpn.get("domain", "") or "").strip()
+        if domain:
+            cmd.append(domain)
+        cmd += cfg.inode_extra_args(vpn)
+        return cmd
+
+    def classify(self, line):
+        return _match(line, self._PATTERNS)
+
+
 _DRIVERS = {
     "fortinet": FortinetDriver,
     "openvpn": OpenVPNDriver,
     "wireguard": WireGuardDriver,
+    "inode": INodeDriver,
 }
 
 

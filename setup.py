@@ -395,7 +395,7 @@ def render_panels_yaml(cfg: dict) -> str:
     # vpn
     v = cfg["vpn"]
     vtype = v.get("type", "fortinet")
-    L.append("# VPN — supervised tunnel (Fortinet / OpenVPN / WireGuard), run as root")
+    L.append("# VPN — supervised tunnel (Fortinet / OpenVPN / WireGuard / iNode), run as root")
     L.append("vpn:")
     L.append(f"  enabled: {str(bool(v['enabled'])).lower()}")
     if v["enabled"]:
@@ -411,6 +411,19 @@ def render_panels_yaml(cfg: dict) -> str:
             L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
             L.append(f"  health_check_interval: {v.get('health_check_interval', 30)}")
             L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
+        elif vtype == "inode":
+            L.append(f"  gateway: {yq(v['gateway'])}")
+            L.append(f"  port: {v.get('port', 443)}")
+            L.append(f"  vault_item: {yq(v['vault_item'])}")
+            L.append(f"  config: {yq(v['config'])}")
+            if v.get("domain"):
+                L.append(f"  domain: {yq(v['domain'])}")
+            L.append(f"  trusted_cert: {yq(v.get('trusted_cert', ''))}")
+            L.append(f"  insecure: {str(bool(v.get('insecure', False))).lower()}")
+            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
+            L.append(f"  health_check_interval: {v.get('health_check_interval', 0)}")
+            L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
+            L.append("  extra_args: []")
         else:  # fortinet
             L.append(f"  gateway: {yq(v['gateway'])}")
             L.append(f"  port: {v['port']}")
@@ -606,12 +619,12 @@ def _fetch_cert_digest(host: str, port: int) -> str:
 
 
 def section_vpn(prev) -> dict:
-    step(4, 7, "VPN (Fortinet / OpenVPN / WireGuard)")
+    step(4, 7, "VPN (Fortinet / OpenVPN / WireGuard / iNode)")
     note("One supervised tunnel so VPN-side panels can use mode: direct.")
     pv = (prev or {}).get("vpn", {}) if prev else {}
     if not ask_bool("Enable a VPN?", bool(pv.get("enabled", False))):
         return dict(enabled=False)
-    vtype = ask_choice("VPN type", ["fortinet", "openvpn", "wireguard"],
+    vtype = ask_choice("VPN type", ["fortinet", "openvpn", "wireguard", "inode"],
                        pv.get("type", "fortinet"))
     if vtype == "openvpn":
         note("Point at an .ovpn profile (carries the server + certs).")
@@ -640,6 +653,35 @@ def section_vpn(prev) -> dict:
         return dict(enabled=True, type="wireguard", config=config,
                     ready_probe=probe, health_check_interval=hc,
                     health_check_failures=int(pv.get("health_check_failures", 3)))
+
+    if vtype == "inode":
+        note("H3C iNode SSL-VPN, driven headlessly via the bundled svpn-connect.sh.")
+        gateway = ask("iNode SSL-VPN gateway host", pv.get("gateway", "vpn.example.com"),
+                      allow_empty=False, validate=v_host)
+        port = ask_int("gateway port", int(pv.get("port", 443)))
+        vault_item = ask("vault item (SSL-VPN username + password)",
+                         pv.get("vault_item", "SOC iNode VPN"), allow_empty=False)
+        config = ask("path to the iNode-VPN-Client dir (holds svpn-connect.sh)",
+                     pv.get("config", "/opt/soc-display/vendor/iNode-VPN-Client"),
+                     allow_empty=False)
+        domain = ask("auth domain (blank if none)", pv.get("domain", ""))
+        note("Self-signed gateway: pin its sha256 (AA:BB:.. form), or allow insecure.")
+        trusted = ask("trusted_cert sha256 pin (blank = none)", pv.get("trusted_cert", ""))
+        insecure = False
+        if not trusted:
+            insecure = ask_bool("skip TLS verification (insecure — trusted LAN only)?",
+                                bool(pv.get("insecure", False)))
+        probe = ask("ready_probe host:port the host waits on (blank = none)",
+                    pv.get("ready_probe", ""),
+                    validate=lambda s: None if not s.strip() else v_hostport(s))
+        hc = ask_int("liveness check interval (s, 0 = off)",
+                     int(pv.get("health_check_interval", 60)), lo=0) if probe else 0
+        return dict(enabled=True, type="inode", gateway=gateway, port=port,
+                    vault_item=vault_item, config=config, domain=domain,
+                    trusted_cert=trusted, insecure=insecure, ready_probe=probe,
+                    health_check_interval=hc,
+                    health_check_failures=int(pv.get("health_check_failures", 3)),
+                    extra_args=[])
 
     note("openfortivpn logs in with FortiGate creds from the vault and brings up the route.")
     gateway = ask("FortiGate gateway host", pv.get("gateway", "vpn.example.com"),
