@@ -45,6 +45,7 @@ or the dev harness at the end.
 python3 setup.py              # interactive menu (Deploy / Configure / First-time setup / …)
 python3 setup.py deploy       # end-to-end: install → configure → seal PIN → creds → check
 python3 setup.py deploy --clean  # wipe generated config/state first, then deploy fresh
+python3 setup.py deploy --fresh   # force a full OS reinstall (deploy skips it if already installed)
 python3 setup.py first-run    # generate the one-time PIN + seal the master password
 python3 setup.py wizard       # just the configuration wizard
 python3 setup.py --dry-run    # show what it would write, write nothing

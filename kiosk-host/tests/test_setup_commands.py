@@ -70,3 +70,51 @@ def test_clean_state_removes(tmp_path, monkeypatch):
     assert not env.exists()
     assert not secret.exists()
     assert not state.exists()
+
+
+def _deploy_paths(m, tmp_path, backend="dev", stamped=False):
+    soc_env = tmp_path / "soc.env"
+    soc_env.write_text(f"SOC_VAULT_BACKEND={backend}\n")
+    if stamped:
+        (tmp_path / ".installed").write_text("installed")
+    return dict(mode="pi", soc_env=str(soc_env), soc_root="/nonexistent",
+                panels_installed=str(tmp_path / "none.yaml"), vw_env=str(tmp_path / "vw"),
+                secret_dir=str(tmp_path / "secret"), default_backend=backend,
+                config_vault_item="X")
+
+
+def _install_calls(calls):
+    return [c for c in calls if any("install.sh" in str(x) for x in c)]
+
+
+def test_deploy_skips_install_when_stamped(tmp_path, monkeypatch):
+    m = _setup()
+    calls = []
+    monkeypatch.setattr(m, "_run", lambda cmd, **k: (calls.append(cmd) or 0))
+    monkeypatch.setattr(m, "cmd_doctor", lambda a: 0)
+    monkeypatch.setattr(m, "ask_bool", lambda prompt, default=False, **k: False)
+    monkeypatch.setattr(m, "resolve_paths", lambda t: _deploy_paths(m, tmp_path, stamped=True))
+
+    class A:
+        target = "pi"; dry_run = False; defaults = False; section = "all"
+        clean = False; fresh = False
+
+    m.cmd_deploy(A())
+    assert _install_calls(calls) == []          # skipped: fast path
+
+
+def test_deploy_fresh_forces_install(tmp_path, monkeypatch):
+    m = _setup()
+    calls = []
+    monkeypatch.setattr(m, "_run", lambda cmd, **k: (calls.append(cmd) or 0))
+    monkeypatch.setattr(m, "cmd_doctor", lambda a: 0)
+    monkeypatch.setattr(m, "ask_bool", lambda prompt, default=False, **k: False)
+    monkeypatch.setattr(m, "resolve_paths", lambda t: _deploy_paths(m, tmp_path, stamped=True))
+
+    class A:
+        target = "pi"; dry_run = False; defaults = False; section = "all"
+        clean = False; fresh = True
+
+    m.cmd_deploy(A())
+    ic = _install_calls(calls)
+    assert ic and any("--fresh" in str(x) for x in ic[0])

@@ -1437,15 +1437,33 @@ def cmd_deploy(args) -> int:
     has_pm = (env.has_apt or _have("dnf") or _have("pacman") or _have("zypper")
               or _have("apk") or _have("xbps-install"))
 
-    # 1) OS packages + services
-    if has_pm:
-        if ask_bool("Step 1/6 — install OS packages + services (install.sh)?", True):
-            rc = _run(["./install.sh"] if env.is_root else ["sudo", "./install.sh"])
-            if rc not in (0, None):
-                err("install.sh failed — fix the error above, then re-run deploy")
-                return rc or 1
+    # 1) OS packages + services. Skip the slow package step when already installed
+    #    (much faster); offer a fresh reinstall, or force it with --fresh.
+    stamp = os.path.join(os.path.dirname(paths["soc_env"]), ".installed")
+    installed = os.path.exists(stamp) or (
+        os.path.exists(os.path.join(paths.get("soc_root", ""), ".venv"))
+        and os.path.exists(paths["panels_installed"]))
+    fresh = getattr(args, "fresh", False)
+    if fresh:
+        run_install = True
+    elif installed:
+        where = stamp if os.path.exists(stamp) else "venv + config present"
+        note(f"Step 1/6 — existing install detected ({where}).")
+        run_install = ask_bool("  reinstall from scratch (fresh)?  "
+                               "[No = skip the OS install, much faster]", False)
+        fresh = run_install
     else:
+        run_install = ask_bool("Step 1/6 — install OS packages + services (install.sh)?", True)
+    if run_install and has_pm:
+        cmd = ["./install.sh"] + (["--fresh"] if fresh else [])
+        rc = _run(cmd if env.is_root else ["sudo"] + cmd)
+        if rc not in (0, None):
+            err("install.sh failed — fix the error above, then re-run deploy")
+            return rc or 1
+    elif run_install:
         note("Step 1/6 — no known package manager; skipping OS install.")
+    else:
+        note("Step 1/6 — skipped the OS install (already installed; use --fresh to force).")
 
     # 2) configuration wizard (skip its own post-actions; deploy drives them)
     if ask_bool("Step 2/6 — configure the wall now (wizard)?", True):
@@ -1570,6 +1588,8 @@ def main():
                          "missing) | install (OS install + wizard) | creds (logins)")
     ap.add_argument("--clean", action="store_true",
                     help="deploy: wipe generated config/state first (fresh deploy)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="deploy: force a full OS reinstall even if already installed")
     ap.add_argument("--dry-run", action="store_true", help="show what would be written; write nothing")
     ap.add_argument("--defaults", action="store_true", help="accept every default (non-interactive)")
     ap.add_argument("--target", choices=["pi", "dev"], help="where to write (default: pi if root, else dev)")

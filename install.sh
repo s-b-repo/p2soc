@@ -35,6 +35,9 @@
 #   COMPOSITOR=labwc          Wayland compositor to install    (default: labwc)
 #                             (e.g. sway/cage — runtime override is SOC_COMPOSITOR)
 #   SOC_SKIP_PACKAGES=1       do not install any OS packages (deps already present)
+#   --fresh | SOC_FRESH=1     reinstall OS packages even if already installed
+#                             (a successful install stamps $ETC/.installed; re-runs
+#                             and `setup.py deploy` skip the slow package step)
 #   SOC_ROOT=/opt/soc-display
 # =============================================================================
 set -euo pipefail
@@ -48,7 +51,11 @@ SVC_USER="${SVC_USER:-socsvc}"
 COMPOSITOR="${COMPOSITOR:-labwc}"
 SKIP_PACKAGES="${SOC_SKIP_PACKAGES:-0}"
 DEPS_ONLY=0
-for _a in "$@"; do [ "$_a" = "--deps-only" ] && DEPS_ONLY=1; done
+FRESH="${SOC_FRESH:-0}"
+for _a in "$@"; do
+  [ "$_a" = "--deps-only" ] && DEPS_ONLY=1
+  [ "$_a" = "--fresh" ] && FRESH=1
+done
 SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
 ETC="/etc/soc-display"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -276,6 +283,17 @@ install_x_server(){   # honour an existing X.Org/XLibre; else install one
    Install X.Org or XLibre for your distro by hand, then re-run with
    SOC_SKIP_PACKAGES=1 — or use SESSION=wayland to skip X entirely."
 }
+
+# Fast re-runs: an existing install (the install stamp is present) skips the OS
+# package step unless --fresh / SOC_FRESH=1. The slow part is the package-manager
+# metadata refresh + re-resolution; the deploy/config/service steps below still
+# run (they are idempotent and pick up code changes).
+if [ "$FRESH" != "1" ] && [ "$SKIP_PACKAGES" != "1" ] && [ "$DEPS_ONLY" != "1" ] \
+   && [ -f "$ETC/.installed" ]; then
+  log "Existing install detected ($ETC/.installed) — skipping OS package install"
+  log "  (pass --fresh or SOC_FRESH=1 to reinstall/upgrade packages)"
+  SKIP_PACKAGES=1
+fi
 
 log "Refreshing package metadata"
 pm_refresh
@@ -524,6 +542,12 @@ if [ "$HARDEN" = "1" ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# Stamp a successful full install so re-runs + `setup.py deploy` can fast-path
+# the package step (skip unless --fresh).
+printf 'installed=%s arch=%s session=%s\n' \
+  "$(date -Is 2>/dev/null || date 2>/dev/null || echo unknown)" "$ARCH" "$SESSION" \
+  > "$ETC/.installed" 2>/dev/null || true
+
 cat <<EOF
 
 $(printf '\033[32mInstall complete.\033[0m')  Next steps:
