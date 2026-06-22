@@ -35,6 +35,9 @@ def test_inode_driver_classify():
     assert d.classify("incorrect username or password ...") == "auth"
     assert d.classify("certificate pin mismatch: peer=x") == "cert"
     assert d.classify("[+] disconnecting...") == "down"
+    assert d.classify("heartbeat: no response, going offline") == "down"
+    assert d.classify("gateway forced log-off (type=4)") == "down"
+    assert d.classify("TunnelClosed: tunnel socket closed") == "down"
     assert d.classify("just chatter") is None
 
 

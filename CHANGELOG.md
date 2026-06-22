@@ -11,6 +11,11 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **iNode auto-reconnect.** The supervisor classifies iNode's keepalive heartbeat
+  death ("going offline"), a forced log-off, and socket close as a disconnect and
+  reconnects — the same liveness logic as the iNode client itself (which exits on
+  a dead tunnel rather than reconnecting). The SSL-VPN self-heals with no
+  `ready_probe` required; covered by a reconnect case in `make verify-vpn`.
 - **VPN configurable from the on-screen ⚙ Settings.** A new **VPN** tab edits the
   supervised VPN (type incl. iNode, gateway, vault item, config, domain, cert pin,
   ready-probe); Apply persists it (overrides + the vault config note) and restarts

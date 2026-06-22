@@ -176,7 +176,9 @@ failures, the systemd watchdog, and the `ready_probe` health check (which forces
 a reconnect when the tunnel goes stale — for WireGuard it falls back to the
 peer's last handshake age when no `ready_probe` is set). `make vpn-check`
 dry-runs any type without connecting; `make verify-vpn` behaviorally tests all
-four with fake clients.
+four with fake clients. iNode self-detects a dead tunnel via its keepalive
+heartbeat (~30 s × 5 misses), a forced log-off, or a socket close and exits, so
+the supervisor reconnects it automatically — no `ready_probe` required.
 
 **Keys in the vault, not on disk** (`config_from_vault: true`). By default the
 OpenVPN `.ovpn` / WireGuard `.conf` lives in a file (which holds the client
