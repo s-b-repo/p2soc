@@ -170,7 +170,7 @@ Then finish setup (the installer prints this):
 
 1. `‎/etc/soc-display/panels.yaml` — your 4 panels (IPs, ports, **selectors**, `vault_item`, tunnel).
 2. `‎/etc/soc-display/soc.env` — email, url, `SOC_SESSION` (**non-secret**; `chmod 0640`).
-3. `‎/etc/soc-display/vaultwarden.env` — `ADMIN_TOKEN` (`vaultwarden hash`).
+3. Vaultwarden's config is in its systemd unit (no `.env`); the `/admin` page is off.
 4. `systemctl start vaultwarden`, create the kiosk account in the web vault, add
    the 4 logins **named to match each `vault_item`**.
 5. `sudo python3 setup.py first-run` — generate the **one-time PIN** + seal the

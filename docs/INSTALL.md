@@ -68,7 +68,7 @@ be changed there any time.
 
 > Easiest path: after the installer, run the guided wizard
 > `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
-> `vaultwarden.env` interactively (display/panels/tunnel/VPN/proxy/vault/server).
+> the config interactively (Vaultwarden's own config is in its systemd unit).
 
 ## 3. Configure (the installer prints this list)
 
@@ -77,7 +77,7 @@ be changed there any time.
 2. **`/etc/soc-display/soc.env`** — `SOC_VAULT_EMAIL`, `SOC_VAULT_URL`,
    `SOC_SECRET_DIR`, `SOC_CONFIG_VAULT_ITEM` (**non-secret**; `chmod 0640`). The
    master password is sealed separately — see step 4b.
-3. **`/etc/soc-display/vaultwarden.env`** — set `ADMIN_TOKEN` (`vaultwarden hash`).
+3. **Vaultwarden** — config is inline in its systemd unit (no `.env`); `/admin` off.
 
 ## 4. Create the vault + add logins
 
@@ -91,7 +91,7 @@ the kiosk account (matching `SOC_VAULT_EMAIL`), then add one **login item per
 panel, named exactly to match its `vault_item`**, with the username/password the
 panel expects. If you enabled the Fortinet VPN, also add a login named to match
 **`vpn.vault_item`** holding the FortiGate username + password. Set
-`SIGNUPS_ALLOWED=false` in `vaultwarden.env` afterwards.
+`SIGNUPS_ALLOWED=false` again afterwards (it's a systemd drop-in now — no `.env`).
 
 ## 4b. Seal the master password (no plaintext .env)
 

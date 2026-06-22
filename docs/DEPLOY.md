@@ -24,7 +24,7 @@ installed, deploy **skips the slow OS-package step** (it asks first; pass
 
 ```bash
 sudo ./install.sh                 # packages, users, /opt + /etc, systemd units, autologin
-sudo python3 setup.py             # menu → Configure (panels.yaml + soc.env + vaultwarden.env)
+sudo python3 setup.py             # menu → Configure (panels.yaml + soc.env)
 sudo python3 setup.py first-run   # one-time PIN + seal the master password
 sudo python3 setup.py doctor
 ```
@@ -43,7 +43,7 @@ The wizard writes, with input validation:
 - **`/etc/soc-display/soc.env`** — `SOC_VAULT_EMAIL/URL`, `SOC_SECRET_DIR`,
   `SOC_CONFIG_VAULT_ITEM`, `SOC_SESSION` (**non-secret**; the master password is
   sealed by `setup.py first-run`, never stored here).
-- **`/etc/soc-display/vaultwarden.env`** — `ADMIN_TOKEN`.
+- **Vaultwarden** — config inline in its systemd unit (no `.env`): localhost, signups off, `/admin` off.
 
 You can also point tiles at URLs + set their vault logins later from the
 on-screen **⚙ Settings** (top bar, optional PIN lock).

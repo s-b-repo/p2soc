@@ -11,6 +11,12 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **Vaultwarden has no `.env`.** Its server config is now inline in the systemd
+  units (`systemd/vaultwarden*.service`) — non-secret (localhost-bound, signups
+  off, websockets off) — and the `/admin` page is disabled by default (no
+  `ADMIN_TOKEN`). `vaultwarden.env` is gone (install/setup no longer write it).
+  First account: temporarily allow signups via a root-only drop-in; enable
+  `/admin` later the same way.
 - **Chromium kiosk anti-throttling.** Panels keep refreshing even when occluded or
   unfocused: added `--disable-background-timer-throttling`,
   `--disable-renderer-backgrounding`, `--disable-backgrounding-occluded-windows`

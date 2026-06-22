@@ -8,8 +8,18 @@ Wants=network-online.target
 Restart=always
 RestartSec=5
 ExecStartPre=-/usr/bin/docker rm -f soc-vaultwarden
+# Config is INLINE via -e — no .env file. All non-secret: signups off, websockets
+# off; the /admin page is OFF (no ADMIN_TOKEN). The -p binding restricts it to the
+# host's localhost; inside the container Vaultwarden binds 0.0.0.0 (its default)
+# and stores data in /data (the mounted volume).
+#
+# First account: add `-e SIGNUPS_ALLOWED=true` here once (systemctl edit), restart,
+# create it, then revert. Enable /admin: add `-e ADMIN_TOKEN=<vaultwarden hash>`.
 ExecStart=/usr/bin/docker run --rm --name soc-vaultwarden \
-  --env-file /etc/soc-display/vaultwarden.env \
+  -e ROCKET_PORT=8222 \
+  -e SIGNUPS_ALLOWED=false \
+  -e SIGNUPS_VERIFY=false \
+  -e WEBSOCKET_ENABLED=false \
   -v /var/lib/vaultwarden:/data \
   -p 127.0.0.1:8222:8222 \
   vaultwarden/server:latest

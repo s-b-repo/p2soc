@@ -407,7 +407,7 @@ install_template(){  # src dst mode owner
 }
 install_template "$SOC_ROOT/config/panels.yaml"          "$ETC/panels.yaml"      0644 "root:root"
 install_template "$SOC_ROOT/config/soc.env.example"      "$ETC/soc.env"          0640 "root:$KIOSK_USER"
-install_template "$SOC_ROOT/config/vaultwarden.env.example" "$ETC/vaultwarden.env" 0640 "root:root"
+# Vaultwarden config is inline in its systemd unit (no .env) — nothing to install.
 chmod 0750 "$ETC/keys"; chown "$SVC_USER:$SVC_USER" "$ETC/keys"
 # Host-bound sealed vault secret (master.enc / pin.enc) — owned by the kiosk user
 # (it unlocks the vault at boot), 0700. setup.py first-run/deploy seals it here.
@@ -567,7 +567,9 @@ $(printf '\033[32mInstall complete.\033[0m')  Next steps:
   3. First-time setup: python3 $SOC_ROOT/setup.py first-run
      -> generates a ONE-TIME PIN + seals the master password host-bound (no
         plaintext .env), and points rbw at pinentry-vault.py. Record the PIN.
-  3. Edit $ETC/vaultwarden.env     -> set ADMIN_TOKEN (vaultwarden hash)
+  3. Vaultwarden config is in its systemd unit (no .env). /admin is off; to create
+     the account, temporarily allow signups (systemctl edit vaultwarden ->
+     Environment=SIGNUPS_ALLOWED=true), restart, create it, then revert.
   4. Start the vault:   $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start vaultwarden" || echo "(start vaultwarden via your init)")
      Create the kiosk account in the web vault (http://<host>:8222 via SSH tunnel
      or temporarily on the LAN), add your logins named to match vault_item.
