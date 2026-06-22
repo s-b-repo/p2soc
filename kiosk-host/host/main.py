@@ -30,6 +30,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
 from . import config as cfg  # noqa: E402
+from . import perf  # noqa: E402
 from .vault import Vault, VaultError  # noqa: E402
 
 
@@ -67,12 +68,14 @@ def _port_open(host: str, port: int, timeout=1.0) -> bool:
 
 
 def wait_for_tunnels(panels, timeout: float):
-    deadline = time.time() + timeout
     tunneled = [p for p in panels if p.mode == "tunnel"]
     for p in tunneled:
         port = p.tunnel_local_port
+        if not port:                       # malformed/None tunnel — nothing to wait on
+            continue
         log(f"[{p.id}] waiting for tunnel port 127.0.0.1:{port} ...")
-        while time.time() < deadline:
+        deadline = time.time() + timeout   # per-tunnel budget — a slow first tunnel
+        while time.time() < deadline:      # must not starve the rest of the deadline
             if _port_open("127.0.0.1", port):
                 log(f"[{p.id}] tunnel up")
                 break
@@ -80,6 +83,21 @@ def wait_for_tunnels(panels, timeout: float):
         else:
             log(f"[{p.id}] WARNING tunnel port {port} never came up; "
                 f"window will show a connection error")
+
+
+def heaviest_panel(views):
+    """The panel view with the largest measurable RSS, or None if none can be
+    measured. Pure (testable) — the memory watchdog uses it to pick a recycle
+    target under pressure."""
+    best, best_rss = None, -1
+    for v in views:
+        try:
+            rss = v.mem_rss_kb()
+        except Exception:                  # noqa: BLE001 — never crash the watchdog
+            rss = None
+        if rss is not None and rss > best_rss:
+            best, best_rss = v, rss
+    return best
 
 
 def wait_for_vpn(vpn: dict, timeout: float):
@@ -246,6 +264,60 @@ class KioskHost:
         if self.wall is not None:
             self.wall.show()
             self._start_vpn_monitor()
+        self._start_mem_watch()
+
+    # ---- memory watchdog ---------------------------------------------------
+    def _start_mem_watch(self):
+        """On a 1 GB Pi a single leaking dashboard can OOM the box. Periodically
+        check MemAvailable and, under sustained pressure, recycle one panel
+        (heaviest measurable first) to reclaim memory — with hysteresis and a
+        cooldown so it can't thrash."""
+        if perf.mem_available_mb() is None:
+            return                          # not Linux/proc — nothing to watch
+        self._mem_min_mb = cfg.env_int("SOC_MEM_MIN_AVAIL_MB", 96, lo=16, hi=8192)
+        self._mem_check_sec = cfg.env_int("SOC_MEM_CHECK_SEC", 30, lo=5, hi=3600)
+        self._mem_cooldown = cfg.env_int("SOC_MEM_RECYCLE_COOLDOWN", 120, lo=10)
+        self._mem_low_streak = 0
+        self._mem_last_recycle = 0.0
+        self._mem_rr = 0
+        log(f"memory watchdog on: recycle a panel when MemAvailable < "
+            f"{self._mem_min_mb} MB (every {self._mem_check_sec}s)")
+        GLib.timeout_add_seconds(self._mem_check_sec, self._check_memory)
+
+    def _check_memory(self):
+        avail = perf.mem_available_mb()
+        if not perf.under_pressure(avail, self._mem_min_mb):
+            self._mem_low_streak = 0
+            return True
+        self._mem_low_streak += 1
+        now = time.time()
+        # need two consecutive low readings (ignore a transient dip) and respect
+        # the cooldown since the last recycle
+        if self._mem_low_streak < 2 or (now - self._mem_last_recycle) < self._mem_cooldown:
+            return True
+        view = self._pick_recycle_target()
+        if view is not None:
+            log(f"[mem] MemAvailable {avail} MB < {self._mem_min_mb} MB — "
+                f"recycling panel {view.panel.id}")
+            try:
+                view.recycle()
+            except Exception as e:          # noqa: BLE001
+                log(f"[mem] recycle of {view.panel.id} failed: {e}")
+            self._mem_last_recycle = now
+            self._mem_low_streak = 0
+        return True
+
+    def _pick_recycle_target(self):
+        """The heaviest panel with a measurable RSS (Chromium); otherwise reload
+        WebKit panels round-robin (their RSS isn't separable)."""
+        heaviest = heaviest_panel(self.panels_view)
+        if heaviest is not None:
+            return heaviest
+        if self.panels_view:
+            v = self.panels_view[self._mem_rr % len(self.panels_view)]
+            self._mem_rr += 1
+            return v
+        return None
 
     # ---- VPN status pill ---------------------------------------------------
     def _start_vpn_monitor(self):

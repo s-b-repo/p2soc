@@ -652,6 +652,41 @@ def test_vault_cache_evicts_expired(monkeypatch):
     assert "fresh" in v._cache
 
 
+def test_mem_available_and_rss(tmp_path):
+    from host import perf
+    mi = tmp_path / "meminfo"
+    mi.write_text("MemTotal:     1024000 kB\nMemAvailable:    65536 kB\nMemFree: 1 kB\n")
+    assert perf.mem_available_mb(str(mi)) == 64               # 65536 KiB -> 64 MiB
+    assert perf.mem_available_mb(str(tmp_path / "missing")) is None
+    st = tmp_path / "status"
+    st.write_text("Name:\tchromium\nVmRSS:\t  204800 kB\nThreads:\t9\n")
+    assert perf.proc_rss_kb(0, str(st)) == 204800
+    assert perf.proc_rss_kb(0, str(tmp_path / "nope")) is None
+
+
+def test_under_pressure():
+    from host import perf
+    assert perf.under_pressure(50, 96) is True
+    assert perf.under_pressure(200, 96) is False
+    assert perf.under_pressure(None, 96) is False             # unknown -> not pressure
+
+
+def test_heaviest_panel_picks_max_rss():
+    from host import main as hostmain
+
+    class FakeV:
+        def __init__(self, pid, rss):
+            self.panel = type("P", (), {"id": pid})()
+            self._rss = rss
+        def mem_rss_kb(self):
+            return self._rss
+
+    a, b, c = FakeV("a", 100), FakeV("b", None), FakeV("c", 300)
+    assert hostmain.heaviest_panel([a, b, c]) is c            # largest measurable RSS
+    assert hostmain.heaviest_panel([b]) is None               # none measurable
+    assert hostmain.heaviest_panel([]) is None
+
+
 # --------------------------------------------------------------------------- #
 # Performance profile detection (host/perf.py)
 # --------------------------------------------------------------------------- #

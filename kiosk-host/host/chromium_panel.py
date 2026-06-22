@@ -498,6 +498,25 @@ class ChromiumPanel:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()        # control loop respawns with the new URL
 
+    def mem_rss_kb(self):
+        """RSS of the Chromium process (KiB), or None if it isn't running. Note
+        Chromium's helper processes aren't summed, so this under-counts — it is a
+        relative signal for picking the heaviest panel, not an exact total."""
+        p = self.proc
+        if p and p.poll() is None:
+            return perf.proc_rss_kb(p.pid)
+        return None
+
+    def recycle(self):
+        """Reclaim memory by restarting the Chromium process; the control loop
+        respawns it with the current URL within a few seconds."""
+        self.log(f"[{self.panel.id}] recycling chromium to reclaim memory")
+        if self.cdp:
+            self.cdp.close()
+            self.cdp = None
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
     def _reap(self):
         """Terminate the Chromium child and actually wait for it, escalating to
         kill(), so shutdown doesn't orphan a half-dead process (and leak its CDP

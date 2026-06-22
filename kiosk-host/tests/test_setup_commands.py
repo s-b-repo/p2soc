@@ -142,6 +142,7 @@ def test_render_wall_unit_no_secret_and_supervised():
     # a value with spaces must be quoted as a whole assignment for systemd
     assert 'Environment="SOC_CONFIG_VAULT_ITEM=SOC Wall Config"' in unit
     assert "ExecStart=/opt/soc-display/scripts/start-session.sh" in unit
+    assert "MemoryHigh=80%" in unit and "MemoryMax=92%" in unit   # OOM guard
 
 
 def test_wall_unit_env_roundtrip(tmp_path):
