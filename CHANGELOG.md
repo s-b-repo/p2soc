@@ -11,6 +11,14 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **Chromium kiosk anti-throttling.** Panels keep refreshing even when occluded or
+  unfocused: added `--disable-background-timer-throttling`,
+  `--disable-renderer-backgrounding`, `--disable-backgrounding-occluded-windows`
+  (a 24/7 dashboard otherwise freezes its auto-refresh timers).
+- **`doctor` handles `vpn.type: inode`.** It no longer KeyErrors on an iNode VPN
+  (which mislabeled it as a config-parse failure); it now checks the iNode connect
+  script is present/executable and warns if `tesseract` (the login CAPTCHA solver)
+  is missing.
 - **iNode client bundled.** The headless H3C iNode SSL-VPN client (the clean-room
   `h3csvpn` backend + `svpn-connect.sh` + helpers) ships in `vendor/iNode-VPN-Client`
   and installs to `/opt/soc-display/vendor/…`, so `vpn.type: inode` works out of the

@@ -257,6 +257,11 @@ class ChromiumPanel:
             "--password-store=basic", "--disable-component-update",
             "--disable-background-networking", "--disable-sync",
             "--disable-breakpad", "--metrics-recording-only",
+            # 24/7 dashboard wall: keep panels refreshing even when occluded or
+            # unfocused (Chromium otherwise throttles their background timers).
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
             "--disk-cache-size=52428800",          # 50 MB cap — kind to SD cards
             "--disable-dev-shm-usage",             # /dev/shm is tiny on a 1 GB Pi
             "--disable-pinch", "--overscroll-history-navigation=0",

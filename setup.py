@@ -1078,12 +1078,24 @@ def cmd_doctor(args) -> int:
         vpn = conf.vpn or {}
         if vpn.get("enabled"):
             kind = hostcfg.vpn_kind(vpn)
-            need = {"fortinet": "openfortivpn", "openvpn": "openvpn",
-                    "wireguard": "wg-quick"}[kind]
-            d.check(f"VPN client ({kind})", lambda: (
-                ("OK", f"{need} present", "") if _have(need)
-                else ("FAIL", f"{need} not installed",
-                      f"install {need} (setup.py repair)")))
+            if kind == "inode":
+                script = hostcfg.inode_script(vpn)
+                d.check("iNode client (svpn-connect.sh)", lambda: (
+                    ("OK", script, "")
+                    if os.path.isfile(script) and os.access(script, os.X_OK)
+                    else ("FAIL", f"missing/not executable: {script}",
+                          "ship vendor/iNode-VPN-Client or set vpn.config")))
+                d.check("tesseract (iNode login CAPTCHA)", lambda: (
+                    ("OK", "on PATH", "") if _have("tesseract")
+                    else ("WARN", "not installed", "install tesseract-ocr — the "
+                          "gateway CAPTCHA cannot be auto-solved without it")))
+            else:
+                need = {"fortinet": "openfortivpn", "openvpn": "openvpn",
+                        "wireguard": "wg-quick"}[kind]
+                d.check(f"VPN client ({kind})", lambda: (
+                    ("OK", f"{need} present", "") if _have(need)
+                    else ("FAIL", f"{need} not installed",
+                          f"install {need} (setup.py repair)")))
         # autossh tunnel: the binary + the restricted key (when panels are tunneled)
         if any(p.mode == "tunnel" for p in conf.panels) and conf.tunnel.get("enabled", True):
             d.check("autossh (SSH jump-host tunnel)", lambda: (
