@@ -63,3 +63,37 @@ def test_unseal_missing_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("SOC_MACHINE_ID", "host-A")
     with pytest.raises(ss.SecretStoreError):
         ss.unseal(str(tmp_path))
+
+
+def test_is_sealed_requires_all_three_files(tmp_path, monkeypatch):
+    # A half-written seal (e.g. only master.enc present) must read as NOT sealed,
+    # so the operator re-seals instead of booting into an unrecoverable state.
+    monkeypatch.setenv("SOC_MACHINE_ID", "host-A")
+    d = str(tmp_path)
+    ss.seal("m", "12345678", d)
+    assert ss.is_sealed(d)
+    for f in ("pin.enc", "pin.hash"):
+        os.remove(os.path.join(d, f))
+        assert not ss.is_sealed(d)
+        ss.seal("m", "12345678", d)             # restore a complete seal
+        assert ss.is_sealed(d)
+
+
+def test_seal_leaves_no_tmp_files(tmp_path, monkeypatch):
+    # The staged *.tmp blobs must be os.replace()d into place, never left behind.
+    monkeypatch.setenv("SOC_MACHINE_ID", "host-A")
+    d = str(tmp_path)
+    ss.seal("m", "12345678", d)
+    assert glob.glob(os.path.join(d, "*.tmp")) == []
+    assert sorted(os.path.basename(f) for f in glob.glob(os.path.join(d, "*"))) \
+        == ["master.enc", "pin.enc", "pin.hash"]
+
+
+def test_reseal_overwrites_and_unseals(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOC_MACHINE_ID", "host-A")
+    d = str(tmp_path)
+    ss.seal("old-pw", "11111111", d)
+    ss.seal("new-pw", "22222222", d)            # re-seal with new pin
+    assert ss.unseal(d) == "new-pw"
+    assert ss.verify_pin("22222222", d)
+    assert not ss.verify_pin("11111111", d)

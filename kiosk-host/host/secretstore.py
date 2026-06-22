@@ -111,6 +111,20 @@ def _write(path: str, data: bytes):
     os.chmod(path, 0o600)
 
 
+def _write_atomic(path: str, data: bytes) -> str:
+    """Write `data` to `path`.tmp (0600, fsync'd) and return the tmp path. The
+    caller os.replace()s it into place once every blob is staged, so an
+    interrupted seal never leaves a torn file under `path`."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return tmp
+
+
 def _read(path: str) -> bytes:
     try:
         with open(path, "rb") as fh:
@@ -119,12 +133,24 @@ def _read(path: str) -> bytes:
         raise SecretStoreError(f"sealed secret not found: {path} (run setup.py)")
 
 
+_SEAL_FILES = ("pin.hash", "pin.enc", "master.enc")
+
+
 def is_sealed(d: str | None = None) -> bool:
-    return os.path.exists(os.path.join(secret_dir(d), "master.enc"))
+    """True only when a *complete* seal is present. Requiring all three files
+    (not just master.enc) means a half-written seal reads as 'not sealed' so the
+    operator re-seals instead of booting into an unrecoverable state."""
+    sd = secret_dir(d)
+    return all(os.path.exists(os.path.join(sd, f)) for f in _SEAL_FILES)
 
 
 def seal(master: str, pin: str, d: str | None = None):
-    """Seal the master password + PIN under this host. Overwrites any prior seal."""
+    """Seal the master password + PIN under this host. Overwrites any prior seal.
+
+    All three blobs are written to `*.tmp` (fsync'd) first, then os.replace()d
+    into place with master.enc — the is_sealed() sentinel — last. So an
+    interruption during a fresh seal leaves master.enc absent (is_sealed False),
+    never a torn file that looks sealed but cannot unseal."""
     if not master:
         raise SecretStoreError("refusing to seal an empty master password")
     if not pin:
@@ -136,11 +162,18 @@ def seal(master: str, pin: str, d: str | None = None):
     except OSError:
         pass
     mid = _machine_id()
-    _write(os.path.join(sd, "master.enc"), _encrypt(mid + pin.encode(), master.encode()))
-    _write(os.path.join(sd, "pin.enc"), _encrypt(mid, pin.encode()))
     salt = os.urandom(16)
-    digest = hashlib.sha256(salt + pin.encode()).hexdigest()
-    _write(os.path.join(sd, "pin.hash"), f"{salt.hex()}${digest}".encode())
+    blobs = {
+        "master.enc": _encrypt(mid + pin.encode(), master.encode()),
+        "pin.enc": _encrypt(mid, pin.encode()),
+        "pin.hash": f"{salt.hex()}${hashlib.sha256(salt + pin.encode()).hexdigest()}".encode(),
+    }
+    # stage every blob before swapping any into place
+    tmps = {name: _write_atomic(os.path.join(sd, name), data)
+            for name, data in blobs.items()}
+    # commit in dependency order; master.enc (the sentinel) goes last
+    for name in _SEAL_FILES:
+        os.replace(tmps[name], os.path.join(sd, name))
 
 
 def unseal(d: str | None = None) -> str:
