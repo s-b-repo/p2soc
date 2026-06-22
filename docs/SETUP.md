@@ -23,7 +23,7 @@ You will produce three files:
 |---|---|---|
 | `panels.yaml` | the 4 panels + `tunnel` + `vpn` | `/etc/soc-display/panels.yaml` |
 | `soc.env` | vault settings (email/url) + paths — **non-secret** | `/etc/soc-display/soc.env` |
-| `vaultwarden.env` | Vaultwarden server settings (admin token, bind) | `/etc/soc-display/vaultwarden.env` |
+| _(Vaultwarden)_ | server config inline in its systemd unit — **no `.env`** | `systemd/vaultwarden*.service` |
 
 The **interactive wizard writes all three for you**. You can also write them by
 hand from the `*.example` templates.
@@ -147,7 +147,7 @@ preserves any `/etc/soc-display/*` you already wrote.
 cd p2soc
 sudo python3 setup.py deploy     # end-to-end: install → configure → seal PIN → push config → creds → doctor
 # …or do the two main steps by hand:
-sudo python3 setup.py            # menu → Configure (panels.yaml + soc.env + vaultwarden.env)
+sudo python3 setup.py            # menu → Configure (panels.yaml + soc.env)
 sudo ./install.sh                # deps, users, /opt/soc-display, systemd units, zram, autologin
 ```
 
@@ -172,7 +172,7 @@ ssh -L 8222:127.0.0.1:8222 pi@<ip>     # then browse http://127.0.0.1:8222
 Create the kiosk account (matching `SOC_VAULT_EMAIL`), then add **one login item
 per panel, named exactly to match its `vault_item`**. If the VPN is enabled, also
 add a login named to match **`vpn.vault_item`** holding the FortiGate username +
-password. Set `SIGNUPS_ALLOWED=false` in `vaultwarden.env` afterwards.
+password. Turn signups back off afterwards (it's a systemd drop-in now — no `.env`).
 
 Then seal the master password (skip if you ran `setup.py deploy`):
 

@@ -156,9 +156,9 @@ or the process environment.
 ## Checklist before exposing anything
 
 - [ ] `ss -ltnp` shows Vaultwarden on `127.0.0.1` only and **no** extra SOC ports
-- [ ] `soc.env` (now **non-secret**) and `vaultwarden.env` are `0640`/`0600`;
+- [ ] `soc.env` (now **non-secret**) is `0640`; Vaultwarden has **no `.env`**;
       `/etc/soc-display/secret/` is `0700` (kiosk user), `*.enc` are `0600`
-- [ ] `SIGNUPS_ALLOWED=false` after the kiosk account exists; `ADMIN_TOKEN` set
+- [ ] `SIGNUPS_ALLOWED=false` after the kiosk account exists; `/admin` left off
 - [ ] tunnel key is `permitopen`-restricted on the jump host
 - [ ] if using the VPN: `vpn.trusted_cert` pins the gateway; consider
       `half_internet_routes`/`set_routes: false` so the VPN can't hijack your admin path
