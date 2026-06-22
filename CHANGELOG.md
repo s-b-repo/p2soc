@@ -232,3 +232,13 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
   across all tunnels, so a slow first tunnel consumed it and the rest were
   declared down without ever being probed; each tunnel now gets its own budget
   (and a `None`/malformed local port is skipped instead of raising).
+- **Defensive tunable parsing** — `SOC_*` numeric env vars are read via
+  `config.env_int`/`env_float`, which warn + fall back to the default and clamp
+  to a sane range on a missing/garbage value, instead of a `ValueError` that
+  crashed the host at boot. Applied to every `int()/float(os.environ)` site.
+- **`probe_tcp` validates `host:port`** and returns `False` on a malformed
+  `ready_probe` instead of raising `ValueError` inside the VPN health loop
+  (which silently killed it).
+- **Vault TTL cache evicts on access** (was append-only) so it can't grow
+  unbounded over a 24/7 run and stale credentials don't linger in RAM past TTL;
+  `_poll_vpn` skips a tick if the previous probe is still running (no thread pileup).
