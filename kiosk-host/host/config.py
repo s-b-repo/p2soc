@@ -30,7 +30,7 @@ VALID_LAYOUTS = {"auto", "windows", "single"}
 VALID_KEEPALIVE = {"reload", "click", "xhr", "none"}
 VALID_SCHEMES = {"http", "https"}
 VALID_PROXY_SCHEMES = {"http", "https", "socks", "socks4", "socks5"}
-VALID_VPN_TYPES = {"fortinet", "openvpn", "wireguard"}
+VALID_VPN_TYPES = {"fortinet", "openvpn", "wireguard", "inode"}
 
 _TOP_KEYS = {"display", "panels", "tunnel", "vpn", "proxy"}
 _DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout"}
@@ -45,7 +45,7 @@ _VPN_KEYS = {"enabled", "type", "config", "config_from_vault", "gateway", "port"
              "vault_item", "trusted_cert", "ca_file", "realm", "set_routes",
              "set_dns", "half_internet_routes", "persistent", "otp_from_vault",
              "ready_probe", "extra_args", "health_check_interval",
-             "health_check_failures"}
+             "health_check_failures", "domain", "insecure"}
 
 
 @dataclass
@@ -230,6 +230,41 @@ def wireguard_target(vpn: dict) -> str:
     """The wg-quick target: a .conf path, or a bare interface name resolved from
     /etc/wireguard/<name>.conf. Empty when not configured."""
     return str((vpn or {}).get("config", "") or "").strip()
+
+
+def inode_gateway(vpn: dict) -> str:
+    """'host:port' for the H3C iNode SSL-VPN gateway (default port 443). '' when
+    no gateway is configured."""
+    vpn = vpn or {}
+    host = str(vpn.get("gateway", "") or "").strip()
+    return f"{host}:{int(vpn.get('port', 443) or 443)}" if host else ""
+
+
+def inode_script(vpn: dict) -> str:
+    """Resolve vpn.config (the iNode-VPN-Client directory, or a direct
+    svpn-connect.sh path) to the connect script the supervisor runs. '' when
+    unset."""
+    base = str((vpn or {}).get("config", "") or "").strip()
+    if not base:
+        return ""
+    base = os.path.expanduser(base)
+    return base if base.endswith(".sh") else os.path.join(base, "svpn-connect.sh")
+
+
+def inode_extra_args(vpn: dict) -> list:
+    """The NON-secret backend args after svpn-connect.sh's '--' separator: cert
+    pin (vpn.trusted_cert) or --insecure, plus any vpn.extra_args. [] if none
+    (the username + gateway are positional; the password travels via the child
+    env $H3C_SVPN_PASSWORD, never argv)."""
+    vpn = vpn or {}
+    tail = []
+    pin = str(vpn.get("trusted_cert", "") or "").strip()
+    if pin:
+        tail += ["--pin-sha256", pin]
+    elif vpn.get("insecure"):
+        tail += ["--insecure"]
+    tail += [str(a) for a in (vpn.get("extra_args") or [])]
+    return ["--"] + tail if tail else []
 
 
 def compute_geometry(disp: DisplayCfg, grid) -> Geometry:
@@ -537,6 +572,25 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
         if vpn.get("vault_item") and not from_vault:
             warns.append("vpn: wireguard ignores vault_item unless config_from_vault "
                          "is set — otherwise its keys live in the .conf file (0600)")
+    elif kind == "inode":
+        if not vpn.get("gateway"):
+            errs.append("vpn: type 'inode' but 'gateway' is not set (the H3C "
+                        "SSL-VPN gateway host)")
+        if not vpn.get("vault_item"):
+            errs.append("vpn: type 'inode' but 'vault_item' is not set (the vault "
+                        "login holding the SSL-VPN username + password)")
+        if not vpn.get("config"):
+            errs.append("vpn: type 'inode' requires 'config' = the iNode-VPN-Client "
+                        "directory (or its svpn-connect.sh path)")
+        if "port" in vpn and (not _is_int(vpn["port"]) or not (0 < vpn["port"] < 65536)):
+            errs.append(f"vpn.port: must be a port number (1-65535), got {vpn['port']!r}")
+        if "insecure" in vpn and not isinstance(vpn["insecure"], bool):
+            errs.append(f"vpn.insecure: must be true or false, got {vpn['insecure']!r}")
+        if not vpn.get("trusted_cert") and not vpn.get("insecure"):
+            warns.append("vpn: iNode with no trusted_cert pin and insecure not set — a "
+                         "self-signed gateway will fail TLS. Pin its sha256 in "
+                         "vpn.trusted_cert (the AA:BB:.. --pin-sha256 form), or set "
+                         "insecure: true (trusted LAN only)")
 
 
 # --------------------------------------------------------------------------- #

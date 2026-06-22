@@ -11,6 +11,13 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **iNode (H3C SSL VPN) support** — new `vpn.type: inode`, driven headlessly by the
+  bundled `svpn-connect.sh`; a process driver under the same supervisor (backoff,
+  auth/cert holds, ready-probe health). Credentials come from the vault
+  (`vault_item`) and reach the client only via `$H3C_SVPN_PASSWORD` (never argv);
+  `config` points at the iNode-VPN-Client dir; `domain` + `trusted_cert`
+  (`--pin-sha256`) / `insecure` cover the gateway. Wizard + `make verify-vpn`
+  (fake client) cover it; install.sh adds tesseract for the login CAPTCHA.
 - **Faster, idempotent deploy.** `install.sh` stamps `$ETC/.installed` on a
   successful run and **skips the slow OS-package step** on re-runs (the
   package-manager refresh + re-resolution) unless `--fresh` / `SOC_FRESH=1`.

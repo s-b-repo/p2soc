@@ -357,6 +357,10 @@ class Supervisor:
                 self.vpn, user, self.pinentry,
                 otp=self._otp_code() if self.vpn.get("otp_from_vault") else "")
             env["SOC_VPN_PASSWORD"] = password
+        elif self.driver.kind == "inode":
+            user, password = creds
+            cmd = self.driver.build_cmd(self.vpn, user)
+            env["H3C_SVPN_PASSWORD"] = password   # via child env, never argv/disk
         else:  # openvpn
             if creds:
                 mgmt = self._mgmt_path()
@@ -411,6 +415,8 @@ class Supervisor:
             return f"to {self.vpn.get('gateway')}"
         if k == "openvpn":
             return f"OpenVPN ({self.vpn.get('config')})"
+        if k == "inode":
+            return f"iNode SSL-VPN ({self.vpn.get('gateway')})"
         return f"WireGuard ({cfg.wireguard_target(self.vpn)})"
 
     def _dry_print(self, creds):
@@ -422,6 +428,12 @@ class Supervisor:
             self.log("DRY RUN — would run: " + " ".join(cmd))
             self.log(f"resolved user='{user}'; password fed via {self.pinentry} "
                      f"(not shown)")
+        elif self.driver.kind == "inode":
+            user = creds[0] if creds else "<user>"
+            cmd = self.driver.build_cmd(self.vpn, user)
+            self.log("DRY RUN — would run: " + " ".join(cmd))
+            self.log(f"resolved user='{user}'; password fed via "
+                     f"$H3C_SVPN_PASSWORD (not shown)")
         else:  # openvpn
             cmd = self.driver.build_cmd(
                 self.vpn, mgmt_socket=self._mgmt_path() if creds else None)
@@ -444,10 +456,12 @@ class Supervisor:
             self._dry_print(creds)
             return 0
 
-        if not shutil.which(self.driver.binary):
-            self.log(f"FATAL: {self.driver.binary} not found on PATH — install it "
-                     f"and restart the VPN service")
-            sd_notify(f"STATUS={self.driver.binary} is not installed")
+        binpath = self.driver.resolve_binary(self.vpn)
+        if not (shutil.which(binpath)
+                or (os.path.isfile(binpath) and os.access(binpath, os.X_OK))):
+            self.log(f"FATAL: {binpath} not found / not executable — install it "
+                     f"(or fix vpn.config) and restart the VPN service")
+            sd_notify(f"STATUS={os.path.basename(binpath)} is not available")
             return self.idle()
 
         if not self._materialize_config():
@@ -692,6 +706,8 @@ def main() -> int:
     from_vault = bool(vpn.get("config_from_vault"))
     incomplete = (
         (kind == "fortinet" and (not vpn.get("gateway") or not vpn.get("vault_item")))
+        or (kind == "inode" and (not vpn.get("gateway") or not vpn.get("vault_item")
+                                 or not vpn.get("config")))
         or (kind in ("openvpn", "wireguard") and not from_vault and not vpn.get("config"))
         or (kind in ("openvpn", "wireguard") and from_vault and not vpn.get("vault_item")))
     if incomplete:

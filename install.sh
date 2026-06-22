@@ -319,8 +319,10 @@ pm_try "${PK_TOOLS[@]}"
 
 # Optional VPN clients (only the one matching vpn.type is actually used).
 # openfortivpn is in PK_CORE; add OpenVPN + WireGuard so any vpn.type works.
-log "Installing optional VPN clients (openvpn, wireguard-tools)"
+log "Installing optional VPN clients (openvpn, wireguard-tools; tesseract for iNode)"
 pm_try openvpn wireguard-tools
+# iNode SSL-VPN solves the gateway's login CAPTCHA with tesseract (pkg name varies)
+pm_try tesseract-ocr tesseract
 
 # rbw is how the kiosk reads Vaultwarden; without it only the dev backend works
 if ! command -v rbw >/dev/null 2>&1; then

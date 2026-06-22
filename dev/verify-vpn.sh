@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Behavioral check of ALL three VPN backends with fake clients (no real tunnels,
+# Behavioral check of ALL four VPN backends with fake clients (no real tunnels,
 # no root). Drives host/fortivpn.py's Supervisor through each driver and asserts
 # the load-line classification, the secure credential paths, and connect/reconnect.
 # Run:  make verify-vpn
@@ -56,14 +56,25 @@ cat > "$FAKE/wg" <<'SH'
 [ "$3" = "latest-handshakes" ] && echo "PEER $(date +%s)"
 exit 0
 SH
-chmod +x "$FAKE"/openfortivpn "$FAKE"/openvpn "$FAKE"/wg-quick "$FAKE"/wg
+mkdir -p "$FAKE/inode"
+cat > "$FAKE/inode/svpn-connect.sh" <<'PY'
+#!/usr/bin/env python3
+import os, sys, time, signal
+open(os.environ["INODE_MARKER"], "w").write(
+    os.environ.get("H3C_SVPN_PASSWORD", "") + " | argv=" + " ".join(sys.argv[1:]))
+print("tunnel up: ip=10.9.9.2 mask=255.255.255.0", flush=True)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+while True: time.sleep(0.3)
+PY
+chmod +x "$FAKE"/openfortivpn "$FAKE"/openvpn "$FAKE"/wg-quick "$FAKE"/wg "$FAKE/inode/svpn-connect.sh"
 
 # vault: fortinet+openvpn creds, and the wireguard .conf (key) in Notes
 cat > "$FAKE/vault.json" <<'JSON'
 { "SOC Forti":  {"username":"fortiuser","password":"fortipass"},
   "SOC OVPN":   {"username":"ovpnuser","password":"ovpnpass"},
   "SOC WG":     {"username":"","password":"x",
-                 "notes":"[Interface]\nPrivateKey = WGSECRET==\nAddress = 10.9.0.2/32\n"} }
+                 "notes":"[Interface]\nPrivateKey = WGSECRET==\nAddress = 10.9.0.2/32\n"},
+  "SOC iNode":  {"username":"inodeuser","password":"inodepass"} }
 JSON
 
 export PATH="$FAKE:$PATH" XDG_RUNTIME_DIR="$FAKE/run"
@@ -71,6 +82,7 @@ export SOC_VAULT_BACKEND=dev SOC_DEV_VAULT="$FAKE/vault.json"
 export SOC_VPN_AUTH_RETRY_DELAY=1 SOC_VPN_BACKOFF_INITIAL=1
 export WG_MARKER="$FAKE/wg.calls" WG_STATE="$FAKE/wg.state" WG_CONF_SEEN="$FAKE/seen.conf"
 export OVPN_MARKER="$FAKE/ovpn.creds"
+export INODE_DIR="$FAKE/inode" INODE_MARKER="$FAKE/inode.cred"
 
 PYTHONPATH=kiosk-host "$PY" - <<'EOF'
 import os, sys, threading, time
@@ -117,6 +129,20 @@ check("wireguard: key came from the vault Notes", "WGSECRET==" in seen)
 check("wireguard: interface brought up", any("WireGuard interface up" in l for l in logs))
 mat = os.path.join(os.environ["XDG_RUNTIME_DIR"],"soc-vpn","wg0.conf")
 check("wireguard: transient config cleaned up", not os.path.exists(mat))
+
+# 5) iNode (H3C SSL VPN) — driven via the bundled svpn-connect.sh; password via
+#    $H3C_SVPN_PASSWORD (child env, never argv); classified "tunnel up"
+logs = run({"enabled":True,"type":"inode","gateway":"vpn.gw","port":3000,
+            "vault_item":"SOC iNode","config":os.environ["INODE_DIR"],
+            "trusted_cert":"AA:BB:CC"}, 1.5)
+m = open(os.environ["INODE_MARKER"]).read() if os.path.exists(os.environ["INODE_MARKER"]) else ""
+pw, _, argv = m.partition(" | argv=")
+check("inode: tunnel established", any("tunnel established" in l for l in logs))
+check("inode: password via $H3C_SVPN_PASSWORD env (not argv)",
+      pw == "inodepass" and "inodepass" not in argv)
+check("inode: gateway+user+pin on argv",
+      "vpn.gw:3000" in argv and "inodeuser" in argv and "--pin-sha256" in argv)
+check("inode: clean stop", any(l == "stopped" for l in logs))
 
 print()
 print("=== VERIFY-VPN OK ===" if fails==0 else f"=== VERIFY-VPN FAILED ({fails}) ===")
