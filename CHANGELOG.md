@@ -11,6 +11,11 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **iNode client bundled.** The headless H3C iNode SSL-VPN client (the clean-room
+  `h3csvpn` backend + `svpn-connect.sh` + helpers) ships in `vendor/iNode-VPN-Client`
+  and installs to `/opt/soc-display/vendor/…`, so `vpn.type: inode` works out of the
+  box — `vpn.config` is now optional (defaults to the bundled client; set it only to
+  point elsewhere). The Qt GUI and large assets are not vendored.
 - **iNode auto-reconnect.** The supervisor classifies iNode's keepalive heartbeat
   death ("going offline"), a forced log-off, and socket close as a disconnect and
   reconnects — the same liveness logic as the iNode client itself (which exits on

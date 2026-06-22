@@ -706,8 +706,7 @@ def main() -> int:
     from_vault = bool(vpn.get("config_from_vault"))
     incomplete = (
         (kind == "fortinet" and (not vpn.get("gateway") or not vpn.get("vault_item")))
-        or (kind == "inode" and (not vpn.get("gateway") or not vpn.get("vault_item")
-                                 or not vpn.get("config")))
+        or (kind == "inode" and (not vpn.get("gateway") or not vpn.get("vault_item")))
         or (kind in ("openvpn", "wireguard") and not from_vault and not vpn.get("config"))
         or (kind in ("openvpn", "wireguard") and from_vault and not vpn.get("vault_item")))
     if incomplete:
