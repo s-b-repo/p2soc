@@ -313,7 +313,9 @@ class KioskHost:
             from .configwin import ConfigWindow
             win = ConfigWindow(self.conf.panels, self.apply_config,
                                on_close=self._config_closed,
-                               display=self.conf.display)
+                               display=self.conf.display,
+                               vpn=self.conf.vpn,
+                               proxy_vault_item=self.conf.proxy.vault_item)
             self._config_win = win
             win.show_all()
             win.present()
@@ -333,6 +335,10 @@ class KioskHost:
                 self.wall.grid.set_column_spacing(disp["gap"])
             except Exception:  # noqa: BLE001
                 pass
+        vpn_ch = changes.pop("_vpn", None)
+        if vpn_ch is not None:
+            self.conf.vpn = vpn_ch                      # persisted to the vault note
+            self._restart_vpn_async()                   # pick up the new config
         by_id = {v.panel.id: v for v in self.panels_view}
         for pid, ch in changes.items():
             view = by_id.get(pid)
@@ -351,6 +357,22 @@ class KioskHost:
                 # vault item changed but URL didn't — reload to re-trigger login
                 view.set_url(view.panel.url or "")
         self._push_config_to_vault()
+
+    def _restart_vpn_async(self):
+        """A VPN-tab change — restart the VPN service so it re-reads the config
+        (off the GTK thread; best-effort, needs privilege)."""
+        import threading
+        import subprocess
+
+        def work():
+            try:
+                subprocess.run(["systemctl", "restart", "forti-vpn"], timeout=10,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                log("VPN config changed — restarted forti-vpn")
+            except Exception as e:  # noqa: BLE001
+                log(f"VPN restart not permitted from the wall ({e})")
+        threading.Thread(target=work, daemon=True).start()
 
     def _push_config_to_vault(self):
         """After an on-screen edit, write the merged config back to the vault note
@@ -507,10 +529,11 @@ def main():
     # apply any settings set previously from the on-screen config
     try:
         from .configwin import (load_overrides, apply_overrides_to_panels,
-                                 apply_display_override)
+                                 apply_display_override, apply_vpn_override)
         ov = load_overrides()
         if ov:
             apply_display_override(conf.display, ov)
+            apply_vpn_override(conf.vpn, ov)
             apply_overrides_to_panels(conf.panels, ov)
             for p in conf.panels:                        # geometry may have moved
                 p.geometry = cfg.compute_geometry(conf.display, p.grid)

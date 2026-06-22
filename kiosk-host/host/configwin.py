@@ -134,6 +134,41 @@ def apply_overrides_to_panels(panels, overrides: dict):
             p.login_marker = o["login_marker"] or p.selectors.get("pass", "")
 
 
+def apply_vpn_override(vpn: dict, overrides: dict):
+    """Merge a saved VPN override (set from the on-screen VPN tab) onto the loaded
+    vpn dict at startup. The override is what the operator entered at the glass;
+    it merges over the config note/file so advanced fields not on the form
+    (set_routes, etc.) are preserved."""
+    o = overrides.get("_vpn")
+    if isinstance(o, dict):
+        vpn.update(o)
+    return vpn
+
+
+def vpn_form_to_dict(v: dict) -> dict:
+    """Build a clean vpn config dict from flat on-screen form values: always sets
+    enabled+type, keeps only non-empty strings, coerces port/health to int. The
+    VPN service re-validates on restart and surfaces problems via its status."""
+    out = {"enabled": bool(v.get("enabled")), "type": (v.get("type") or "fortinet")}
+    for k in ("gateway", "vault_item", "config", "domain", "realm",
+              "trusted_cert", "ready_probe"):
+        val = str(v.get(k) or "").strip()
+        if val:
+            out[k] = val
+    if v.get("insecure"):
+        out["insecure"] = True
+    if v.get("config_from_vault"):
+        out["config_from_vault"] = True
+    for k in ("port", "health_check_interval"):
+        try:
+            n = int(v.get(k) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            out[k] = n
+    return out
+
+
 def apply_display_override(display, overrides: dict):
     """Apply a saved display override (layout/gap) to the DisplayCfg at startup."""
     o = overrides.get("_display")
@@ -152,13 +187,17 @@ class ConfigWindow(Gtk.Window):
     """on_apply(changes: {id: {"url","title"}}) is called when Apply is pressed,
     after the overrides file has been saved; the host applies them live."""
 
-    def __init__(self, panels, on_apply, on_close=None, display=None):
+    def __init__(self, panels, on_apply, on_close=None, display=None, vpn=None,
+                 proxy_vault_item=""):
         super().__init__(title="SOC wall — settings")
         style.apply_css()
         self.panels = panels
         self.on_apply = on_apply
         self.on_close_cb = on_close
         self.display = display          # config.DisplayCfg | None (Display tab)
+        self._vpn = vpn                 # conf.vpn dict | None (VPN tab)
+        self._proxy_vault_item = proxy_vault_item
+        self._vpn_w = None
         self._rows = {}
         self._unlocked = not pin_is_set()
 
@@ -244,6 +283,8 @@ class ConfigWindow(Gtk.Window):
         nb.append_page(self._tab_credentials(), Gtk.Label(label="Credentials"))
         if self.display is not None:
             nb.append_page(self._tab_display(), Gtk.Label(label="Display"))
+        if self._vpn is not None:
+            nb.append_page(self._tab_vpn(), Gtk.Label(label="VPN"))
         nb.append_page(self._tab_status(), Gtk.Label(label="Status"))
         outer.pack_start(nb, True, True, 0)
 
@@ -349,12 +390,15 @@ class ConfigWindow(Gtk.Window):
             h.get_style_context().add_class("soc-config-sub")
             h.set_xalign(0.0)
             grid.attach(h, col, 0, 1, 1)
-        seen, r = set(), 1
-        for p in self.panels:
-            name = (p.vault_item or "").strip()
+        seen = set()
+        self._cred_r = 1
+
+        def add_row(name, uri):
+            name = (name or "").strip()
             if not name or name in seen:
-                continue
+                return
             seen.add(name)
+            r = self._cred_r
             nm = Gtk.Label(label=name)
             nm.get_style_context().add_class("soc-config-tag")
             nm.set_xalign(0.0)
@@ -362,16 +406,21 @@ class ConfigWindow(Gtk.Window):
             pw = Gtk.Entry(); pw.set_visibility(False); pw.set_width_chars(15)
             pw.set_placeholder_text("password")
             btn = Gtk.Button(label="Save to vault")
-            btn.connect("clicked", (lambda b, n=name, ue=u, pe=pw, uri=p.effective_url:
-                                    self._save_cred(n, ue, pe, uri)))
+            btn.connect("clicked", (lambda b, n=name, ue=u, pe=pw, ur=uri:
+                                    self._save_cred(n, ue, pe, ur)))
             grid.attach(nm, 0, r, 1, 1)
             grid.attach(u, 1, r, 1, 1)
             grid.attach(pw, 2, r, 1, 1)
             grid.attach(btn, 3, r, 1, 1)
-            r += 1
-        if r == 1:
-            box.pack_start(Gtk.Label(label="No panels have a vault login set yet "
-                                           "(set one on the Panels tab)."),
+            self._cred_r += 1
+
+        for p in self.panels:
+            add_row(p.vault_item, p.effective_url)
+        add_row((self._vpn or {}).get("vault_item", ""), "")   # VPN login -> vault
+        add_row(self._proxy_vault_item, "")                    # proxy login -> vault
+        if self._cred_r == 1:
+            box.pack_start(Gtk.Label(label="No vault logins to set yet (give a "
+                                           "panel/VPN/proxy a vault item first)."),
                            False, False, 0)
         else:
             box.pack_start(grid, False, False, 0)
@@ -455,6 +504,72 @@ class ConfigWindow(Gtk.Window):
             g.attach(h, 0, r, 1, 1)
             g.attach(w, 1, r, 1, 1)
         box.pack_start(g, False, False, 0)
+        return box
+
+    def _tab_vpn(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(12)
+        note = Gtk.Label(label="The supervised VPN. Credentials live in the vault "
+                               "(set the username/password on the Credentials tab "
+                               "for this VPN's vault item). Apply pushes the config "
+                               "into the vault and restarts the VPN service.")
+        note.get_style_context().add_class("soc-config-sub")
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        box.pack_start(note, False, False, 0)
+
+        v = self._vpn or {}
+        w = {}
+        w["enabled"] = Gtk.CheckButton(label="VPN enabled")
+        w["enabled"].set_active(bool(v.get("enabled")))
+        box.pack_start(w["enabled"], False, False, 0)
+
+        g = Gtk.Grid()
+        g.set_column_spacing(8)
+        g.set_row_spacing(6)
+        w["type"] = Gtk.ComboBoxText()
+        types = ["fortinet", "openvpn", "wireguard", "inode"]
+        for t in types:
+            w["type"].append_text(t)
+        cur = str(v.get("type", "fortinet"))
+        w["type"].set_active(types.index(cur) if cur in types else 0)
+
+        def entry(val, hint):
+            e = Gtk.Entry()
+            e.set_text(str(val or ""))
+            e.set_hexpand(True)
+            e.set_placeholder_text(hint)
+            return e
+
+        w["gateway"] = entry(v.get("gateway"), "gateway host (fortinet / inode)")
+        w["port"] = Gtk.SpinButton.new_with_range(0, 65535, 1)
+        w["port"].set_value(int(v.get("port", 443) or 0))
+        w["vault_item"] = entry(v.get("vault_item"), "vault login (username + password)")
+        w["config"] = entry(v.get("config"), ".ovpn/.conf path, or the iNode client dir")
+        w["domain"] = entry(v.get("domain"), "auth domain (inode)")
+        w["realm"] = entry(v.get("realm"), "realm (fortinet)")
+        w["trusted_cert"] = entry(v.get("trusted_cert"), "gateway cert sha256 pin")
+        w["ready_probe"] = entry(v.get("ready_probe"), "host:port reachable only over the VPN")
+        rows = [("type", w["type"]), ("gateway", w["gateway"]), ("port", w["port"]),
+                ("vault login", w["vault_item"]), ("config", w["config"]),
+                ("domain", w["domain"]), ("realm", w["realm"]),
+                ("trusted_cert", w["trusted_cert"]), ("ready_probe", w["ready_probe"])]
+        for r, (lbl, widget) in enumerate(rows, start=1):
+            h = Gtk.Label(label=lbl)
+            h.get_style_context().add_class("soc-config-sub")
+            h.set_xalign(0.0)
+            g.attach(h, 0, r, 1, 1)
+            g.attach(widget, 1, r, 1, 1)
+        box.pack_start(g, False, False, 0)
+
+        w["insecure"] = Gtk.CheckButton(label="skip TLS verify (inode — trusted LAN only)")
+        w["insecure"].set_active(bool(v.get("insecure")))
+        w["config_from_vault"] = Gtk.CheckButton(
+            label="config from the vault item's Notes (openvpn / wireguard)")
+        w["config_from_vault"].set_active(bool(v.get("config_from_vault")))
+        box.pack_start(w["insecure"], False, False, 0)
+        box.pack_start(w["config_from_vault"], False, False, 0)
+        self._vpn_w = w
         return box
 
     def _tab_status(self):
@@ -556,6 +671,25 @@ class ConfigWindow(Gtk.Window):
                     "gap": int(self._gap_s.get_value())}
             overrides["_display"] = disp
             changes["_display"] = disp
+
+        if self._vpn is not None and self._vpn_w:
+            w = self._vpn_w
+            vpncfg = vpn_form_to_dict({
+                "enabled": w["enabled"].get_active(),
+                "type": w["type"].get_active_text() or "fortinet",
+                "gateway": w["gateway"].get_text(),
+                "port": int(w["port"].get_value()),
+                "vault_item": w["vault_item"].get_text(),
+                "config": w["config"].get_text(),
+                "domain": w["domain"].get_text(),
+                "realm": w["realm"].get_text(),
+                "trusted_cert": w["trusted_cert"].get_text(),
+                "ready_probe": w["ready_probe"].get_text(),
+                "insecure": w["insecure"].get_active(),
+                "config_from_vault": w["config_from_vault"].get_active(),
+            })
+            overrides["_vpn"] = vpncfg
+            changes["_vpn"] = vpncfg
 
         save_overrides(overrides)
         try:
