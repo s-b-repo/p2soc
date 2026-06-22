@@ -11,6 +11,14 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **Runtime memory watchdog (1 GB Pi).** The host periodically checks
+  `MemAvailable` and, under sustained pressure (two low readings, with a
+  cooldown so it can't thrash), recycles one panel to reclaim memory — the
+  heaviest measurable panel (Chromium RSS) first, otherwise WebKit panels
+  reloaded round-robin. Tunables: `SOC_MEM_MIN_AVAIL_MB` (default 96),
+  `SOC_MEM_CHECK_SEC` (30), `SOC_MEM_RECYCLE_COOLDOWN` (120). The generated
+  `soc-wall.service` also caps the session with `MemoryHigh=80%` / `MemoryMax=92%`
+  so a leak throttles (or restarts the session) instead of OOM-killing the box.
 - **Supervised, env-free kiosk session (`soc-wall.service`).** `setup.py` now
   generates the session as a systemd service with the non-secret config baked in
   as `Environment=` lines (no `soc.env` at runtime) and `Restart=always`, so a
@@ -220,3 +228,7 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
   reconfigure nulls a panel's tunnel).
 - **`first-run` honors `SOC_SECRET_DIR`** — it sealed to the hardcoded default
   even when a custom secret dir was set, so the wall couldn't self-unlock at boot.
+- **`wait_for_tunnels` per-tunnel deadline** — the readiness budget was shared
+  across all tunnels, so a slow first tunnel consumed it and the rest were
+  declared down without ever being probed; each tunnel now gets its own budget
+  (and a `None`/malformed local port is skipped instead of raising).

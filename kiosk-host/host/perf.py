@@ -43,6 +43,38 @@ def low_memory() -> bool:
     return mb is not None and mb <= LOW_MEMORY_THRESHOLD_MB
 
 
+def mem_available_mb(meminfo: str = "/proc/meminfo"):
+    """MemAvailable in MiB (kernel's estimate of allocatable memory), or None.
+    Used by the runtime memory watchdog to detect pressure on a 1 GB Pi."""
+    try:
+        with open(meminfo, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def proc_rss_kb(pid: int, status_path: str = None):
+    """Resident-set size (KiB) of a process from /proc/<pid>/status, or None.
+    Lets the watchdog pick the heaviest panel to recycle under memory pressure."""
+    path = status_path or f"/proc/{pid}/status"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def under_pressure(avail_mb, min_mb) -> bool:
+    """True when available memory is known and below the floor."""
+    return avail_mb is not None and avail_mb < min_mb
+
+
 def is_arm() -> bool:
     return platform.machine() in ("aarch64", "arm64", "armv7l", "armv6l")
 

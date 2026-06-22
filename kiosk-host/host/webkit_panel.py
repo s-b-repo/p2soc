@@ -313,6 +313,16 @@ class WebKitPanel:
         self.webview.load_uri(url)
         self.log(f"[{self.panel.id}] webkit loading {url}")
 
+    def mem_rss_kb(self):
+        # WebKit's renderer runs in a separate WebKitWebProcess we can't attribute
+        # per-panel, so the watchdog can't measure it — it recycles us round-robin.
+        return None
+
+    def recycle(self):
+        """Reclaim accumulated renderer memory by reloading the page."""
+        self.log(f"[{self.panel.id}] recycling webkit (reload) to reclaim memory")
+        self.load()
+
     def set_url(self, url: str):
         """Repoint this panel live (from the on-screen config)."""
         url = (url or "").strip()
