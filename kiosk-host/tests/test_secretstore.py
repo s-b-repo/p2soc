@@ -1,10 +1,20 @@
 """Unit tests for host/secretstore.py — the host-bound, PIN-sealed master pw."""
 import glob
+import importlib.util
 import os
 
 import pytest
 
 from host import secretstore as ss
+
+
+def _load_pinentry_vault():
+    path = os.path.join(os.path.dirname(__file__), "..", "..",
+                        "scripts", "pinentry-vault.py")
+    spec = importlib.util.spec_from_file_location("pinentry_vault", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
 
 
 def test_available():
@@ -97,3 +107,23 @@ def test_reseal_overwrites_and_unseals(tmp_path, monkeypatch):
     assert ss.unseal(d) == "new-pw"
     assert ss.verify_pin("22222222", d)
     assert not ss.verify_pin("11111111", d)
+
+
+def test_pinentry_vault_prefers_sealed_over_env(tmp_path, monkeypatch):
+    # A sealed wall must unseal the host-bound master and IGNORE any
+    # SOC_VAULT_PASSWORD in the environment — no plaintext master path in prod.
+    monkeypatch.setenv("SOC_MACHINE_ID", "host-A")
+    monkeypatch.setenv("SOC_SECRET_DIR", str(tmp_path))
+    ss.seal("SEALED-master", "12345678", str(tmp_path))
+    monkeypatch.setenv("SOC_VAULT_PASSWORD", "ENV-master")
+    pv = _load_pinentry_vault()
+    assert pv._master() == "SEALED-master"
+
+
+def test_pinentry_vault_env_fallback_only_when_unsealed(tmp_path, monkeypatch):
+    # Dev / seeding: with nothing sealed, an explicit env master is the fallback.
+    monkeypatch.setenv("SOC_MACHINE_ID", "host-A")
+    monkeypatch.setenv("SOC_SECRET_DIR", str(tmp_path))    # nothing sealed here
+    monkeypatch.setenv("SOC_VAULT_PASSWORD", "ENV-master")
+    pv = _load_pinentry_vault()
+    assert pv._master() == "ENV-master"

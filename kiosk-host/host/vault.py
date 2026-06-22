@@ -5,7 +5,8 @@ Two backends, selected by $SOC_VAULT_BACKEND:
 
   rbw  (default, production)  Reads logins from Vaultwarden via the `rbw` CLI.
                              Unattended unlock uses a pinentry wrapper that
-                             feeds $SOC_VAULT_PASSWORD (see scripts/pinentry-soc.sh).
+                             UNSEALS the host-bound master (scripts/pinentry-vault.py)
+                             — no plaintext master password on disk.
   dev  (local testing)       Reads logins from a JSON file ($SOC_DEV_VAULT),
                              so the kiosk host runs end-to-end on x86 without
                              Vaultwarden installed.

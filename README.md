@@ -94,7 +94,7 @@ Chromium is opt-in per panel. zram + throttled chart refresh absorb the rest.
 | `inject/login.js.tmpl` | shared auto-login + keep-alive + re-login script (both engines) |
 | `openbox/` | `rc.xml.tmpl` (2×2, no panel, draggable), `menu.xml`, `autostart` |
 | `labwc/` | `rc.xml.tmpl` — the Wayland twin of the Openbox config |
-| `scripts/` | `start-session.sh`, `wayland-session.sh`, `launcher.sh`, `autossh-tunnel.sh`, `forti-vpn*.{sh,py}`, `gen-openbox-rc.py`, `gen-labwc-rc.py`, `tunnel-args.py`, `pinentry-vault.py`, `pinentry-soc.sh`, `xinitrc` |
+| `scripts/` | `start-session.sh`, `wayland-session.sh`, `launcher.sh`, `autossh-tunnel.sh`, `forti-vpn*.{sh,py}`, `gen-openbox-rc.py`, `gen-labwc-rc.py`, `tunnel-args.py`, `pinentry-vault.py`, `xinitrc` |
 | `systemd/` | `vaultwarden(-docker).service`, `autossh-tunnel.service`, `forti-vpn.service`, `getty-autologin.conf` |
 | `security/` | `nftables.conf`, `sshd_hardening.conf`, `zram.conf`, `99-soc-sysctl.conf`, `tunnel_key.note` |
 | `dev/` | dummy panels, vault seeding, tunnel stand-in, `auth-proxy.py`, `verify*.sh`, `run-wall.sh` |
