@@ -11,6 +11,17 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **Supervised, env-free kiosk session (`soc-wall.service`).** `setup.py` now
+  generates the session as a systemd service with the non-secret config baked in
+  as `Environment=` lines (no `soc.env` at runtime) and `Restart=always`, so a
+  dead compositor/session recovers instead of leaving a black screen.
+  `render_wall_unit()` emits it (the master is never baked in); `load_unit_env()`
+  reads `SOC_*` back from a unit. Installed but not auto-enabled — flipping the
+  boot from getty-autologin to the service is a documented on-Pi step.
+- **`first-run` auto-migrates a plaintext master.** If `soc.env` still has a
+  `SOC_VAULT_PASSWORD`, first-run seals it, verifies it unseals on this host,
+  then scrubs the line (atomic `rewrite_env`) — never leaving the wall unable to
+  unlock.
 - **Vaultwarden has no `.env`.** Its server config is now inline in the systemd
   units (`systemd/vaultwarden*.service`) — non-secret (localhost-bound, signups
   off, websockets off) — and the `/admin` page is disabled by default (no
@@ -155,6 +166,21 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 - PIN stored only as a salted SHA-256 hash with a brute-force cooldown.
 - `forti-vpn.service` keeps `/dev` open for `/dev/ppp` + `/dev/net/tun` without
   switching to device-whitelist mode (which could starve a backend).
+- **Chromium CDP debugger locked to the host origin.** Replaced
+  `--remote-allow-origins=*` with the exact `http://127.0.0.1:<port>` the host
+  connects from. A rendered dashboard (or XSS on a panel) can no longer open the
+  DevTools websocket — browsers forbid page JS from forging the `Origin` header —
+  so it can't attach CDP and read every panel's injected credentials.
+- **No plaintext vault master anywhere.** Removed every `SOC_VAULT_PASSWORD`
+  code path (host write-back, on-screen config, `store_credentials`); the master
+  comes only from the host-bound sealed store. `doctor` now **FAILs** (was a
+  warning) on a leftover plaintext in `soc.env`; the legacy unsealed
+  `pinentry-soc.sh` is retired (`pinentry-vault.py` tries the sealed store first).
+- **Sealing is atomic.** `secretstore.seal()` stages `*.tmp` blobs + `os.replace`
+  (master.enc last); `is_sealed()` requires all three files, so an interrupted
+  seal reads as not-sealed instead of an unbootable half-state.
+- `soc.env` is never world-readable: when `setfacl` is unavailable the installer
+  grants the autossh user read via group membership at `0640` (was `chmod 0644`).
 
 ### Changed (display stack)
 
@@ -185,3 +211,12 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
   WebKit views paint over.
 - Chromium proxy-auth navigates from a dark placeholder (not `about:blank`, which
   demoted `--app` to a tabbed window) and settles before disabling interception.
+- **Self-healing hardening for 24/7 unattended boards:** CDP `rpc()` now has an
+  overall deadline so an event flood can't wedge a panel's control loop; Chromium
+  children are `wait()`+`kill`ed on shutdown (no orphans / leaked CDP ports); a
+  WebKit `web-process-terminated` reloads with exponential backoff instead of a
+  fixed 3 s (which crash-OOM-looped on a 1 GB Pi); `effective_url` /
+  `tunnel_local_port` are None-safe (no `KeyError` on the GTK thread when a live
+  reconfigure nulls a panel's tunnel).
+- **`first-run` honors `SOC_SECRET_DIR`** — it sealed to the hardcoded default
+  even when a custom secret dir was set, so the wall couldn't self-unlock at boot.
