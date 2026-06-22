@@ -26,7 +26,7 @@ echo "==> registering account (idempotent)"
 echo "==> configuring rbw"
 rbw config set email "$EMAIL"
 rbw config set base_url "$VW_URL"
-rbw config set pinentry "$PWD/scripts/pinentry-soc.sh"
+rbw config set pinentry "$PWD/scripts/pinentry-vault.py"
 
 echo "==> login + unlock + sync"
 rbw login

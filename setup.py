@@ -871,6 +871,21 @@ def _vault_items(cfg: dict):
     return items
 
 
+def _resolve_master(soc_env: dict) -> str:
+    """The vault master password — from the host-bound sealed store, or an
+    interactive prompt if not sealed yet. NEVER from a plaintext
+    SOC_VAULT_PASSWORD in soc.env (that path is gone; doctor fails on it)."""
+    sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
+    sd = soc_env.get("SOC_SECRET_DIR")
+    try:
+        from host import secretstore  # type: ignore
+        if secretstore.is_sealed(sd):
+            return secretstore.unseal(sd)
+    except Exception as e:  # noqa: BLE001
+        warn(f"could not unseal the master ({e}); enter it manually")
+    return ask_secret("vault master password (used now, not stored)")
+
+
 def store_credentials(soc_env: dict, cfg: dict, dry: bool):
     """Write each item's username+password into Vaultwarden (vaultseed). Run this
     AFTER Vaultwarden is up + the account exists. Operator can skip + add by hand."""
@@ -880,7 +895,7 @@ def store_credentials(soc_env: dict, cfg: dict, dry: bool):
         return
     url = soc_env.get("SOC_VAULT_URL", "")
     email = soc_env.get("SOC_VAULT_EMAIL", "")
-    pw = soc_env.get("SOC_VAULT_PASSWORD", "")
+    pw = _resolve_master(soc_env)
     items = _vault_items(cfg)
     if not items:
         note("no vault items configured.")
@@ -1087,8 +1102,8 @@ def cmd_doctor(args) -> int:
                 return ("FAIL", "cryptography not installed",
                         "pip install cryptography (setup.py repair)")
             if soc_env.get("SOC_VAULT_PASSWORD"):
-                return ("WARN", "plaintext SOC_VAULT_PASSWORD still in soc.env",
-                        "remove it, then: setup.py first-run  (seals it host-bound)")
+                return ("FAIL", "plaintext SOC_VAULT_PASSWORD present in soc.env",
+                        "remove that line, then: setup.py first-run  (seals it host-bound)")
             if secretstore.is_sealed(sec):
                 try:
                     secretstore.unseal(sec)

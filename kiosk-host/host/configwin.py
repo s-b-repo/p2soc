@@ -426,7 +426,10 @@ class ConfigWindow(Gtk.Window):
             box.pack_start(grid, False, False, 0)
 
         self._cred_master = None
-        if not os.environ.get("SOC_VAULT_PASSWORD"):
+        # Only ask for the master at the glass when it isn't sealed on this host;
+        # a sealed wall unseals it itself (no plaintext SOC_VAULT_PASSWORD).
+        from . import secretstore
+        if not secretstore.is_sealed(os.environ.get("SOC_SECRET_DIR")):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             lbl = Gtk.Label(label="vault master password:")
             lbl.get_style_context().add_class("soc-config-sub")
@@ -450,8 +453,16 @@ class ConfigWindow(Gtk.Window):
             return
         url = os.environ.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
         email = os.environ.get("SOC_VAULT_EMAIL", "")
-        master = os.environ.get("SOC_VAULT_PASSWORD") or (
-            self._cred_master.get_text() if self._cred_master else "")
+        # Prefer the host-bound sealed master; fall back to the at-the-glass entry
+        # only when the wall isn't sealed. Never read a plaintext SOC_VAULT_PASSWORD.
+        from . import secretstore
+        sd = os.environ.get("SOC_SECRET_DIR")
+        try:
+            master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
+        except Exception:  # noqa: BLE001 — fall back to the manual entry below
+            master = ""
+        if not master and self._cred_master:
+            master = self._cred_master.get_text()
         if not (email and master):
             self._cred_msg.set_text("need the vault email + master password to write")
             return

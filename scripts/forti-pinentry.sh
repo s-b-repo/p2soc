@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Minimal Assuan pinentry that feeds $SOC_VPN_PASSWORD to openfortivpn for
 # unattended Fortinet login (openfortivpn --pinentry=...). It is the VPN twin of
-# scripts/pinentry-soc.sh (which feeds the vault master password to rbw).
+# scripts/pinentry-vault.py (which feeds the vault master password to rbw).
 #
 # openfortivpn sends SETTITLE / SETDESC / SETKEYINFO / SETPROMPT then GETPIN; we
 # answer OK to everything and return the (URI-escaped) FortiGate password on

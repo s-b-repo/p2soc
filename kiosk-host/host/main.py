@@ -391,9 +391,9 @@ class KioskHost:
                 sd = os.environ.get("SOC_SECRET_DIR")
                 url = os.environ.get("SOC_VAULT_URL", "")
                 email = os.environ.get("SOC_VAULT_EMAIL", "")
-                master = os.environ.get("SOC_VAULT_PASSWORD", "")
-                if not master and secretstore.is_sealed(sd):
-                    master = secretstore.unseal(sd)
+                # Master comes ONLY from the host-bound sealed store — never from
+                # a plaintext SOC_VAULT_PASSWORD in soc.env.
+                master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
                 if not (url and email and master):
                     log("config write-back skipped (need url/email + sealed master)")
                     return
