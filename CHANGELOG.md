@@ -11,6 +11,12 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 
 ### Added
 
+- **VPN configurable from the on-screen ⚙ Settings.** A new **VPN** tab edits the
+  supervised VPN (type incl. iNode, gateway, vault item, config, domain, cert pin,
+  ready-probe); Apply persists it (overrides + the vault config note) and restarts
+  the VPN service. The **Credentials** tab now also lists the VPN + proxy vault
+  items, so their username/password go straight into Vaultwarden from the glass —
+  every VPN is vault-backed for both config and credentials.
 - **iNode (H3C SSL VPN) support** — new `vpn.type: inode`, driven headlessly by the
   bundled `svpn-connect.sh`; a process driver under the same supervisor (backoff,
   auth/cert holds, ready-probe health). Credentials come from the vault

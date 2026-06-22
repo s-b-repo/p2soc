@@ -121,6 +121,14 @@ gates the panel; the PIN is stored only as a salted SHA-256 hash. This lets you
 ship a wall with blank tiles and point them at real tools at the glass — no SSH,
 no file editing.
 
+The panel is **tabbed**: **Panels** (per-tile URL/title/vault/engine + advanced
+selectors), **Credentials** (store a panel/VPN/proxy login's username+password
+straight into Vaultwarden), **VPN** (pick the type — fortinet/openvpn/wireguard/
+iNode — and its gateway, vault item, config, domain, cert pin, ready-probe; Apply
+pushes it into the vault config note and restarts the VPN service), **Display**
+(layout/gap), and **Status**. So the whole wall — panels, credentials *and* the
+VPN — is configurable at the glass, with config + creds stored in the vault.
+
 ## `tunnel`
 
 ```yaml
