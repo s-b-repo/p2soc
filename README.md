@@ -106,7 +106,18 @@ Chromium is opt-in per panel. zram + throttled chart refresh absorb the rest.
 ## Try it on your workstation (no Pi needed)
 
 Requires: `python3` + `python3-gi` + `gir1.2-webkit2-4.x`, `Xvfb`/`Xephyr`,
-`chromium`, ImageMagick (`import`). Then:
+`chromium`, ImageMagick (`import`).
+
+**Fastest first run** — one idempotent command sets up the venv + dev vault, then
+launches the wall (use `--pi` instead to hand off to the production deploy):
+
+```bash
+./launch.sh             # show the wall in a window (Xephyr); headless if no display
+./launch.sh --headless  # headless end-to-end check (Xvfb + screenshot)
+./launch.sh --pi        # production: sudo setup.py deploy (install + configure + seal + checks)
+```
+
+Or drive the pieces directly:
 
 ```bash
 make verify         # headless: brings up 4 dummy panels + the host, asserts logins,
