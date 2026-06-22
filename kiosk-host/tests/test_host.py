@@ -615,6 +615,44 @@ def test_chromium_cdp_rpc_returns_matching_result():
 
 
 # --------------------------------------------------------------------------- #
+# Input validation + resource usage
+# --------------------------------------------------------------------------- #
+def test_env_num_helpers(monkeypatch):
+    monkeypatch.delenv("SOC_TEST_X", raising=False)
+    assert config.env_int("SOC_TEST_X", 7) == 7              # missing -> default
+    monkeypatch.setenv("SOC_TEST_X", "notanumber")
+    assert config.env_int("SOC_TEST_X", 7) == 7              # garbage -> default
+    monkeypatch.setenv("SOC_TEST_X", "999")
+    assert config.env_int("SOC_TEST_X", 7, hi=100) == 100    # clamp to hi
+    monkeypatch.setenv("SOC_TEST_X", "-5")
+    assert config.env_int("SOC_TEST_X", 7, lo=0) == 0        # clamp to lo
+    monkeypatch.setenv("SOC_TEST_X", "42")
+    assert config.env_int("SOC_TEST_X", 7) == 42             # valid passes through
+    monkeypatch.setenv("SOC_TEST_F", "")
+    assert config.env_float("SOC_TEST_F", 2.0) == 2.0        # empty -> default
+    monkeypatch.setenv("SOC_TEST_F", "1.5")
+    assert config.env_float("SOC_TEST_F", 0.0) == 1.5
+
+
+def test_probe_tcp_rejects_malformed():
+    from host import fortivpn
+    # malformed probes must return False, never raise (raising kills the health loop)
+    for bad in ("", "hostonly", "host:notaport", "host:0", "host:99999", ":443"):
+        assert fortivpn.probe_tcp(bad) is False
+
+
+def test_vault_cache_evicts_expired(monkeypatch):
+    import time as _t
+    monkeypatch.setenv("SOC_VAULT_BACKEND", "dev")
+    v = vault.Vault(ttl=30.0)
+    v._cache["stale"] = (_t.time() - 60.0, ("u", "p"))       # older than ttl
+    v._cache["fresh"] = (_t.time(), ("u", "p"))
+    assert v.cached("fresh") is True                          # sweeps on access
+    assert "stale" not in v._cache                            # expired entry dropped
+    assert "fresh" in v._cache
+
+
+# --------------------------------------------------------------------------- #
 # Performance profile detection (host/perf.py)
 # --------------------------------------------------------------------------- #
 from host import perf  # noqa: E402

@@ -156,14 +156,23 @@ class Vault:
     def ready(self) -> bool:
         return self._ready
 
+    def _evict_expired_locked(self, now: float = None):
+        """Drop expired entries so the cache can't grow unbounded over a 24/7 run
+        and stale credentials don't linger in RAM past their TTL. Call under lock."""
+        now = now if now is not None else time.time()
+        for k in [k for k, (ts, _) in self._cache.items() if now - ts >= self.ttl]:
+            self._cache.pop(k, None)
+
     def cached(self, item: str) -> bool:
         """True if a fresh credential is in the cache (no backend call needed)."""
         with self._lock:
+            self._evict_expired_locked()
             hit = self._cache.get(item)
             return bool(hit and (time.time() - hit[0]) < self.ttl)
 
     def creds(self, item: str) -> dict:
         with self._lock:
+            self._evict_expired_locked()
             hit = self._cache.get(item)
             if hit and (time.time() - hit[0]) < self.ttl:
                 user, pw = hit[1]

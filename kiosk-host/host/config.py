@@ -13,11 +13,41 @@ them, which catches typos like `vault_iten:` before they bite at 3 AM.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlsplit
 
 import yaml
+
+
+def _env_num(name, default, cast, lo, hi):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        v = cast(raw.strip())
+    except (TypeError, ValueError):
+        sys.stderr.write(f"[soc-kiosk] {name}={raw!r} is not a valid number; "
+                         f"using {default}\n")
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def env_int(name: str, default: int, *, lo: int = None, hi: int = None) -> int:
+    """os.environ[name] as an int, clamped to [lo, hi]; on a missing/garbage
+    value, warn and fall back to default. A typo'd tunable must never crash the
+    wall at boot."""
+    return _env_num(name, default, int, lo, hi)
+
+
+def env_float(name: str, default: float, *, lo: float = None, hi: float = None) -> float:
+    """os.environ[name] as a float, clamped to [lo, hi]; missing/garbage -> default."""
+    return _env_num(name, default, float, lo, hi)
 
 
 class ConfigError(Exception):

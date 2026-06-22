@@ -113,7 +113,7 @@ def wait_for_vpn(vpn: dict, timeout: float):
 class KioskHost:
     def __init__(self, conf: cfg.Config, vault: "Vault | None" = None):
         self.conf = conf
-        self.vault = vault or Vault(ttl=float(os.environ.get("SOC_CRED_TTL", "30")))
+        self.vault = vault or Vault(ttl=cfg.env_float("SOC_CRED_TTL", 30.0, lo=1.0))
         self.panels_view = []          # live panel objects (WebKit/Chromium)
         self.wall = None               # WallWindow in single-window layout
         self._config_win = None        # the on-screen config window, when open
@@ -218,8 +218,8 @@ class KioskHost:
             self.wall = WallWindow(self.conf, log, on_destroy=self.shutdown,
                                    on_config=config_cb, on_vpn=self.vpn_action)
 
-        stagger = float(os.environ.get("SOC_LAUNCH_STAGGER", "1.5"))
-        cdp_base = int(os.environ.get("SOC_CDP_BASE_PORT", "9222"))
+        stagger = cfg.env_float("SOC_LAUNCH_STAGGER", 1.5, lo=0.0, hi=60.0)
+        cdp_base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
         delay = 0.0
         for idx, panel in enumerate(self.conf.panels):
             if panel.engine == "chromium":
@@ -252,7 +252,7 @@ class KioskHost:
         """Poll the VPN state in the background and keep the wall pill current."""
         if self.wall is None:
             return
-        interval = int(os.environ.get("SOC_VPN_STATUS_INTERVAL", "10") or 10)
+        interval = cfg.env_int("SOC_VPN_STATUS_INTERVAL", 10, lo=1, hi=3600)
         self._poll_vpn()                              # immediate first reading
         GLib.timeout_add_seconds(max(3, interval), self._poll_vpn_periodic)
 
@@ -265,11 +265,19 @@ class KioskHost:
         import threading
         from . import vpnstatus
 
+        # Skip this tick if the previous probe is still running, so a slow/hung
+        # connect near the poll interval can't pile up daemon threads.
+        if getattr(self, "_vpn_poll_busy", False):
+            return False
+        self._vpn_poll_busy = True
+
         def work():
             try:
                 state = vpnstatus.vpn_state(self.conf.vpn)
             except Exception:                          # never let the pill crash us
                 state = vpnstatus.STATE_OFFLINE
+            finally:
+                self._vpn_poll_busy = False
             label = vpnstatus.LABELS.get(state, "VPN: ?")
             css = {"not_configured": "unconfigured"}.get(state, state)
             GLib.idle_add(self._set_pill, css, label)
@@ -500,10 +508,10 @@ def main():
     # 1. open the vault FIRST — with the rbw backend the wall config itself lives
     #    in the vault, so it must be unlocked before we can read the config.
     #    Required: fail loudly if it will not open within the timeout.
-    vault = Vault(ttl=float(os.environ.get("SOC_CRED_TTL", "30")))
+    vault = Vault(ttl=cfg.env_float("SOC_CRED_TTL", 30.0, lo=1.0))
     backend = os.environ.get("SOC_VAULT_BACKEND", "rbw")
     log(f"opening vault (backend={backend}) ...")
-    ready_timeout = float(os.environ.get("SOC_READY_TIMEOUT", "120"))
+    ready_timeout = cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
     deadline = time.time() + ready_timeout
     while True:
         try:
