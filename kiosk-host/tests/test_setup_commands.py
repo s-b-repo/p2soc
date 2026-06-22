@@ -118,3 +118,36 @@ def test_deploy_fresh_forces_install(tmp_path, monkeypatch):
     m.cmd_deploy(A())
     ic = _install_calls(calls)
     assert ic and any("--fresh" in str(x) for x in ic[0])
+
+
+_WALL_ENV = {
+    "SOC_VAULT_BACKEND": "rbw", "SOC_VAULT_EMAIL": "k@soc.local",
+    "SOC_VAULT_URL": "http://127.0.0.1:8222",
+    "SOC_SECRET_DIR": "/etc/soc-display/secret",
+    "SOC_CONFIG_VAULT_ITEM": "SOC Wall Config", "SOC_ROOT": "/opt/soc-display",
+    "SOC_PANELS_FILE": "/etc/soc-display/panels.yaml",
+    "SOC_INJECT_TMPL": "/opt/soc-display/inject/login.js.tmpl",
+    "SOC_LAUNCH_STAGGER": "1.5", "SOC_READY_TIMEOUT": "120",
+    "SOC_CDP_BASE_PORT": "9222", "SOC_CRED_TTL": "30", "SOC_VPN_DRY_RUN": "0",
+    "SOC_SESSION": "auto",
+}
+
+
+def test_render_wall_unit_no_secret_and_supervised():
+    m = _setup()
+    unit = m.render_wall_unit(_WALL_ENV, user="soc", soc_root="/opt/soc-display")
+    assert "SOC_VAULT_PASSWORD" not in unit          # the master is never baked in
+    assert "Restart=always" in unit                  # supervised (compositor recovers)
+    assert "Environment=SOC_VAULT_EMAIL=k@soc.local" in unit
+    # a value with spaces must be quoted as a whole assignment for systemd
+    assert 'Environment="SOC_CONFIG_VAULT_ITEM=SOC Wall Config"' in unit
+    assert "ExecStart=/opt/soc-display/scripts/start-session.sh" in unit
+
+
+def test_wall_unit_env_roundtrip(tmp_path):
+    m = _setup()
+    p = tmp_path / "soc-wall.service"
+    p.write_text(m.render_wall_unit(_WALL_ENV))
+    back = m.load_unit_env(str(p))
+    for k, v in _WALL_ENV.items():
+        assert back[k] == v

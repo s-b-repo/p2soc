@@ -465,9 +465,15 @@ want_tunnel(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$S
 want_vpn(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;v=config.load('$ETC/panels.yaml').vpn or {};k=config.vpn_kind(v);ok=bool(v.get('enabled')) and ((k=='fortinet' and v.get('gateway')) or (k in ('openvpn','wireguard') and v.get('config')));sys.exit(0 if ok else 1)"; }
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
-  log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn)"
+  log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall)"
   cp "$SOC_ROOT/systemd/autossh-tunnel.service" /etc/systemd/system/
   cp "$SOC_ROOT/systemd/forti-vpn.service" /etc/systemd/system/
+  # Supervised kiosk session (env baked in, no soc.env) — setup.py regenerates it
+  # with the wizard's values. Installed but NOT enabled: switching the boot from
+  # getty-autologin to this service must be validated on the target display (see
+  # the end-of-run notes), so we don't flip it automatically.
+  [ -f /etc/systemd/system/soc-wall.service ] || \
+    cp "$SOC_ROOT/systemd/soc-wall.service" /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable vaultwarden.service
   if want_tunnel; then
