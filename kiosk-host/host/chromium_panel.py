@@ -43,6 +43,19 @@ from . import perf
 
 RESPAWN_INITIAL = 5.0    # seconds; doubled up to RESPAWN_MAX after each death
 RESPAWN_MAX = 60.0
+RPC_TIMEOUT = 30.0       # hard ceiling on a single CDP round-trip (anti-wedge)
+
+
+def cdp_allowed_origin(port: int) -> str:
+    """The exact Origin our CDP websocket client sends (the websocket-client lib
+    derives it from the ws URL as http://host:port). We pin
+    --remote-allow-origins to THIS value so ONLY our own connection is accepted:
+    a panel page's JS cannot reach the debugger because browsers forbid scripts
+    from forging the Origin header, so its WebSocket carries the page's real
+    (remote) origin, which is not in the allow-list. NEVER use "*" here — that
+    disables the check and lets any rendered dashboard hijack CDP and read the
+    injected credentials of every panel."""
+    return f"http://127.0.0.1:{port}"
 PROXY_AUTH_MAX_ATTEMPTS = 3     # then cancel — don't hammer the proxy
 PROXY_AUTH_WINDOW = 20.0        # seconds of fast Fetch pumping after attach
 # shown for an unconfigured tile (no URL set yet) — a dark blank page
@@ -95,13 +108,14 @@ class _CDP:
             try:
                 for t in self._targets():
                     if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                        # Let websocket-client send its single default Origin
+                        # (http://127.0.0.1:<port>); we pin --remote-allow-origins
+                        # to exactly that (see cdp_allowed_origin) so only this
+                        # connection is accepted. Do NOT also pass an explicit
+                        # Origin header — Chromium then sees two and rejects both.
                         self.ws = create_connection(
                             t["webSocketDebuggerUrl"],
                             timeout=10,
-                            # modern Chromium rejects CDP ws unless origin allowed;
-                            # we pass --remote-allow-origins=* on the cmdline, and
-                            # also send a localhost Origin header here.
-                            header=["Origin: http://127.0.0.1"],
                         )
                         return
             except Exception as e:  # noqa: BLE001
@@ -133,11 +147,15 @@ class _CDP:
         self.ws.send(json.dumps({"id": self._id, "method": method,
                                  "params": params or {}}))
 
-    def rpc(self, method, params=None):
+    def rpc(self, method, params=None, timeout=RPC_TIMEOUT):
         self._id += 1
         mid = self._id
         self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        while True:
+        # Overall deadline so a flood of unsolicited events (which keep recv()
+        # returning before its socket timeout) can never starve the matching
+        # reply and wedge the panel's control loop forever.
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             msg = json.loads(self.ws.recv())
             if self._dispatch(msg):
                 continue
@@ -146,6 +164,7 @@ class _CDP:
                     raise CDPError(msg["error"])
                 return msg.get("result", {})
             # response to a stale call — drop it
+        raise CDPError(f"CDP rpc {method} timed out after {timeout:.0f}s")
 
     def pump(self, duration: float):
         """Process incoming events for `duration` seconds (no RPC in flight)."""
@@ -248,7 +267,7 @@ class ChromiumPanel:
             f"--user-data-dir={profile}",
             f"--remote-debugging-port={self.cdp_port}",
             "--remote-debugging-address=127.0.0.1",
-            "--remote-allow-origins=*",
+            f"--remote-allow-origins={cdp_allowed_origin(self.cdp_port)}",
             f"--window-position={g.x},{g.y}",
             f"--window-size={g.w},{g.h}",
             "--no-first-run", "--no-default-browser-check",
@@ -479,9 +498,25 @@ class ChromiumPanel:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()        # control loop respawns with the new URL
 
+    def _reap(self):
+        """Terminate the Chromium child and actually wait for it, escalating to
+        kill(), so shutdown doesn't orphan a half-dead process (and leak its CDP
+        port / profile lock) on a 24/7 box that restarts the service."""
+        p = self.proc
+        if not p or p.poll() is not None:
+            return
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
     def stop(self):
         self._stop.set()
         if self.cdp:
             self.cdp.close()
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        self._reap()

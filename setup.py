@@ -1315,7 +1315,11 @@ def cmd_firstrun(args) -> int:
             "(pip install cryptography)")
         return 1
 
-    sd = paths["secret_dir"]
+    # Honor a custom SOC_SECRET_DIR from soc.env — doctor, the credential store,
+    # and the boot-time pinentry all read it, so first-run must seal to the SAME
+    # place or the wall seals here but looks for the secret elsewhere and can't
+    # self-unlock at boot.
+    sd = soc_env.get("SOC_SECRET_DIR") or paths["secret_dir"]
     do_seal = True
     if secretstore.is_sealed(sd):
         do_seal = ask_bool(f"A sealed secret already exists in {sd}. Re-seal (new PIN)?", False)

@@ -103,7 +103,12 @@ class Panel:
     @property
     def effective_url(self) -> str:
         if self.mode == "tunnel":
-            lp = self.tunnel["local_port"]
+            # Be defensive: live reconfigure / restored overrides can flip mode
+            # or null out `tunnel`, and this is read on the GTK thread during
+            # repaints — a KeyError here would take down the main loop.
+            lp = (self.tunnel or {}).get("local_port")
+            if lp is None:
+                return ""
             return f"{self.scheme}://127.0.0.1:{lp}{self.path}"
         return self.url or ""
 
@@ -114,7 +119,9 @@ class Panel:
 
     @property
     def tunnel_local_port(self) -> Optional[int]:
-        return self.tunnel["local_port"] if self.mode == "tunnel" else None
+        if self.mode != "tunnel":
+            return None
+        return (self.tunnel or {}).get("local_port")
 
 
 @dataclass

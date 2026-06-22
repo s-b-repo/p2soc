@@ -335,10 +335,19 @@ class WebKitPanel:
     # ---- self-healing ------------------------------------------------------
     def _on_terminated(self, _wv, reason):
         why = reason.value_nick if hasattr(reason, "value_nick") else "crashed"
+        # Use the same exponential backoff as load failures. On a 1 GB Pi a
+        # web-process termination is usually the memory-pressure killer; a fixed
+        # 3s reload of a heavy page would just crash-OOM-loop and starve the
+        # other panels. A sustained successful load resets the delay
+        # (_on_load_changed FINISHED).
         self.log(f"[{self.panel.id}] web process terminated ({why}); "
-                 f"reloading in 3s")
-        self.status.update(f"renderer {why} — recovering…", error=True)
-        self._schedule_retry(3)
+                 f"reloading in {self._retry_delay}s")
+        self.status.update(f"renderer {why} — recovering in {self._retry_delay}s",
+                           error=True)
+        self._load_failed = True              # keep the card; don't clear on the
+        #                                       error page's FINISHED event
+        self._schedule_retry(self._retry_delay)
+        self._retry_delay = min(self._retry_delay * 2, RETRY_MAX)
 
     def _on_load_failed(self, _wv, _event, uri, error):
         # CANCELLED fires on perfectly normal in-page navigation; not a failure.

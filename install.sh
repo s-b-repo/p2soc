@@ -412,8 +412,17 @@ chmod 0750 "$ETC/keys"; chown "$SVC_USER:$SVC_USER" "$ETC/keys"
 # Host-bound sealed vault secret (master.enc / pin.enc) — owned by the kiosk user
 # (it unlocks the vault at boot), 0700. setup.py first-run/deploy seals it here.
 mkdir -p "$ETC/secret"; chmod 0700 "$ETC/secret"; chown "$KIOSK_USER:$KIOSK_USER" "$ETC/secret"
-# soc.env is also read by the autossh service user
-setfacl -m u:"$SVC_USER":r "$ETC/soc.env" 2>/dev/null || chmod 0644 "$ETC/soc.env"
+# soc.env must be readable by BOTH the kiosk user (sources it at session start)
+# and the autossh service user — but NEVER world-readable (it holds the vault
+# email/URL, secret-dir path and config-item name). Prefer an ACL; if ACLs are
+# unavailable, fall back to a shared group (add the service user to the kiosk
+# user's group). The sealed-secret dir stays 0700, so this grants soc.env only.
+if ! setfacl -m u:"$SVC_USER":r "$ETC/soc.env" 2>/dev/null; then
+  warn "setfacl unavailable — granting $SVC_USER read on soc.env via group membership (not world-readable)"
+  usermod -aG "$KIOSK_USER" "$SVC_USER" 2>/dev/null \
+    || warn "could not add $SVC_USER to group $KIOSK_USER; autossh may not read soc.env"
+  chown "root:$KIOSK_USER" "$ETC/soc.env"; chmod 0640 "$ETC/soc.env"
+fi
 
 # record the chosen session in soc.env — only override a manual edit when the
 # operator explicitly passed SESSION= to this run

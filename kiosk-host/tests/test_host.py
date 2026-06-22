@@ -543,6 +543,77 @@ def test_chromium_proxy_flags_no_secrets():
     assert not any("SOC Proxy" in f for f in flags)
 
 
+def test_panel_url_props_are_none_safe():
+    # A tunnel panel whose `tunnel` got nulled out by a live reconfigure / a
+    # restored override must not raise on the GTK thread — it should degrade.
+    conf = _load()
+    p2 = {x.id: x for x in conf.panels}["p2"]
+    assert p2.mode == "tunnel"
+    p2.tunnel = None
+    assert p2.effective_url == ""
+    assert p2.tunnel_local_port is None
+
+
+def test_chromium_cdp_origin_is_pinned_not_wildcard(monkeypatch, tmp_path):
+    # The CDP debugger must accept ONLY the host's own origin; a wildcard would
+    # let any rendered dashboard hijack CDP and read injected credentials.
+    from host import chromium_panel
+    assert chromium_panel.cdp_allowed_origin(9333) == "http://127.0.0.1:9333"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(chromium_panel, "_chromium_bin", lambda: "/bin/true")
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, args, **kw):
+            captured["args"] = args
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(chromium_panel.subprocess, "Popen", _FakePopen)
+    p2 = {x.id: x for x in _load().panels}["p2"]
+    panel = chromium_panel.ChromiumPanel(p2, lambda _p: None, lambda *_a: None,
+                                         cdp_port=9333)
+    panel._spawn()
+    args = captured["args"]
+    assert "--remote-allow-origins=http://127.0.0.1:9333" in args
+    assert "--remote-allow-origins=*" not in args
+
+
+def test_chromium_cdp_rpc_times_out_on_event_flood():
+    # A flood of unsolicited events must not starve the matching reply forever;
+    # rpc() has an overall deadline and raises rather than wedging the panel.
+    from host import chromium_panel
+
+    class _FloodWS:
+        def send(self, _data):
+            pass
+        def recv(self):
+            return json.dumps({"method": "Runtime.consoleAPICalled",
+                               "params": {}})        # never a matching id
+
+    cdp = chromium_panel._CDP(9333)
+    cdp.ws = _FloodWS()
+    import pytest
+    with pytest.raises(chromium_panel.CDPError):
+        cdp.rpc("Page.enable", timeout=0.2)
+
+
+def test_chromium_cdp_rpc_returns_matching_result():
+    from host import chromium_panel
+
+    class _ReplyWS:
+        def __init__(self):
+            self._sent_id = None
+        def send(self, data):
+            self._sent_id = json.loads(data)["id"]
+        def recv(self):
+            return json.dumps({"id": self._sent_id, "result": {"ok": True}})
+
+    cdp = chromium_panel._CDP(9333)
+    cdp.ws = _ReplyWS()
+    assert cdp.rpc("Page.enable") == {"ok": True}
+
+
 # --------------------------------------------------------------------------- #
 # Performance profile detection (host/perf.py)
 # --------------------------------------------------------------------------- #
