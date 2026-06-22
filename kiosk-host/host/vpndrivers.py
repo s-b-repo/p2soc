@@ -149,6 +149,10 @@ class INodeDriver(Driver):
         ("certificate pin mismatch", EVENT_CERT),
         ("certificate verify failed", EVENT_CERT),
         ("CERTIFICATE_VERIFY_FAILED", EVENT_CERT),
+        ("heartbeat: no response", EVENT_DOWN),    # iNode keepalive missed N times
+        ("going offline", EVENT_DOWN),
+        ("gateway forced log-off", EVENT_DOWN),
+        ("tunnel socket closed", EVENT_DOWN),
         ("disconnecting", EVENT_DOWN),
         ("Connection reset", EVENT_DOWN),
         ("Connection refused", EVENT_DOWN),

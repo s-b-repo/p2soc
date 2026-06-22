@@ -60,9 +60,15 @@ mkdir -p "$FAKE/inode"
 cat > "$FAKE/inode/svpn-connect.sh" <<'PY'
 #!/usr/bin/env python3
 import os, sys, time, signal
+open(os.environ["INODE_RUNS"], "a").write("1\n")          # count (re)connect attempts
 open(os.environ["INODE_MARKER"], "w").write(
     os.environ.get("H3C_SVPN_PASSWORD", "") + " | argv=" + " ".join(sys.argv[1:]))
 print("tunnel up: ip=10.9.9.2 mask=255.255.255.0", flush=True)
+fail_after = os.environ.get("INODE_FAIL_AFTER")
+if fail_after:                                            # simulate iNode heartbeat death
+    time.sleep(float(fail_after))
+    print("heartbeat: no response, going offline", flush=True)
+    sys.exit(1)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 while True: time.sleep(0.3)
 PY
@@ -82,7 +88,7 @@ export SOC_VAULT_BACKEND=dev SOC_DEV_VAULT="$FAKE/vault.json"
 export SOC_VPN_AUTH_RETRY_DELAY=1 SOC_VPN_BACKOFF_INITIAL=1
 export WG_MARKER="$FAKE/wg.calls" WG_STATE="$FAKE/wg.state" WG_CONF_SEEN="$FAKE/seen.conf"
 export OVPN_MARKER="$FAKE/ovpn.creds"
-export INODE_DIR="$FAKE/inode" INODE_MARKER="$FAKE/inode.cred"
+export INODE_DIR="$FAKE/inode" INODE_MARKER="$FAKE/inode.cred" INODE_RUNS="$FAKE/inode.runs"
 
 PYTHONPATH=kiosk-host "$PY" - <<'EOF'
 import os, sys, threading, time
@@ -143,6 +149,18 @@ check("inode: password via $H3C_SVPN_PASSWORD env (not argv)",
 check("inode: gateway+user+pin on argv",
       "vpn.gw:3000" in argv and "inodeuser" in argv and "--pin-sha256" in argv)
 check("inode: clean stop", any(l == "stopped" for l in logs))
+
+# 6) iNode auto-reconnect — the backend's heartbeat death ("going offline") makes
+#    it exit; the supervisor must respawn it (same logic as the iNode client)
+open(os.environ["INODE_RUNS"], "w").close()
+os.environ["INODE_FAIL_AFTER"] = "0.3"
+logs = run({"enabled":True,"type":"inode","gateway":"vpn.gw","port":3000,
+            "vault_item":"SOC iNode","config":os.environ["INODE_DIR"],
+            "trusted_cert":"AA:BB:CC"}, 2.6)
+os.environ.pop("INODE_FAIL_AFTER", None)
+runs = sum(1 for _ in open(os.environ["INODE_RUNS"])) if os.path.exists(os.environ["INODE_RUNS"]) else 0
+check("inode: auto-reconnects after heartbeat death (>=2 attempts)", runs >= 2)
+check("inode: drop classified + reconnect logged", any("reconnecting" in l for l in logs))
 
 print()
 print("=== VERIFY-VPN OK ===" if fails==0 else f"=== VERIFY-VPN FAILED ({fails}) ===")
