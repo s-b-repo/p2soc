@@ -329,9 +329,19 @@ The host auto-profiles the hardware (no config needed) and exposes overrides in
 | `SOC_WEBKIT_HWACCEL` | `auto` | `always` \| `never` \| `ondemand` \| `auto`. Auto = GPU-accelerated compositing on ARM boards that expose a render node (Pi 5 V3D), on-demand under the low-memory profile, engine default elsewhere. |
 | `SOC_LAUNCH_STAGGER` | `1.5` | seconds between panel launches — spreads the boot RAM/CPU spike. |
 | `SOC_CHROMIUM_OZONE` | `auto` | `x11` \| `wayland`. Chromium panels default to X11/XWayland so WM_CLASS placement works under Openbox and labwc. |
+| `SOC_MEM_MIN_AVAIL_MB` | `96` | Memory-watchdog floor: when `MemAvailable` falls below this, the host recycles a panel (heaviest Chromium first, else a WebKit reload) to reclaim memory. |
+| `SOC_MEM_CHECK_SEC` | `30` | How often the memory watchdog samples `MemAvailable`. |
+| `SOC_MEM_RECYCLE_COOLDOWN` | `120` | Minimum seconds between watchdog recycles (anti-thrash; it also needs two consecutive low readings before acting). |
+
+All numeric tunables are parsed defensively: a missing or non-numeric value logs
+a warning and falls back to the default (and is clamped to a sane range) rather
+than crashing the host at boot.
 
 Chromium panels also run with a capped 50 MB disk cache, background networking
-and sync disabled — kinder to SD cards and RAM.
+and sync disabled — kinder to SD cards and RAM. When the wall runs as
+`soc-wall.service`, the unit additionally caps the whole session with
+`MemoryHigh=80%` / `MemoryMax=92%` so a leak throttles (or restarts the session)
+instead of OOM-killing the box.
 
 Other tips:
 
