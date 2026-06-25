@@ -56,7 +56,6 @@ PROXY_AUTH_MAX_ATTEMPTS = 3   # then stop, or a bad password hammers the proxy
 MAX_LOGIN_ATTEMPTS = 3        # then show the "please sign in" popup instead
 
 _default_ctx_proxied = False
-_tuned_contexts = set()
 _mem_pressure_done = False
 
 
@@ -93,10 +92,9 @@ def _apply_memory_pressure():
 
 
 def _tune_context(ctx):
-    """Apply the performance profile to a WebContext (idempotent per context)."""
-    if id(ctx) in _tuned_contexts:
-        return
-    _tuned_contexts.add(id(ctx))
+    """Apply the performance profile to a WebContext. set_cache_model is cheap +
+    idempotent, so call it unconditionally — no id()-keyed dedup, whose ids can be
+    reused by a GC'd private context and wrongly skip a fresh one's tuning."""
     # DOCUMENT_VIEWER drops the page/back-forward caches — right for a wall
     # that shows one page per view, and a big win on 1 GB boards.
     if perf.low_memory():
