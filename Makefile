@@ -118,6 +118,10 @@ lint: .venv verify-arm  ## syntax-check shell + python + run the aarch64 gate
 	@bash -n install.sh && echo "install.sh: ok"
 	@for s in scripts/*.sh dev/*.sh; do bash -n "$$s" && echo "$$s: ok"; done
 	@$(PY) -m py_compile setup.py kiosk-host/host/*.py scripts/*.py dev/*.py && echo "python: ok"
+	@# headless wiring smokes (no GTK / no display): config resolver, launcher, health dot.
+	@PYTHONPATH=kiosk-host $(PY) -m host.configpaths --check
+	@PYTHONPATH=kiosk-host $(PY) -m host.health --check
+	@PYTHONPATH=kiosk-host $(PY) -m host.launchermenu --check
 
 .PHONY: install
 install:  ## install on the Pi (run as root)
