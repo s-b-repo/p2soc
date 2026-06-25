@@ -465,6 +465,17 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
                             f"(1-65535), got {lp!r}")
             if not t.get("remote_host"):
                 errs.append(f"{where}: tunnel.remote_host is required")
+            # `path` is concatenated straight into effective_url for tunnel
+            # panels (f"...127.0.0.1:{lp}{path}"); without a leading slash a value
+            # like "@evil.com/dash" turns 127.0.0.1:lp into userinfo and
+            # redirects the panel (and any injected creds) to an attacker host.
+            # Requiring isinstance(str) also stops a non-str path crashing the
+            # f-string. All real tunnel paths start with '/', so this is
+            # behaviour-preserving.
+            path = p.get("path", "/")
+            if not (isinstance(path, str) and path.startswith("/")):
+                errs.append(f"{where}: tunnel path must be a string starting "
+                            f"with '/', got {path!r}")
 
     if p.get("scheme", "http") not in VALID_SCHEMES:
         errs.append(f"{where}: scheme must be http or https, got {p['scheme']!r}")
@@ -681,6 +692,19 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
             errs.append(f"vpn.port: must be a port number (1-65535), got {vpn['port']!r}")
         if "insecure" in vpn and not isinstance(vpn["insecure"], bool):
             errs.append(f"vpn.insecure: must be true or false, got {vpn['insecure']!r}")
+        # The iNode pin flows into --pin-sha256 and is compared (in transport.py)
+        # against sha256(cert).hexdigest() after stripping ':'/' ' — i.e. it must
+        # normalise to a 64-hex (or 40-hex sha1) digest. A typo'd/truncated pin
+        # fails closed (compare_digest just won't match) but only at connect time
+        # as an opaque "pin mismatch", so warn early. Mirror _normalize_pin's
+        # strip so the AA:BB:.. colon form is accepted; warning only (no hard
+        # error) — existing configs use placeholder pins like 'AA:BB'.
+        cert = str(vpn.get("trusted_cert", "") or "").strip()
+        if cert and not _is_cert_pin(cert.replace(":", "").replace(" ", "")):
+            warns.append(f"vpn.trusted_cert: does not look like a sha256/sha1 "
+                         f"cert pin (expected 64- or 40-hex digits, ':'-separated "
+                         f"ok) — it will only fail at connect time if wrong, "
+                         f"got {vpn.get('trusted_cert')!r}")
         if not vpn.get("trusted_cert") and not vpn.get("insecure"):
             warns.append("vpn: iNode with no trusted_cert pin and insecure not set — a "
                          "self-signed gateway will fail TLS. Pin its sha256 in "

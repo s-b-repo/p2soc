@@ -277,6 +277,45 @@ tunnel: {enabled: true, jump_host: "u@j"}
 """, "share grid cell", "local_port 19000 is used by more than one panel")
 
 
+def test_validation_tunnel_path_must_start_with_slash():
+    # a tunnel `path` is concatenated straight into effective_url, so a value
+    # without a leading slash (e.g. userinfo injection "@evil.com/x") must be
+    # rejected — it would redirect the loopback panel to an attacker host.
+    _expect_error("""
+panels:
+  - id: t1
+    grid: [0, 0]
+    mode: tunnel
+    tunnel: {local_port: 19002, remote_host: h}
+    path: "@evil.com/dash"
+""" + MINIMAL_PANEL + """
+tunnel: {enabled: true, jump_host: "u@j"}
+""", "tunnel path must be a string starting with '/'")
+    # a non-string path is also rejected (would crash the effective_url f-string)
+    _expect_error("""
+panels:
+  - id: t1
+    grid: [0, 0]
+    mode: tunnel
+    tunnel: {local_port: 19002, remote_host: h}
+    path: 123
+""" + MINIMAL_PANEL + """
+tunnel: {enabled: true, jump_host: "u@j"}
+""", "tunnel path must be a string starting with '/'")
+    # a normal "/..." path is accepted unchanged, and resolves to loopback
+    conf = _load_yaml_text("""
+panels:
+  - id: t1
+    grid: [0, 0]
+    mode: tunnel
+    tunnel: {local_port: 19002, remote_host: h}
+    path: "/dash"
+""" + MINIMAL_PANEL + """
+tunnel: {enabled: true, jump_host: "u@j"}
+""")
+    assert conf.panels[0].effective_url == "http://127.0.0.1:19002/dash"
+
+
 def test_validation_single_layout_rejects_chromium():
     _expect_error("""
 display: {layout: single}
@@ -350,6 +389,30 @@ def test_trusted_cert_rejects_bad_pin():
     _expect_error(_forti_yaml("z" * 64), "sha256", "sha1")   # 64 chars but non-hex
     assert not config._is_cert_pin("")
     assert not config._is_cert_pin("AA:BB:CC")               # colon form is iNode's
+
+
+# --- iNode trusted_cert: warn (not error) on a malformed pin ------------------
+def _inode_yaml(cert):
+    return f"""
+panels: [{{id: a, grid: [0,0], url: "http://x/"}}]
+vpn: {{enabled: true, type: inode, gateway: g, vault_item: VPN,
+       trusted_cert: "{cert}"}}
+"""
+
+
+def test_inode_trusted_cert_warns_on_bad_pin():
+    # a typo'd/truncated iNode pin loads (it fails closed at connect time) but
+    # must surface a config warning so it isn't a silent false sense of pinning.
+    conf = _load_yaml_text(_inode_yaml("nothex"))
+    assert any("trusted_cert" in w and "cert pin" in w for w in conf.warnings), \
+        conf.warnings
+    # a real sha256 pin in the ':'-separated --pin-sha256 form is fine (no warning)
+    colon_pin = ":".join(_SHA256[i:i + 2] for i in range(0, 64, 2))   # AA:BB:..
+    conf = _load_yaml_text(_inode_yaml(colon_pin))
+    assert not any("trusted_cert" in w and "cert pin" in w for w in conf.warnings), \
+        conf.warnings
+    # a bad pin is a WARNING, never a hard error (behaviour-preserving)
+    assert config.vpn_kind(conf.vpn) == "inode"
 
 
 # --- gateway validation: accept real gateways, reject garbage -----------------
@@ -1023,6 +1086,26 @@ def test_openvpn_driver_classify_real_strings():
     assert "--management-hold" in cmd                   # held until creds are sent
 
 
+def test_fortinet_driver_build_cmd_otp_is_only_secret_on_argv():
+    # Pins the documented invariant (host/vpndrivers.py module docstring): the
+    # password reaches openfortivpn via --pinentry (child env), NEVER argv; the
+    # single-use OTP is the lone exception openfortivpn 1.x accepts only as
+    # --otp= on argv. A future change that leaks the password onto argv, or that
+    # silently appends an OTP flag when none was supplied, must break here.
+    d = vpndrivers.FortinetDriver()
+    vpn = {"enabled": True, "gateway": "gw.example", "port": 443,
+           "vault_item": "VPN", "set_routes": True}
+    cmd = d.build_cmd(vpn, "alice", "/x/pinentry.sh", otp="123456")
+    assert cmd[0] == "openfortivpn"
+    assert "-u" in cmd and cmd[cmd.index("-u") + 1] == "alice"
+    assert "--pinentry=/x/pinentry.sh" in cmd
+    assert "--otp=123456" in cmd                 # documented argv exception
+    # the OTP is the ONLY secret on argv: no password, ever
+    assert not any("password" in a.lower() for a in cmd)
+    # no OTP flag at all when no OTP is supplied
+    assert "--otp" not in " ".join(d.build_cmd(vpn, "alice", "/x/pinentry.sh"))
+
+
 def test_get_driver_dispatch():
     assert vpndrivers.get_driver({"type": "openvpn"}).kind == "openvpn"
     assert vpndrivers.get_driver({"type": "wireguard"}).kind == "wireguard"
@@ -1188,6 +1271,58 @@ def test_vaultseed_crypto_roundtrip():
         assert False, "MAC tamper not caught"
     except vaultseed.VaultSeedError:
         pass
+
+
+def test_vaultseed_dec_rejects_bad_pkcs7_padding():
+    # A MAC-valid ciphertext whose plaintext has an invalid PKCS7 final byte
+    # (e.g. 0x00) must fail closed, not silently strip the wrong number of
+    # bytes. Without the guard, last-byte 0x00 yields pt[:-0] == b'' and a
+    # last byte > 16 over-strips — both returning a wrong key with no error.
+    from host import vaultseed
+    if not vaultseed.available():
+        import pytest; pytest.skip("cryptography not installed")
+    import os as _os
+    import hashlib as _hashlib
+    import hmac as _hmac
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    ek, mk = _os.urandom(32), _os.urandom(32)
+    iv = _os.urandom(16)
+    for last in (0x00, 0x11):  # 0x00 (==len 0) and 17 (>16): both invalid
+        plaintext = bytes([0x41] * 15) + bytes([last])  # exactly one block
+        enc = Cipher(algorithms.AES(ek), modes.CBC(iv)).encryptor()
+        ct = enc.update(plaintext) + enc.finalize()
+        mac = _hmac.new(mk, iv + ct, _hashlib.sha256).digest()
+        s = f"2.{vaultseed._b64(iv)}|{vaultseed._b64(ct)}|{vaultseed._b64(mac)}"
+        try:
+            vaultseed._dec(s, ek, mk)
+            assert False, f"bad PKCS7 padding {last:#x} not rejected"
+        except vaultseed.VaultSeedError:
+            pass
+
+
+def test_vaultseed_dec_malformed_encstring_raises_vaultseederror():
+    # _dec() runs on server-returned EncStrings: the account key tok['Key'] and,
+    # in _find's loop, every cipher Name. A field with any '|' part-count other
+    # than 3, or with non-base64 parts, used to raise a bare ValueError (bad
+    # tuple-unpack / binascii.Error) that escaped the caller's per-item
+    # `except VaultSeedError` and aborted the entire seed/find. Each must now
+    # raise VaultSeedError so the single bad item is skipped, not crash.
+    from host import vaultseed
+    import os as _os
+    ek, mk = _os.urandom(32), _os.urandom(32)
+    b16 = vaultseed._b64(b"\x00" * 16)
+    for bad in (
+        "2.onlyone",                         # 1 part (no '|')
+        f"2.{b16}|{b16}",                    # 2 parts
+        "2." + "|".join(["AAAA"] * 4),       # 4 parts
+        "no-dot-at-all",                     # no type separator -> 1 part
+        "2.not-base64!!!|also!!!|nope!!!",   # 3 parts, none decodable
+    ):
+        try:
+            vaultseed._dec(bad, ek, mk)
+            assert False, f"malformed EncString not rejected: {bad!r}"
+        except vaultseed.VaultSeedError:
+            pass
 
 
 def test_vault_prewarm_and_threadsafe_cache(monkeypatch, tmp_path):

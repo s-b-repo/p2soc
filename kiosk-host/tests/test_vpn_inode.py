@@ -1,12 +1,17 @@
 """iNode (H3C SSL VPN) — config helpers, driver classification, render round-trip."""
 import importlib.util
 import os
+import socket
+import sys
 
 import pytest
 
 from host import config, vpndrivers
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# The vendored clean-room backend is imported as the top-level package
+# `h3csvpn` with PYTHONPATH=<...>/backends (see inode-svpn-helper).
+_BACKENDS = os.path.join(_REPO, "vendor", "iNode-VPN-Client", "backends")
 
 
 def test_vpn_kind_inode():
@@ -98,3 +103,74 @@ def test_inode_render_roundtrips():
     assert config.vpn_kind(c.vpn) == "inode"
     assert c.vpn["gateway"] == "g" and c.vpn["vault_item"] == "I"
     assert c.vpn["config"] == "/opt/iNode" and c.vpn["domain"] == "system"
+
+
+# -- wire-level: tunnel preamble body cap -------------------------------------
+# After NET_EXTEND the netconfig is read on the raw socket (not via the capped
+# httpclient). A hostile gateway must not be able to drive an unbounded
+# reassembly buffer by declaring a giant Content-Length; the preamble reader
+# enforces the same C.MAX_BODY_BYTES cap that Connection._read_exact does.
+
+def _load_h3c_session():
+    if _BACKENDS not in sys.path:
+        sys.path.insert(0, _BACKENDS)
+    try:
+        from h3csvpn import constants as C  # noqa: WPS433 (vendored package)
+        from h3csvpn import session as s
+    except Exception as exc:  # pragma: no cover - backend must import here
+        pytest.skip(f"h3csvpn backend unavailable: {exc}")
+    return C, s
+
+
+class _FakeConn:
+    """Minimal stand-in for httpclient.Connection for _read_tunnel_preamble:
+    exposes a real (selectable) socket and the take_buffered() leftover API."""
+
+    def __init__(self, sock, buffered=b""):
+        self.sock = sock
+        self._buf = buffered
+
+    def take_buffered(self):
+        out, self._buf = self._buf, b""
+        return out
+
+
+def _make_session(s):
+    return s.SslVpnSession(s.Credentials("u", "p"), s.Options(host="h"))
+
+
+def test_tunnel_preamble_rejects_oversized_content_length():
+    """A gateway declaring Content-Length > MAX_BODY_BYTES is rejected up front
+    with AuthError, before the recv loop can grow the reassembly buffer."""
+    C, s = _load_h3c_session()
+    sess = _make_session(s)
+    a, b = socket.socketpair()
+    try:
+        head = (b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: %d\r\n\r\n" % (C.MAX_BODY_BYTES + 1))
+        a.sendall(head)
+        with pytest.raises(s.AuthError) as e:
+            sess._read_tunnel_preamble(_FakeConn(b))
+        msg = str(e.value).lower()
+        assert "content-length" in msg and "exceeds" in msg
+    finally:
+        a.close()
+        b.close()
+
+
+def test_tunnel_preamble_parses_bounded_netconfig_body():
+    """The unchanged success path: a small HTTP-body netconfig (Content-Length
+    well under the cap) is still read and parsed."""
+    _C, s = _load_h3c_session()
+    sess = _make_session(s)
+    a, b = socket.socketpair()
+    try:
+        body = b"IPADDRESS:10.0.0.2\nSUBNETMASK:255.255.255.0\n"
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body)
+        a.sendall(head + body)
+        leftover, cfg = sess._read_tunnel_preamble(_FakeConn(b))
+        assert cfg is not None
+        assert leftover == b""
+    finally:
+        a.close()
+        b.close()

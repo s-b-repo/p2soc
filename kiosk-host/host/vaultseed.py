@@ -29,6 +29,13 @@ class VaultSeedError(Exception):
     pass
 
 
+# Cap on a single Vaultwarden HTTP response body. A real personal vault's
+# /api/ciphers is well under this; the ceiling exists so a compromised/MITM'd
+# endpoint can't stream a multi-GB (or infinite) body into one bytes object and
+# OOM the 1 GB Pi. Mirrors the h3c httpclient's MAX_BODY_BYTES defense.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
 def _b64(b: bytes) -> str:
     return base64.b64encode(b).decode()
 
@@ -66,13 +73,21 @@ def _enc(plaintext: bytes, ek: bytes, mk: bytes) -> str:
 
 def _dec(s: str, ek: bytes, mk: bytes) -> bytes:
     Cipher, algorithms, modes = _aes()
-    iv_b, ct_b, mac_b = s.split(".", 1)[1].split("|")
-    iv, ct, mac = _ub64(iv_b), _ub64(ct_b), _ub64(mac_b)
+    body = s.split(".", 1)
+    parts = body[1].split("|") if len(body) == 2 else []
+    if len(parts) != 3:
+        raise VaultSeedError("malformed EncString")
+    try:
+        iv, ct, mac = (_ub64(p) for p in parts)
+    except (ValueError, TypeError) as e:  # binascii.Error is a ValueError
+        raise VaultSeedError(f"bad EncString base64: {e}")
     if not hmac.compare_digest(
             hmac.new(mk, iv + ct, hashlib.sha256).digest(), mac):
         raise VaultSeedError("MAC mismatch decrypting the account key")
     dec = Cipher(algorithms.AES(ek), modes.CBC(iv)).decryptor()
     pt = dec.update(ct) + dec.finalize()
+    if not pt or pt[-1] < 1 or pt[-1] > 16:
+        raise VaultSeedError("bad PKCS7 padding")
     return pt[:-pt[-1]]
 
 
@@ -89,7 +104,12 @@ def _req(url, headers=None, data=None, method="GET", form=False):
     req = urllib.request.Request(url, data=body, headers=h, method=method)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read().decode()
+            buf = r.read(MAX_RESPONSE_BYTES + 1)
+            if len(buf) > MAX_RESPONSE_BYTES:
+                raise VaultSeedError(
+                    f"{method} {url}: vault response exceeds "
+                    f"{MAX_RESPONSE_BYTES} bytes")
+            raw = buf.decode()
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as e:
         raise VaultSeedError(f"{method} {url} -> HTTP {e.code}: "

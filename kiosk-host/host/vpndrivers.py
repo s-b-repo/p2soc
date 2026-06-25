@@ -12,7 +12,10 @@ Two shapes:
     `wg-quick up` and are supervised purely by health probing + up/down.
 
 Credentials never touch argv or disk:
-  * Fortinet — password via the pinentry helper (child environment).
+  * Fortinet — password via the pinentry helper (child environment). The lone
+    exception is the optional single-use OTP (otp_from_vault): openfortivpn 1.x
+    accepts it only as `--otp=` on argv, so when enabled it is briefly visible
+    in the process list (single-use, consumed in ~1s) — see docs/SECURITY.md.
   * OpenVPN  — username/password answered over a local management socket.
   * WireGuard — no interactive creds (keys live in the .conf, protect it 0600).
 """

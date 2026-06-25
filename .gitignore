@@ -11,7 +11,7 @@ keys/
 .rbw/
 vaultwarden.env
 dev-vault.json
-kiosk-host/host/secret*
+kiosk-host/host/secret-dir/
 sealed-secret/
 sealed-secrets/
 *.sealed

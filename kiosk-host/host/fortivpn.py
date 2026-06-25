@@ -118,8 +118,11 @@ class SdWatchdog:
 
 # --- command assembly ---------------------------------------------------------
 def build_cmd(vpn: dict, user: str, pinentry: str, otp: str = "") -> list:
-    """Full openfortivpn argv. Only non-secrets: the password travels via the
-    pinentry helper (environment), never argv."""
+    """Full openfortivpn argv. The password travels via the pinentry helper
+    (environment), never argv. The one exception is the optional single-use OTP
+    (otp_from_vault): openfortivpn 1.x accepts it only as `--otp=` on argv, so
+    when supplied it is briefly visible in the process list (single-use,
+    consumed in ~1s) — see docs/SECURITY.md."""
     cmd = ["openfortivpn", *cfg.openfortivpn_args(vpn),
            "-u", user, f"--pinentry={pinentry}"]
     if otp:

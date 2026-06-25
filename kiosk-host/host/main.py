@@ -516,9 +516,13 @@ def _cache_config(text: str):
     try:
         p = _config_cache_path()
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.chmod(p, 0o600)
+        tmp = p + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, p)
     except OSError:
         pass
 

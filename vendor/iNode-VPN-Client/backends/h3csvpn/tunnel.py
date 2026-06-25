@@ -283,6 +283,7 @@ class Tunnel:
             return found
         # 2) read until a netconfig frame appears
         deadline = time.monotonic() + timeout
+        early_bytes = sum(len(p) for _, _, p in self._early)
         while time.monotonic() < deadline:
             r, _, _ = select.select([self.sock], [], [], max(0.0, deadline - time.monotonic()))
             if not r:
@@ -294,4 +295,7 @@ class Tunnel:
                 if ftype == C.FRAME_NETCONFIG and subtype == C.NETCONFIG_SUB_UPDATE:
                     return parse_netconfig(payload)
                 self._early.append((ftype, subtype, payload))  # retain for run()
+                early_bytes += len(payload)
+                if early_bytes > C.MAX_EARLY_BYTES:
+                    raise TunnelClosed("too many early frames before netconfig (flood)")
         return None

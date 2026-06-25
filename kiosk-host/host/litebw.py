@@ -146,7 +146,14 @@ def derive_master_key(password: str, email: str, kdf: int, iterations: int,
     email_l = email.lower()
     pw = password.encode()
     if kdf == 0:
-        return hashlib.pbkdf2_hmac("sha256", pw, email_l.encode(), iterations, 32)
+        # Clamp server-supplied iteration count: the prelogin response is
+        # UNAUTHENTICATED network input, and a hostile/MITM'd Vaultwarden can
+        # declare kdfIterations in the billions to pin the CPU for minutes and
+        # wedge every unlock()/boot. The 10M ceiling keeps the floor (>=1) and
+        # changes nothing for any real vault (Bitwarden default 600k); the KDF
+        # math itself is untouched.
+        iters = min(max(1, iterations), 10_000_000)
+        return hashlib.pbkdf2_hmac("sha256", pw, email_l.encode(), iters, 32)
     if kdf == 1:
         if not _argon2id_available():
             raise VaultSeedError(
@@ -156,12 +163,19 @@ def derive_master_key(password: str, email: str, kdf: int, iterations: int,
                 "Vaultwarden account to the PBKDF2 KDF.")
         from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
         salt = hashlib.sha256(email_l.encode()).digest()
+        # Clamp the server-supplied Argon2id parameters. memory is in MiB and
+        # becomes memory_cost = memory*1024 KiB fed to .derive(): an unbounded
+        # kdfMemory (e.g. 8_000_000) makes cryptography attempt a multi-TB
+        # allocation -> instant OOM-kill of the 1GB kiosk at boot. The ceilings
+        # (1024 MiB ~= 1GB-equivalent work, 10M iters, 16 lanes) mirror sane
+        # Bitwarden limits and leave the MiB->KiB *1024 mapping and every value
+        # <= the ceiling (all KATs + real vaults) byte-for-byte identical.
         return Argon2id(
             salt=salt,
             length=32,
-            iterations=max(1, iterations),
-            lanes=max(1, parallelism or 1),
-            memory_cost=max(8, memory) * 1024,   # MiB -> KiB
+            iterations=min(max(1, iterations), 10_000_000),
+            lanes=min(max(1, parallelism or 1), 16),
+            memory_cost=min(max(8, memory), 1024) * 1024,   # MiB -> KiB, <=1 GiB
         ).derive(pw)
     raise VaultSeedError(f"unsupported KDF type {kdf} (only PBKDF2 and Argon2id)")
 
@@ -270,10 +284,27 @@ def generate_totp(totp_secret: str, at: float | None = None) -> str:
         secret = (q.get("secret", [""])[0]) or ""
         if not secret:
             raise ValueError("otpauth URI has no secret")
+        # digits/period are attacker-controlled (the otpauth URI comes from a
+        # vault item that a compromised/MITM'd server or shared org item can
+        # set). Guard + range-clamp BEFORE the dangerous 10**digits / // period
+        # math below: a huge digits builds a 100M-digit int (hard DoS on the
+        # 1GB board), period=0 is a ZeroDivisionError, and non-numeric raises.
+        # The bounds cover every legitimate code (digits 6-8, period 15-60), so
+        # no real secret is affected and no wire/crypto behaviour changes.
         if q.get("digits"):
-            digits = int(q["digits"][0])
+            try:
+                digits = int(q["digits"][0])
+            except ValueError:
+                raise ValueError("TOTP digits is not an integer")
+            if not (1 <= digits <= 10):
+                raise ValueError("TOTP digits out of range")
         if q.get("period"):
-            period = int(q["period"][0])
+            try:
+                period = int(q["period"][0])
+            except ValueError:
+                raise ValueError("TOTP period is not an integer")
+            if period < 1:
+                raise ValueError("TOTP period out of range")
         if q.get("algorithm"):
             alg = q["algorithm"][0].upper()
             if alg == "STEAM":
@@ -344,7 +375,12 @@ class ReadSession:
         req = urllib.request.Request(url, data=body, headers=h, method=method)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
-                raw = r.read().decode()
+                buf = r.read(vaultseed.MAX_RESPONSE_BYTES + 1)
+                if len(buf) > vaultseed.MAX_RESPONSE_BYTES:
+                    raise VaultSeedError(
+                        f"{method} {url}: vault response exceeds "
+                        f"{vaultseed.MAX_RESPONSE_BYTES} bytes")
+                raw = buf.decode()
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as e:
             detail = e.read().decode()[:200]
