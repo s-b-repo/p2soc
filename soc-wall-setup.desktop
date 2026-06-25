@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Name=SOC Wall Setup
+Comment=Configure the SOC video wall — presets and validated custom settings
+Exec=/opt/soc-display/scripts/soc-wall-setup-gui.sh
+Icon=soc-wall
+Terminal=false
+Type=Application
+Categories=System;Settings;
+Keywords=soc;setup;config;wizard;

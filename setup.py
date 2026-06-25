@@ -17,6 +17,7 @@ Usage:
   python3 setup.py                 # interactive menu (deploy / configure / diagnose / ...)
   python3 setup.py deploy          # full automated deployment, end to end
   python3 setup.py wizard          # just the configuration wizard
+  python3 setup.py wizard-gui      # the graphical configuration wizard (desktop window)
   python3 setup.py doctor          # diagnose an existing install
   python3 setup.py repair          # fix what doctor flags (packages / venv / keys)
   python3 setup.py creds           # store logins in Vaultwarden
@@ -1407,6 +1408,34 @@ def cmd_install(args) -> int:
     return cmd_doctor(args)
 
 
+def _gui_available() -> bool:
+    """True if a graphical setup is launchable: a display AND GTK3 importable.
+    Pure stdlib — we only check for $DISPLAY/$WAYLAND_DISPLAY here; the actual
+    gi import is left to the GUI process (which degrades on its own too)."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def cmd_wizard_gui(args) -> int:
+    """Launch the graphical setup wizard (scripts/soc-wall-setup-gui.sh).
+
+    The GUI reuses this module's renderers/validators + the host secret store,
+    so it writes the SAME artifacts as `wizard`. Pure stdlib here: if there is
+    no display (or the launcher script is missing), degrade gracefully to the
+    TTY wizard so scripted/headless runs still work."""
+    gui_sh = os.path.join(REPO, "scripts", "soc-wall-setup-gui.sh")
+    if not _gui_available():
+        note("no graphical display detected — falling back to the text wizard")
+        return cmd_wizard(args)
+    if not os.path.exists(gui_sh):
+        note(f"GUI launcher not found ({gui_sh}) — falling back to the text wizard")
+        return cmd_wizard(args)
+    rc = _run([gui_sh])
+    if rc not in (0, None):
+        warn("the graphical wizard exited with an error — falling back to the text wizard")
+        return cmd_wizard(args)
+    return rc or 0
+
+
 def cmd_menu(args) -> int:
     """Interactive launcher — the default when run with no subcommand on a TTY."""
     env = Env()
@@ -1420,6 +1449,7 @@ def cmd_menu(args) -> int:
         ("deploy", "Deploy", "full automated install + configure + seal PIN + credentials"),
         ("clean", "Clean deploy", "wipe generated config/state, then deploy fresh"),
         ("wizard", "Configure", "edit panels, vault, VPN, proxy (writes the config files)"),
+        ("wizard-gui", "Configure (graphical)", "the same wizard in a desktop window (presets + live validation)"),
         ("first-run", "First-time setup", "generate the one-time PIN + seal the master password"),
         ("doctor", "Diagnose", "check this install and report problems"),
         ("repair", "Repair", "install missing packages / venv / keys doctor flagged"),
@@ -1449,7 +1479,8 @@ def cmd_menu(args) -> int:
     if choice == "clean":
         args.clean = True
         return cmd_deploy(args)
-    return {"deploy": cmd_deploy, "wizard": cmd_wizard, "doctor": cmd_doctor,
+    return {"deploy": cmd_deploy, "wizard": cmd_wizard,
+            "wizard-gui": cmd_wizard_gui, "doctor": cmd_doctor,
             "repair": cmd_repair, "creds": cmd_creds,
             "first-run": cmd_firstrun}[choice](args)
 
@@ -1468,10 +1499,139 @@ def _unseal_master(secret_dir, prompt_label=None) -> str:
     return ask_secret(prompt_label) if prompt_label else ""
 
 
+class SealMasterError(Exception):
+    """A seal/store step failed (bad input, locked wallet, missing crypto, …).
+    Carries a human-readable message both wizards surface to the operator."""
+
+
+def seal_master(pw, *, source, pin, paths, soc_env, backend, dry) -> str:
+    """Non-interactive seal/store CORE shared by the TTY first-run wizard and the
+    GUI, so the two CANNOT drift. Given an already-collected master ``pw`` and the
+    chosen ``source`` (auto|sealed|secret-service|env), it performs the mechanical
+    work: seal/store + verify-unseal + ``rewrite_env(SOC_MASTER_SOURCE)`` + (for
+    rbw/litebw) the email/base_url/pinentry client config + scrubbing any leftover
+    plaintext ``SOC_VAULT_PASSWORD`` out of soc.env once the seal is confirmed.
+
+    It NEVER prompts and NEVER writes the master to a file (only the SOURCE name
+    is recorded). Returns the PIN actually used (the passed-in PIN, or a freshly
+    generated one for the sealed path; '' for the secret-service / env sources).
+    Raises ``SealMasterError`` on any hard failure. ``dry`` short-circuits every
+    side effect (no seal, no store, no rewrite) but still returns the PIN that
+    would have been used so a caller can preview it.
+
+    ``source`` 'auto' is materialised by sealing host-bound (the unattended
+    default) while RECORDING 'auto' in soc.env (so the secret-service -> env
+    runtime fallbacks survive if the seal is ever removed)."""
+    sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
+    try:
+        from host import mastersource, secretstore  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        raise SealMasterError(f"cannot load the secret store ({e})")
+
+    record_src = source
+    eff_src = "sealed" if source == "auto" else source
+    env_mode = paths.get("env_mode", 0o600)
+
+    if eff_src == "env":
+        # DEV/seeding only — nothing to seal/store; record the source choice.
+        if not dry:
+            rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": "env"},
+                        mode=env_mode)
+        return ""
+
+    if eff_src == "secret-service":
+        if not mastersource._have_secret_tool():
+            raise SealMasterError(
+                "secret-tool (libsecret) is not on PATH — install it "
+                "(apt: libsecret-tools; dnf/pacman/apk/xbps: libsecret), or pick "
+                "the 'sealed' source. Nothing stored.")
+        if not pw:
+            raise SealMasterError("no master password entered — nothing stored")
+        if not dry:
+            try:
+                mastersource.store_master(pw, "secret-service")
+                if mastersource.get_master("secret-service") != pw:
+                    raise mastersource.MasterSourceError(
+                        "stored value did not read back — wallet locked?")
+            except mastersource.MasterSourceError as e:
+                raise SealMasterError(f"could not store the master in the wallet: {e}")
+            updates = {"SOC_MASTER_SOURCE": "secret-service"}
+            removes = ("SOC_VAULT_PASSWORD",) if soc_env.get("SOC_VAULT_PASSWORD") else ()
+            rewrite_env(paths["soc_env"], remove=removes, set_kv=updates, mode=env_mode)
+            if backend in ("rbw", "litebw") and _have(backend):
+                _run([backend, "config", "set", "pinentry", paths["pinentry"]])
+        return ""
+
+    # eff_src == 'sealed' — the host-bound seal path. Needs cryptography.
+    if not secretstore.available():
+        raise SealMasterError(
+            "the 'cryptography' package is required to seal the master password "
+            "(pip install cryptography)")
+    if not pw:
+        raise SealMasterError("no master password entered — nothing sealed")
+
+    # Honor a custom SOC_SECRET_DIR — doctor, the credential store, and the
+    # boot-time pinentry all read it, so we MUST seal to the SAME place or the
+    # wall seals here but looks for the secret elsewhere and can't self-unlock.
+    sd = soc_env.get("SOC_SECRET_DIR") or paths["secret_dir"]
+    use_pin = pin or secretstore.gen_pin()
+    if not dry:
+        try:
+            secretstore.seal(pw, use_pin, sd)
+            # Verify it unseals on THIS host before we trust it (and before any
+            # plaintext gets scrubbed) — never lock the wall out.
+            if secretstore.unseal(sd) != pw:
+                raise secretstore.SecretStoreError("seal did not unseal to the same value")
+        except secretstore.SecretStoreError as e:
+            raise SealMasterError(f"could not seal: {e}")
+        _seal_housekeeping(secretstore, sd, record_src, paths, soc_env, backend)
+    return use_pin
+
+
+def _seal_housekeeping(secretstore, sd, record_src, paths, soc_env, backend) -> None:
+    """Post-seal client wiring shared by ``seal_master`` (after a fresh seal) and
+    ``cmd_firstrun`` (when the operator KEEPS an existing seal): point the rbw/
+    litebw client at the unsealing pinentry (+ email/base_url), scrub any leftover
+    plaintext ``SOC_VAULT_PASSWORD`` once the seal is confirmed to unseal, and
+    record the chosen source. The master itself is never written — only wiring."""
+    # point the vault client at the unsealing pinentry + bake email/url
+    if backend in ("rbw", "litebw") and _have(backend):
+        if soc_env.get("SOC_VAULT_EMAIL"):
+            _run([backend, "config", "set", "email", soc_env["SOC_VAULT_EMAIL"]])
+        if soc_env.get("SOC_VAULT_URL"):
+            _run([backend, "config", "set", "base_url", soc_env["SOC_VAULT_URL"]])
+        _run([backend, "config", "set", "pinentry", paths["pinentry"]])
+
+    # Clean any leftover plaintext master out of soc.env now that it is sealed —
+    # only after CONFIRMING it unseals, so a failed seal never strands the
+    # operator. record where we sealed + repoint a stale pinentry too.
+    if soc_env.get("SOC_VAULT_PASSWORD") and secretstore.is_sealed(sd):
+        try:
+            secretstore.unseal(sd)
+        except Exception:  # noqa: BLE001 — keep the plaintext if it won't unseal here
+            pass
+        else:
+            updates = {}
+            if (soc_env.get("SOC_SECRET_DIR") or "/etc/soc-display/secret") != sd:
+                updates["SOC_SECRET_DIR"] = sd
+            if soc_env.get("SOC_PINENTRY", "").endswith("pinentry-soc.sh"):
+                updates["SOC_PINENTRY"] = paths["pinentry"]
+            rewrite_env(paths["soc_env"], remove=("SOC_VAULT_PASSWORD",),
+                        set_kv=updates, mode=paths["env_mode"])
+
+    # Record the chosen source ('auto' preserved verbatim; 'sealed' as 'sealed').
+    if secretstore.is_sealed(sd) and soc_env.get("SOC_MASTER_SOURCE") != record_src:
+        rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": record_src},
+                    mode=paths.get("env_mode", 0o600))
+
+
 def cmd_firstrun(args) -> int:
     """First-time setup: generate a one-time PIN, seal the vault master password
     host-bound (no plaintext .env), point litebw at the unsealing pinentry. Asks
-    before overwriting an existing seal; re-runnable to change the password."""
+    before overwriting an existing seal; re-runnable to change the password.
+
+    Gathers inputs interactively, then delegates the mechanical seal/store to
+    ``seal_master`` (shared verbatim with the GUI wizard)."""
     env = Env()
     target = args.target or ("pi" if env.is_root else "dev")
     paths = resolve_paths(target)
@@ -1486,7 +1646,7 @@ def cmd_firstrun(args) -> int:
         return 0
     sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
     try:
-        from host import mastersource, secretstore  # type: ignore
+        from host import mastersource, secretstore  # type: ignore  # noqa: F401
     except Exception as e:  # noqa: BLE001
         err(f"cannot load the secret store ({e})")
         return 1
@@ -1501,27 +1661,20 @@ def cmd_firstrun(args) -> int:
     src = ask_choice(
         "master-password source", ["auto", "sealed", "secret-service", "env"],
         cur_src if cur_src in ("auto", "sealed", "secret-service", "env") else "auto")
-    # 'auto' is materialised by sealing host-bound (the unattended default); the
-    # source name recorded in soc.env below stays 'auto' so the wall keeps its
-    # secret-service -> env fallbacks if the seal is ever removed.
-    record_src = src
-    if src == "auto":
-        src = "sealed"
+    eff_src = "sealed" if src == "auto" else src
 
-    if src == "env":
+    if eff_src == "env":
         warn("'env' reads $SOC_VAULT_PASSWORD — DEV/seeding only; never persisted "
              "to a file. Nothing to seal/store; recording the source choice only.")
-        if not args.dry_run:
-            rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": "env"},
-                        mode=paths.get("env_mode", 0o600))
+        try:
+            seal_master("", source=src, pin="", paths=paths, soc_env=soc_env,
+                        backend=backend, dry=args.dry_run)
+        except SealMasterError as e:
+            err(str(e))
+            return 1
         return 0
 
-    if src == "secret-service":
-        if not mastersource._have_secret_tool():
-            err("secret-tool (libsecret) is not on PATH — install it "
-                "(apt: libsecret-tools; dnf/pacman/apk/xbps: libsecret), or pick "
-                "the 'sealed' source. Nothing stored.")
-            return 1
+    if eff_src == "secret-service":
         master = ask_secret("vault master password (stored in the Secret Service "
                             "wallet, never in a file)")
         if not master:
@@ -1530,42 +1683,30 @@ def cmd_firstrun(args) -> int:
         if args.dry_run:
             print(yellow("   [dry-run] would store the master via secret-tool "
                          "(service=soc-wall account=vault-master)"))
-        else:
-            try:
-                mastersource.store_master(master, "secret-service")
-                if mastersource.get_master("secret-service") != master:
-                    raise mastersource.MasterSourceError(
-                        "stored value did not read back — wallet locked?")
-            except mastersource.MasterSourceError as e:
-                err(f"could not store the master in the wallet: {e}")
-                return 1
+        try:
+            seal_master(master, source=src, pin="", paths=paths, soc_env=soc_env,
+                        backend=backend, dry=args.dry_run)
+        except SealMasterError as e:
+            master = ""  # scrub
+            err(str(e))
+            return 1
+        master = ""  # scrub
+        if not args.dry_run:
             ok("stored + verified the master in the Secret Service wallet "
                "(service=soc-wall account=vault-master)")
-        master = ""  # scrub
+            if backend in ("rbw", "litebw") and _have(backend):
+                ok(f"{backend} configured (pinentry -> pinentry-vault.py -> secret-service)")
         note("Reminder: a headless wall's wallet is LOCKED at boot. For unattended")
         note("use, auto-unlock the wallet (PAM / gnome-keyring --unlock) or prefer")
         note("the 'sealed' source. See docs/SECURITY.md.")
-        if not args.dry_run:
-            updates = {"SOC_MASTER_SOURCE": "secret-service"}
-            # scrub any leftover plaintext master now that the wallet holds it
-            removes = ("SOC_VAULT_PASSWORD",) if soc_env.get("SOC_VAULT_PASSWORD") else ()
-            rewrite_env(paths["soc_env"], remove=removes, set_kv=updates,
-                        mode=paths.get("env_mode", 0o600))
-            if backend in ("rbw", "litebw") and _have(backend):
-                _run([backend, "config", "set", "pinentry", paths["pinentry"]])
-                ok(f"{backend} configured (pinentry -> pinentry-vault.py -> secret-service)")
         return 0
 
-    # src == 'sealed' below — the host-bound seal path. Needs cryptography.
+    # eff_src == 'sealed' below — the host-bound seal path. Needs cryptography.
     if not secretstore.available():
         err("the 'cryptography' package is required to seal the master password "
             "(pip install cryptography)")
         return 1
 
-    # Honor a custom SOC_SECRET_DIR from soc.env — doctor, the credential store,
-    # and the boot-time pinentry all read it, so first-run must seal to the SAME
-    # place or the wall seals here but looks for the secret elsewhere and can't
-    # self-unlock at boot.
     sd = soc_env.get("SOC_SECRET_DIR") or paths["secret_dir"]
     do_seal = True
     if secretstore.is_sealed(sd):
@@ -1580,21 +1721,26 @@ def cmd_firstrun(args) -> int:
         if not master:
             err("no master password entered — nothing sealed")
             return 1
-        pin = ask("one-time PIN (blank = generate a random one)", "") or secretstore.gen_pin()
+        pin = ask("one-time PIN (blank = generate a random one)", "")
         if args.dry_run:
             print(yellow(f"   [dry-run] would seal the master password to {sd}"))
-        else:
-            try:
-                secretstore.seal(master, pin, sd)
-                # Verify it unseals on THIS host before we trust it (and before
-                # any plaintext gets scrubbed) — never lock the wall out.
-                if secretstore.unseal(sd) != master:
-                    raise secretstore.SecretStoreError("seal did not unseal to the same value")
-            except secretstore.SecretStoreError as e:
-                err(f"could not seal: {e}")
-                return 1
-            ok(f"sealed + verified the master password (host-bound) -> {sd}")
+        try:
+            pin = seal_master(master, source=src, pin=pin, paths=paths,
+                              soc_env=soc_env, backend=backend, dry=args.dry_run)
+        except SealMasterError as e:
+            master = ""  # scrub
+            err(str(e))
+            return 1
         master = ""  # scrub
+        if not args.dry_run:
+            ok(f"sealed + verified the master password (host-bound) -> {sd}")
+            if backend in ("rbw", "litebw") and _have(backend):
+                ok(f"{backend} configured (email / base_url / pinentry -> pinentry-vault.py)")
+            elif backend in ("rbw", "litebw"):
+                warn(f"{backend} is not on PATH — install it, then re-run first-run to configure it")
+            if soc_env.get("SOC_VAULT_PASSWORD"):
+                ok(f"removed plaintext SOC_VAULT_PASSWORD from {paths['soc_env']} "
+                   f"(master is now host-sealed)")
         banner("YOUR ONE-TIME PIN")
         print()
         print("        " + bold(green("  ".join(pin))))
@@ -1606,51 +1752,14 @@ def cmd_firstrun(args) -> int:
             _readline("   press Enter once you have recorded the PIN ... ")
     else:
         note("kept the existing sealed secret.")
-
-    # point the vault client at the unsealing pinentry + bake email/url into its config
-    if backend in ("rbw", "litebw") and _have(backend):
-        if soc_env.get("SOC_VAULT_EMAIL"):
-            _run([backend, "config", "set", "email", soc_env["SOC_VAULT_EMAIL"]])
-        if soc_env.get("SOC_VAULT_URL"):
-            _run([backend, "config", "set", "base_url", soc_env["SOC_VAULT_URL"]])
-        _run([backend, "config", "set", "pinentry", paths["pinentry"]])
-        ok(f"{backend} configured (email / base_url / pinentry -> pinentry-vault.py)")
-    elif backend in ("rbw", "litebw"):
-        warn(f"{backend} is not on PATH — install it, then re-run first-run to configure it")
-
-    # Clean the plaintext master out of soc.env now that it is sealed. Only do
-    # this once we have CONFIRMED the seal unseals on this host, so a failed seal
-    # can never strand the operator without their password.
-    if not args.dry_run and soc_env.get("SOC_VAULT_PASSWORD"):
-        if not secretstore.is_sealed(sd):
-            warn("not sealed — keeping SOC_VAULT_PASSWORD in soc.env (nothing to fall back on)")
-        else:
-            try:
-                secretstore.unseal(sd)
-            except Exception as e:  # noqa: BLE001
-                warn(f"sealed secret does not unseal here ({e}); keeping "
-                     f"SOC_VAULT_PASSWORD so you are not locked out")
-            else:
-                updates = {}
-                # record where we sealed, if soc.env points elsewhere/nowhere
-                if (soc_env.get("SOC_SECRET_DIR") or "/etc/soc-display/secret") != sd:
-                    updates["SOC_SECRET_DIR"] = sd
-                # repoint a stale pinentry (the retired pinentry-soc.sh)
-                if soc_env.get("SOC_PINENTRY", "").endswith("pinentry-soc.sh"):
-                    updates["SOC_PINENTRY"] = paths["pinentry"]
-                rewrite_env(paths["soc_env"], remove=("SOC_VAULT_PASSWORD",),
-                            set_kv=updates, mode=paths["env_mode"])
+        # Re-run the client wiring / plaintext scrub / source record against the
+        # EXISTING seal (same as a fresh seal, minus the seal itself), so a
+        # re-run that declines re-sealing still repoints a stale client.
+        if not args.dry_run:
+            _seal_housekeeping(secretstore, sd, src, paths, soc_env, backend)
+            if soc_env.get("SOC_VAULT_PASSWORD"):
                 ok(f"removed plaintext SOC_VAULT_PASSWORD from {paths['soc_env']} "
                    f"(master is now host-sealed)")
-
-    # Record the chosen source so doctor / the wall resolve it unambiguously
-    # (the master itself is NEVER written to soc.env — only the source name).
-    # 'auto' is preserved verbatim (keeps the secret-service/env fallbacks); an
-    # explicit 'sealed' is recorded as 'sealed'.
-    if not args.dry_run and secretstore.is_sealed(sd) \
-            and soc_env.get("SOC_MASTER_SOURCE") != record_src:
-        rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": record_src},
-                    mode=paths.get("env_mode", 0o600))
     return 0
 
 
@@ -1885,12 +1994,13 @@ def main():
     ap = argparse.ArgumentParser(
         description="Setup, diagnose, repair + install the SOC video wall.")
     ap.add_argument("command", nargs="?", default=None,
-                    choices=["menu", "deploy", "first-run", "wizard", "doctor",
-                             "repair", "install", "creds"],
+                    choices=["menu", "deploy", "first-run", "wizard", "wizard-gui",
+                             "doctor", "repair", "install", "creds"],
                     help="menu (default on a TTY) | deploy (full automated "
                          "deploy) | first-run (seal the one-time PIN) | wizard "
-                         "(config) | doctor (diagnose) | repair (fix/install "
-                         "missing) | install (OS install + wizard) | creds (logins)")
+                         "(config) | wizard-gui (graphical config) | doctor "
+                         "(diagnose) | repair (fix/install missing) | install "
+                         "(OS install + wizard) | creds (logins)")
     ap.add_argument("--clean", action="store_true",
                     help="deploy: wipe generated config/state first (fresh deploy)")
     ap.add_argument("--fresh", action="store_true",
@@ -1916,7 +2026,7 @@ def main():
     dispatch = {
         "menu": cmd_menu, "deploy": cmd_deploy, "first-run": cmd_firstrun,
         "doctor": cmd_doctor, "repair": cmd_repair, "install": cmd_install,
-        "creds": cmd_creds, "wizard": cmd_wizard,
+        "creds": cmd_creds, "wizard": cmd_wizard, "wizard-gui": cmd_wizard_gui,
     }
     return dispatch[cmd](args)
 

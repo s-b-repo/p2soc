@@ -32,7 +32,7 @@ dev-vault:  ## write dev/run/dev-vault.json (dev vault backend, no server needed
 	@echo "wrote dev/run/dev-vault.json"
 
 .PHONY: vault
-vault: .venv  ## start Vaultwarden in Docker + seed it via rbw (full vault path)
+vault: .venv  ## start Vaultwarden in Docker + seed it via litebw (full vault path)
 	docker rm -f soc-vaultwarden 2>/dev/null || true
 	mkdir -p dev/run/vw-data
 	docker run -d --name soc-vaultwarden -e ADMIN_TOKEN=devadmintoken \
@@ -46,6 +46,23 @@ vault: .venv  ## start Vaultwarden in Docker + seed it via rbw (full vault path)
 .PHONY: dev
 dev: .venv dev-vault  ## run the wall in a Xephyr window (interactive; Ctrl-C to stop)
 	bash dev/run-wall.sh
+
+.PHONY: wizard-gui
+wizard-gui: .venv  ## graphical setup wizard (presets + live validation; needs a display)
+	PYTHONPATH=kiosk-host $(PY) -m host.setupgui
+
+.PHONY: desktop-dev
+desktop-dev: .venv  ## install user-level app icons pointing at THIS checkout (no sudo)
+	@mkdir -p $(HOME)/.local/share/applications $(HOME)/.local/share/icons/hicolor/scalable/apps
+	@install -m0644 share/icons/soc-wall.svg $(HOME)/.local/share/icons/hicolor/scalable/apps/soc-wall.svg
+	@PYTHONPATH=kiosk-host SOC_ROOT="$(CURDIR)" $(PY) -m host.branding desktop \
+	  "$(CURDIR)/scripts/soc-wall-menu" soc-wall > $(HOME)/.local/share/applications/soc-wall.desktop
+	@printf '%s\n' '[Desktop Entry]' 'Name=SOC Wall Setup' 'Comment=Configure the SOC video wall' \
+	  'Exec=$(CURDIR)/scripts/soc-wall-setup-gui.sh' 'Icon=soc-wall' 'Terminal=false' \
+	  'Type=Application' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-setup.desktop
+	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
+	@command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
+	@echo "dev app icons installed -> $(HOME)/.local/share/applications (SOC Video Wall + SOC Wall Setup)"
 
 .PHONY: verify
 verify: .venv dev-vault  ## headless end-to-end check (Xvfb) — asserts logins + tunnel + screenshot

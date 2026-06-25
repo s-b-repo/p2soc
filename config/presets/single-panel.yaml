@@ -1,0 +1,53 @@
+# name: Single panel
+# desc: One fullscreen dashboard on the screen. The minimal starting point — edit
+#       the URL, vault item and login selectors, then deploy.
+# =============================================================================
+# SOC video-wall preset — a complete, valid panels.yaml starting point.
+# Loaded by the graphical setup wizard (host.setupgui) and customizable by hand.
+# =============================================================================
+
+display:
+  auto: true
+  width: 1920
+  height: 1080
+  cols: 1
+  rows: 1
+  gap: 0
+  layout: auto
+
+panels:
+  # --- The one dashboard ---------------------------------------------------
+  - id: p1
+    engine: webkit
+    grid: [0, 0]
+    mode: direct
+    url: "http://192.168.1.50:3000/login"
+    vault_item: "SOC Panel 1"
+    selectors:
+      user: "#username"
+      pass: "#password"
+      submit: "button[type=submit]"
+    login_marker: "#password"
+    keepalive:
+      strategy: reload
+      intervalSec: 600
+
+tunnel:
+  enabled: false
+  jump_host: ""
+  identity: ""
+  extra_forwards: []
+
+vpn:
+  enabled: false
+  type: fortinet
+  gateway: ""
+  port: 443
+  vault_item: ""
+  trusted_cert: ""
+
+proxy:
+  enabled: false
+  url: ""
+  vault_item: ""
+  ignore_hosts: []

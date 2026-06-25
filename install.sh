@@ -692,6 +692,7 @@ fi
 # is installed under $ETC for in-place editing. Falls back to the static asset
 # when branding/python isn't available (trimmed deploy / pre-venv).
 DESKTOP_FILE=""
+SETUP_DESKTOP_FILE=""
 ICON_FILE=""
 BRANDING_FILE=""
 VENV_PY="$SOC_ROOT/.venv/bin/python"
@@ -747,6 +748,21 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
       ICON_FILE="/usr/share/icons/hicolor/scalable/apps/soc-wall.svg"
       log "installed app icon -> $ICON_FILE (from ${BRAND_ICON#"$SOC_ROOT/"})"
     fi
+  fi
+
+  # Companion entry: "SOC Wall Setup" — the graphical config wizard. It shares
+  # the soc-wall icon and execs the setup-gui launcher. Static copy (the entry's
+  # Name is intentionally the product-neutral "SOC Wall Setup", so it is NOT
+  # regenerated from branding); chmod +x the gui launcher so the entry works.
+  SETUP_DESKTOP_DST="/usr/share/applications/soc-wall-setup.desktop"
+  if [ -f "$SOC_ROOT/soc-wall-setup.desktop" ]; then
+    install -Dm0644 "$SOC_ROOT/soc-wall-setup.desktop" "$SETUP_DESKTOP_DST"
+    SETUP_DESKTOP_FILE="$SETUP_DESKTOP_DST"
+    log "installed setup launcher -> $SETUP_DESKTOP_DST"
+    [ -f "$SOC_ROOT/scripts/soc-wall-setup-gui.sh" ] && \
+      chmod +x "$SOC_ROOT/scripts/soc-wall-setup-gui.sh" 2>/dev/null || true
+  else
+    warn "no $SOC_ROOT/soc-wall-setup.desktop — skipping setup launcher entry"
   fi
 
   # refresh the desktop + icon caches best-effort (absent on headless/minimal)
@@ -806,6 +822,7 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
   # files on PATH / shared trees
   printf 'FILE|/usr/local/bin/litebw|litebw launcher (remove on uninstall)\n'
   [ -n "$DESKTOP_FILE" ] && printf 'FILE|%s|XDG desktop launcher (rebrand-generated; remove on uninstall)\n' "$DESKTOP_FILE"
+  [ -n "$SETUP_DESKTOP_FILE" ] && printf 'FILE|%s|XDG setup launcher (remove on uninstall)\n' "$SETUP_DESKTOP_FILE"
   [ -n "$ICON_FILE" ]    && printf 'FILE|%s|app icon (remove on uninstall)\n' "$ICON_FILE"
   # branding source lives under $ETC -> operator data, preserved unless --purge
   [ -n "$BRANDING_FILE" ] && printf 'FILE|%s|branding source (preserve unless --purge; edit to rebrand)\n' "$BRANDING_FILE"

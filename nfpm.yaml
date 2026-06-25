@@ -109,6 +109,8 @@ contents:
   # system apps menu against the operator's existing DE.
   - src: ./soc-wall.desktop
     dst: /opt/soc-display/soc-wall.desktop
+  - src: ./soc-wall-setup.desktop
+    dst: /opt/soc-display/soc-wall-setup.desktop
   - src: ./share/**
     dst: /opt/soc-display/share
 

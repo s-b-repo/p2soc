@@ -10,7 +10,11 @@
 #   soc-wall-desktop.sh --help
 set -euo pipefail
 
-ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locating: ROOT = the parent of this scripts/ dir, so it works from a dev
+# checkout OR the deployed /opt/soc-display. SOC_ROOT overrides.
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)}"
+[ -d "$ROOT/kiosk-host" ] || ROOT="/opt/soc-display"
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 MODE="fullscreen"
 
@@ -37,7 +41,7 @@ fi
 
 # Load the (tmpfs, 0600) env for vault creds, ports and timeouts if it is present.
 # Absent in dev checkouts — the host falls back to its defaults / dev vault.
-if [ -f "$ENV_FILE" ]; then
+if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"

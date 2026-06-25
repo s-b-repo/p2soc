@@ -6,11 +6,15 @@
 # tty1. Pure launcher: real work is host/launchermenu.py.
 set -euo pipefail
 
-ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locating: ROOT = the parent of this scripts/ dir, so the launcher works
+# from a dev checkout OR the deployed /opt/soc-display. SOC_ROOT overrides.
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)}"
+[ -d "$ROOT/kiosk-host" ] || ROOT="/opt/soc-display"
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 
 # Load the (tmpfs, 0600) env if present so the launched wall sees the same config.
-if [ -f "$ENV_FILE" ]; then
+if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"

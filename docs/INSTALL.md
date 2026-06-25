@@ -95,6 +95,19 @@ stop the wall; it leaves your desktop session as it was.
 > `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
 > the config interactively (Vaultwarden's own config is in its systemd unit).
 
+The installer also adds a **SOC Wall Setup** desktop entry (next to **SOC Wall**)
+that opens the **graphical** configuration wizard — the same flow in a desktop
+window, with **presets** and live-validated fields. It writes the *identical*
+artifacts as the text wizard (it reuses `setup.py`'s renderers/validators and the
+host secret store, so the two can't drift). The launcher's **Setup** card opens
+the same window. Launch it any of these ways:
+
+```bash
+make wizard-gui                      # from the repo (dev)
+python3 setup.py wizard-gui          # degrades to the text wizard with no display
+/opt/soc-display/scripts/soc-wall-setup-gui.sh   # on a deployed box
+```
+
 ### Rebranding
 
 The whole product — the launcher menu, the installed desktop entry and the setup
@@ -118,6 +131,22 @@ name/icon.
    `SOC_SECRET_DIR`, `SOC_CONFIG_VAULT_ITEM` (**non-secret**; `chmod 0640`). The
    master password is sealed separately — see step 4b.
 3. **Vaultwarden** — config is inline in its systemd unit (no `.env`); `/admin` off.
+
+You can write 1–2 with either wizard. The **graphical** wizard
+(`python3 setup.py wizard-gui`, or the **SOC Wall Setup** icon) starts from a
+**preset** — `wazuh-zabbix-2x2` (a 2×2 SOC starter), `single-panel`, or `empty`
+— then lets you customize every field with live validation before writing. The
+presets ship at `/opt/soc-display/config/presets/*.yaml` and are themselves valid
+`panels.yaml` files. For scripted/CI use, the wizard also has a **headless** path
+(no window, no display needed) that renders a preset straight to disk:
+
+```bash
+python3 -m host.setupgui --list-presets                 # discover presets
+python3 -m host.setupgui --preset empty --output ./out --non-interactive
+```
+
+The master password is **never** part of the headless path — sealing/storing only
+happens in the graphical Write step (and never lands in any file).
 
 ## 4. Create the vault + add logins
 
