@@ -709,6 +709,90 @@ def load_config(vault: Vault) -> cfg.Config:
     return cfg.load(panels_file)
 
 
+def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
+    """Fail-safe: instead of exiting silently (which launcher.sh would just restart
+    into a black screen, so the operator sees *nothing*), show a visible, themed
+    error window explaining WHY the wall could not start, with an 'Open Setup'
+    button to fix it. It runs its own GTK loop so it STAYS on screen (the launcher
+    won't busy-restart while it's up). Returns 2 after the operator dismisses it;
+    falls back to a log-only exit when there is no display (headless / pre-session)."""
+    log(f"FATAL: {title}: {detail}")
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return 2  # nothing to render on; the journal line above is the diagnostic
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk, Gdk
+        try:
+            from . import branding
+            c = branding.load().get("colors", {})
+        except Exception:  # noqa: BLE001 — theming is best-effort
+            c = {}
+        bg, text = c.get("background", "#FFFFFF"), c.get("text", "#0B1F14")
+        dim, bad = c.get("text_dim", "#5B7567"), c.get("bad", "#C0341D")
+        prov = Gtk.CssProvider()
+        prov.load_from_data((f"window {{ background-color: {bg}; }}"
+                             f".e-title {{ color: {bad}; }} .e-detail {{ color: {text}; }}"
+                             f".e-hint {{ color: {dim}; }}").encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        win = Gtk.Window(title="SOC Video Wall — cannot start")
+        if os.environ.get("SOC_WINDOW_MODE") == "window":
+            win.set_default_size(660, 440)
+        else:
+            win.fullscreen()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(60)
+        box.set_margin_end(60)
+        win.add(box)
+        esc = (lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        t = Gtk.Label(xalign=0.5)
+        t.get_style_context().add_class("e-title")
+        t.set_markup(f"<span size='xx-large' weight='bold'>{esc(title)}</span>")
+        box.pack_start(t, False, False, 0)
+        d = Gtk.Label(label=detail.strip())
+        d.get_style_context().add_class("e-detail")
+        d.set_line_wrap(True)
+        d.set_max_width_chars(74)
+        d.set_selectable(True)
+        box.pack_start(d, False, False, 0)
+        if hint:
+            h = Gtk.Label(label=hint)
+            h.get_style_context().add_class("e-hint")
+            h.set_line_wrap(True)
+            h.set_max_width_chars(74)
+            box.pack_start(h, False, False, 0)
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        btns.set_halign(Gtk.Align.CENTER)
+
+        def _open_setup(_b):
+            root = os.environ.get("SOC_ROOT", "/opt/soc-display")
+            sh = os.path.join(root, "scripts", "soc-wall-setup-gui.sh")
+            argv = (["bash", sh] if os.path.exists(sh)
+                    else [sys.executable, "-m", "host.setupgui"])
+            try:
+                subprocess.Popen(argv, start_new_session=True)
+            except OSError as e:
+                log(f"could not open Setup: {e}")
+        setup_btn = Gtk.Button(label="Open Setup")
+        setup_btn.connect("clicked", _open_setup)
+        quit_btn = Gtk.Button(label="Quit")
+        quit_btn.connect("clicked", lambda _b: Gtk.main_quit())
+        btns.pack_start(setup_btn, False, False, 0)
+        btns.pack_start(quit_btn, False, False, 0)
+        box.pack_start(btns, False, False, 0)
+        win.connect("destroy", lambda _w: Gtk.main_quit())
+        win.show_all()
+        Gtk.main()
+    except Exception as e:  # noqa: BLE001 — never let the diagnostic mask the real error
+        log(f"(could not show the fail-safe error screen: {e})")
+    return 2
+
+
 def main():
     # Geometry preview (no display, no vault needed) — read the local file.
     if os.environ.get("SOC_DRY_RUN") == "1":
@@ -738,8 +822,12 @@ def main():
             break
         except VaultError as e:
             if time.time() > deadline:
-                log(f"FATAL: vault did not open within {ready_timeout}s: {e}")
-                return 2
+                return _fatal_screen(
+                    "Vault did not open",
+                    f"The vault did not unlock and sync within {ready_timeout}s.\n\n{e}",
+                    "Check that Vaultwarden is running and the master password is "
+                    "configured (sealed host-bound, or via the keyring). "
+                    "Use Open Setup to configure the vault, then relaunch.")
             log(f"vault not ready ({e}); retrying ...")
             time.sleep(3)
     log("vault unlocked + synced")
@@ -748,8 +836,11 @@ def main():
     try:
         conf = load_config(vault)
     except cfg.ConfigError as e:
-        log(f"FATAL config error:\n{e}")
-        return 2
+        return _fatal_screen(
+            "Configuration error",
+            str(e),
+            "The wall config (vault note or panels.yaml) is invalid. "
+            "Use Open Setup to fix it, then relaunch.")
     for w in conf.warnings:
         log(f"WARNING {w}")
 
@@ -775,8 +866,10 @@ def main():
                 if conf.proxy.vault_item else "no auth")
         log(f"proxy: {conf.proxy.url} ({auth})")
     if not conf.panels:
-        log("FATAL: no panels defined — nothing to show (edit the config)")
-        return 2
+        return _fatal_screen(
+            "No panels configured",
+            "The wall has no panels to display, so there is nothing to show.",
+            "Add at least one panel (Setup -> Panels), then relaunch.")
 
     host = KioskHost(conf, vault=vault)
 
