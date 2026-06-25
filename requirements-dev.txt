@@ -1,0 +1,3 @@
+# Dev/CI-only dependencies (the unit-test runner). Not needed at runtime on the Pi.
+-r requirements.txt
+pytest>=7.0
