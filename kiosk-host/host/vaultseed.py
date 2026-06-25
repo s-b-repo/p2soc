@@ -2,7 +2,7 @@
 Write a credential into Vaultwarden over its REST API.
 
 So setup.py and the on-screen Settings can *store* usernames/passwords (and a
-VPN config in Notes) in the vault — the kiosk still READS them via rbw. This is
+VPN config in Notes) in the vault — the kiosk still READS them from the vault. This is
 the programmatic equivalent of adding a login in the web vault, generalised from
 dev/seed-ciphers.py.
 

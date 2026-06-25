@@ -134,7 +134,8 @@ class DevFileBackend:
 
 
 def _make_backend():
-    name = os.environ.get("SOC_VAULT_BACKEND", "litebw").lower()
+    from . import config
+    name = os.environ.get("SOC_VAULT_BACKEND", config.DEFAULT_VAULT_BACKEND).lower()
     if name == "dev":
         return DevFileBackend()
     if name in ("litebw", "native"):
@@ -230,7 +231,7 @@ class Vault:
     def prewarm(self, items, log=None) -> int:
         """Fetch creds for many items in parallel (off the GTK thread) so each
         panel's first login is served from cache instead of blocking the UI on
-        an rbw call. Per-item failures are logged, not raised."""
+        a vault call. Per-item failures are logged, not raised."""
         from concurrent.futures import ThreadPoolExecutor
         uniq = [i for i in dict.fromkeys(items) if i]
         if not uniq:

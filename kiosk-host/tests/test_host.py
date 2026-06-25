@@ -826,6 +826,60 @@ def test_chromium_cdp_rpc_returns_matching_result():
     assert cdp.rpc("Page.enable") == {"ok": True}
 
 
+def test_chromium_attach_failure_backs_off(monkeypatch):
+    # Regression: when _spawn() succeeds but _attach_cdp() fails (DevTools socket
+    # never becomes attachable), the control loop must back off and GROW the
+    # respawn delay — not spin spawn->attach-fail->respawn with no wait and the
+    # delay frozen at the 5s floor (an uncapped spawn loop on a 1 GB Pi).
+    from host import chromium_panel
+
+    p2 = {x.id: x for x in _load().panels}["p2"]
+    panel = chromium_panel.ChromiumPanel(p2, lambda _p: None, lambda *_a: None,
+                                         cdp_port=9333)
+
+    class _AliveProc:
+        returncode = None
+        def poll(self):
+            return None        # alive, so the loop proceeds to _attach_cdp
+
+    monkeypatch.setattr(panel, "_spawn",
+                        lambda: setattr(panel, "proc", _AliveProc()))
+
+    # Always fail to attach, mirroring the real failure path (reap + clear proc).
+    # Hard-stop after a bounded number of spawns so a regression (no backoff =>
+    # _stop.wait never fires from this branch => endless spin) fails the test
+    # fast instead of hanging the suite.
+    attaches = []
+
+    def _fail_attach():
+        attaches.append(1)
+        if len(attaches) > 20:
+            panel._stop.set()
+        panel.proc = None
+        return False
+
+    monkeypatch.setattr(panel, "_attach_cdp", _fail_attach)
+
+    waited = []
+
+    def _fake_wait(delay):
+        waited.append(delay)
+        if len(waited) >= 3:        # let the backoff climb a few times, then stop
+            panel._stop.set()
+        return panel._stop.is_set()
+
+    monkeypatch.setattr(panel._stop, "wait", _fake_wait)
+    panel._control_loop()
+
+    # The attach-fail branch must wait each iteration (without the fix it never
+    # waits — it spins) and the delay must grow, not stay pinned at the floor.
+    assert len(waited) >= 2
+    assert waited[0] == chromium_panel.RESPAWN_INITIAL
+    assert waited[1] == min(chromium_panel.RESPAWN_INITIAL * 2,
+                            chromium_panel.RESPAWN_MAX)
+    assert waited == sorted(waited)        # monotonically non-decreasing
+
+
 # --------------------------------------------------------------------------- #
 # Input validation + resource usage
 # --------------------------------------------------------------------------- #
@@ -897,6 +951,61 @@ def test_heaviest_panel_picks_max_rss():
     assert hostmain.heaviest_panel([a, b, c]) is c            # largest measurable RSS
     assert hostmain.heaviest_panel([b]) is None               # none measurable
     assert hostmain.heaviest_panel([]) is None
+
+
+def _run_restart_vpn_service(hostmain, monkeypatch, *, fail):
+    """Drive KioskHost._restart_vpn_service synchronously: stub the worker thread
+    to run inline, capture log lines, and record the subprocess.run call."""
+    calls = {}
+    logs = []
+
+    def fake_run(argv, **kw):
+        calls["argv"] = argv
+        calls["kw"] = kw
+        if fail:
+            raise PermissionError("nope")
+
+    class InlineThread:
+        def __init__(self, target, daemon=None):
+            self._target = target
+            self.daemon = daemon
+        def start(self):
+            self._target()
+
+    import subprocess as _sub
+    import threading as _thr
+    monkeypatch.setattr(_sub, "run", fake_run)
+    monkeypatch.setattr(_thr, "Thread", InlineThread)
+    monkeypatch.setattr(hostmain, "log", logs.append)
+
+    app = object.__new__(hostmain.KioskHost)        # no GTK app/window needed
+    done = []
+    app._restart_vpn_service("ok!", "bad!", on_done=lambda: done.append(True))
+    return calls, logs, done
+
+
+def test_restart_vpn_service_shape_and_on_done(monkeypatch):
+    from host import main as hostmain
+
+    calls, logs, done = _run_restart_vpn_service(hostmain, monkeypatch, fail=False)
+    # exact subprocess shape: argv, timeout, all three streams to DEVNULL
+    assert calls["argv"] == ["systemctl", "restart", "forti-vpn"]
+    assert calls["kw"]["timeout"] == 10
+    import subprocess
+    assert calls["kw"]["stdin"] == subprocess.DEVNULL
+    assert calls["kw"]["stdout"] == subprocess.DEVNULL
+    assert calls["kw"]["stderr"] == subprocess.DEVNULL
+    assert logs == ["ok!"]                           # success message
+    assert done == [True]                            # on_done ran
+
+
+def test_restart_vpn_service_failure_still_runs_on_done(monkeypatch):
+    from host import main as hostmain
+
+    calls, logs, done = _run_restart_vpn_service(hostmain, monkeypatch, fail=True)
+    assert calls["argv"] == ["systemctl", "restart", "forti-vpn"]
+    assert len(logs) == 1 and logs[0].startswith("bad!")   # fail message + (exc)
+    assert done == [True]                                  # on_done runs after except
 
 
 # --------------------------------------------------------------------------- #
@@ -1004,6 +1113,16 @@ def test_configwin_overrides_roundtrip(tmp_path, monkeypatch):
     assert again["p1"]["url"] == "http://x/" and again["p1"]["title"] == "X"
 
 
+def test_configwin_credentials_note_is_backend_agnostic():
+    # The Credentials-tab note shown on the wall must not name the legacy reader:
+    # since litebw the default backend is litebw, not rbw (vault.py / install.sh).
+    # Source-level check so it stays display-free (no GTK window needed).
+    import inspect
+    from host import configwin
+    src = inspect.getsource(configwin.ConfigWindow._tab_credentials)
+    assert "rbw" not in src.lower(), "config-window note must not mention rbw"
+
+
 def test_configwin_pin_store(tmp_path, monkeypatch):
     monkeypatch.setenv("SOC_STATE_DIR", str(tmp_path))
     from host import configwin
@@ -1104,6 +1223,36 @@ def test_fortinet_driver_build_cmd_otp_is_only_secret_on_argv():
     assert not any("password" in a.lower() for a in cmd)
     # no OTP flag at all when no OTP is supplied
     assert "--otp" not in " ".join(d.build_cmd(vpn, "alice", "/x/pinentry.sh"))
+
+
+def test_fortivpn_otp_code_uses_configured_backend_cli(monkeypatch):
+    # The per-attempt OTP fetch must shell out to the CLI of the SELECTED
+    # backend (litebw default, rbw selectable) — not always `litebw`. Picking
+    # the wrong CLI when SOC_VAULT_BACKEND=rbw means litebw may be absent, the
+    # FileNotFoundError is swallowed, the OTP is dropped, and every connect
+    # attempt fails auth into the supervisor's auth-lockout backoff.
+    sup = fortivpn.Supervisor(
+        {"enabled": True, "type": "fortinet", "vault_item": "VPN"},
+        "", log=lambda m: None)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="654321\n", stderr="")
+
+    monkeypatch.setattr(fortivpn.subprocess, "run", fake_run)
+
+    monkeypatch.setenv("SOC_VAULT_BACKEND", "rbw")
+    assert sup._otp_code() == "654321"
+    assert seen["cmd"] == ["rbw", "code", "VPN"]
+
+    monkeypatch.setenv("SOC_VAULT_BACKEND", "litebw")
+    assert sup._otp_code() == "654321"
+    assert seen["cmd"] == ["litebw", "code", "VPN"]
+
+    monkeypatch.delenv("SOC_VAULT_BACKEND", raising=False)   # default -> litebw
+    assert sup._otp_code() == "654321"
+    assert seen["cmd"] == ["litebw", "code", "VPN"]
 
 
 def test_get_driver_dispatch():
@@ -1242,6 +1391,45 @@ def test_loginmemory(tmp_path, monkeypatch):
     # empty url / item are no-ops
     loginmemory.remember("", "X"); loginmemory.remember("http://h/", "")
     assert "h:80" not in loginmemory.load()
+
+
+def test_loginmemory_remember_no_fd_leak_on_error(tmp_path, monkeypatch):
+    # If os.fdopen raises before taking ownership of the mkstemp fd, the raw
+    # descriptor must still be closed — otherwise a 24/7 wall leaks one fd per
+    # failed remember() and eventually exhausts descriptors.
+    import resource
+
+    monkeypatch.setenv("SOC_STATE_DIR", str(tmp_path))
+    from host import loginmemory
+
+    real_fdopen = os.fdopen
+
+    def boom(fd, *a, **k):
+        # Simulate os.fdopen failing *before* it takes ownership of fd: the raw
+        # descriptor is left open, so the production code must close it. We must
+        # NOT close it here, or we'd mask the very leak this test checks for.
+        raise OSError("injected")
+
+    monkeypatch.setattr(loginmemory.os, "fdopen", boom)
+
+    def open_fds() -> int:
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        n = 0
+        for i in range(min(soft, 4096)):
+            try:
+                os.fstat(i)
+                n += 1
+            except OSError:
+                pass
+        return n
+
+    before = open_fds()
+    for _ in range(200):
+        loginmemory.remember("https://leak.example.com/login", "App Login")
+    assert open_fds() == before
+    # the write never landed, so nothing was remembered
+    monkeypatch.setattr(loginmemory.os, "fdopen", real_fdopen)
+    assert loginmemory.vault_item_for("https://leak.example.com/") == ""
 
 
 def test_inject_prompt_calls():

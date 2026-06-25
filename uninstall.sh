@@ -225,6 +225,7 @@ rm_path(){   # remove a file/dir/symlink if present, and record it
 rm_path "$SOC_ROOT"
 rm_path /usr/local/bin/litebw
 rm_path /usr/share/applications/soc-wall.desktop
+rm_path /usr/share/applications/soc-wall-setup.desktop
 rm_path /usr/share/icons/hicolor/scalable/apps/soc-wall.svg
 rm_path /etc/sysctl.d/99-soc.conf
 rm_path /etc/systemd/zram-generator.conf

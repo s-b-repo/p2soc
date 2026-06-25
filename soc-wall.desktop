@@ -6,5 +6,5 @@ Exec=/opt/soc-display/scripts/soc-wall-menu
 Icon=soc-wall
 Terminal=false
 Type=Application
-Categories=System;Utility;
+Categories=System;
 Keywords=soc;security;wall;kiosk;dashboard;

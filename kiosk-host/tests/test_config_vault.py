@@ -11,6 +11,15 @@ panels:
 """
 
 
+def test_default_vault_backend_constant():
+    # The default backend name is shared from config so the ~9 call-sites that
+    # re-derive it from the env (main/vault/fortivpn/configwin) cannot drift.
+    # It must also be a vault-capable backend, or the default install would skip
+    # config-from-vault and the OTP/session flows.
+    assert config.DEFAULT_VAULT_BACKEND == "litebw"
+    assert config.DEFAULT_VAULT_BACKEND in ("rbw", "litebw", "native")
+
+
 def test_load_str_parses():
     c = config.load_str(_CFG, "vault:test")
     assert [p.id for p in c.panels] == ["a", "b"]

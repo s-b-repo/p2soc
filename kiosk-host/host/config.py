@@ -51,6 +51,13 @@ def env_float(name: str, default: float, *, lo: float = None, hi: float = None) 
     return _env_num(name, default, float, lo, hi)
 
 
+# The vault backend selected when $SOC_VAULT_BACKEND is unset. The pure-Python
+# litebw client is the production default (no Rust toolchain on the 1 GB Pi);
+# 'native' is its alias and 'rbw' stays selectable. Callers re-derive the name
+# from the environment in several places — share this so they cannot drift.
+DEFAULT_VAULT_BACKEND = "litebw"
+
+
 class ConfigError(Exception):
     """panels.yaml is invalid. The message lists every problem found."""
 

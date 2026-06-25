@@ -73,6 +73,19 @@ def test_build_headless_writes_valid_config(preset, expect_panels, tmp_path):
     assert "SOC_SESSION=" in text
 
 
+def test_every_discovered_preset_renders_valid_config(tmp_path):
+    """Every preset the app auto-discovers (config/presets/*.yaml) must render to a
+    panels.yaml that passes config.load(). Iterates preset_names() rather than a
+    hardcoded list so a newly-added preset cannot ship un-validated."""
+    names = setupgui.preset_names()
+    assert names, "no presets discovered"
+    for name in names:
+        out = tmp_path / name
+        rc = setupgui.build_headless(name, str(out), non_interactive=True)
+        assert rc == 0, f"build_headless({name!r}) returned {rc}"
+        config.load(str(out / "panels.yaml"))  # raises ConfigError on a bad preset
+
+
 def test_unknown_preset_returns_nonzero(tmp_path):
     rc = setupgui.build_headless("does-not-exist", str(tmp_path))
     assert rc != 0

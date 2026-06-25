@@ -6,5 +6,5 @@ Exec=/opt/soc-display/scripts/soc-wall-setup-gui.sh
 Icon=soc-wall
 Terminal=false
 Type=Application
-Categories=System;Settings;
+Categories=Settings;
 Keywords=soc;setup;config;wizard;

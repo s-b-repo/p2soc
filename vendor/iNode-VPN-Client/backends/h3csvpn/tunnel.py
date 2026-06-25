@@ -128,9 +128,16 @@ def parse_netconfig(data: bytes) -> NetworkConfig:
             cfg.ipv6dns = _split(val)
         elif key == "IPV6ROUTES":
             cfg.ipv6routes = _split(val)
-    # A "0.0.0.0/0" route or explicit default flag means redirect-all.
-    if any(r.startswith("0.0.0.0") for r in cfg.routes) or not cfg.routes:
-        cfg.default_gateway = cfg.default_gateway or not cfg.routes
+    # A "0.0.0.0/0" route (or no routes at all) means redirect-all. Fold the
+    # catch-all into the default_gateway flag and drop it from the explicit
+    # route list, so the vnic full-tunnel path (split-default + the server-IP
+    # bypass that keeps the TLS link off the tunnel) engages — otherwise the
+    # literal 0.0.0.0/0 route captures everything with no bypass and deadlocks.
+    if not cfg.routes:
+        cfg.default_gateway = True
+    elif any(r.split("/")[0].strip() == "0.0.0.0" for r in cfg.routes):
+        cfg.default_gateway = True
+        cfg.routes = [r for r in cfg.routes if r.split("/")[0].strip() != "0.0.0.0"]
     return cfg
 
 

@@ -219,8 +219,12 @@ class Supervisor:
 
     def _otp_code(self) -> str:
         item = self.vpn["vault_item"]
+        # Use the same CLI the configured backend uses (litebw is the default;
+        # rbw stays selectable). Both expose an rbw-compatible `code <item>`.
+        cli = "rbw" if os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND).lower() == "rbw" \
+            else "litebw"
         try:
-            r = subprocess.run(["litebw", "code", item], capture_output=True,
+            r = subprocess.run([cli, "code", item], capture_output=True,
                                text=True, stdin=subprocess.DEVNULL, timeout=30)
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return ""
@@ -682,7 +686,7 @@ def ensure_litebw_session(log):
     The master password is supplied non-interactively by the pinentry in
     $SOC_PINENTRY. litebw is the default; the rbw backend reuses this flow
     against the rbw CLI (the two share a config layout)."""
-    cli = "rbw" if os.environ.get("SOC_VAULT_BACKEND", "litebw").lower() == "rbw" \
+    cli = "rbw" if os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND).lower() == "rbw" \
         else "litebw"
     for key, val in (("email", os.environ.get("SOC_VAULT_EMAIL", "")),
                      ("base_url", os.environ.get("SOC_VAULT_URL", "")),
@@ -755,7 +759,7 @@ def main() -> int:
 
     # a CLI vault session is needed when this VPN reads creds OR its config from
     # the vault; litebw is the default, rbw stays selectable
-    backend = os.environ.get("SOC_VAULT_BACKEND", "litebw").lower()
+    backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND).lower()
     if (driver.needs_creds(vpn) or from_vault) and backend in ("litebw", "rbw"):
         try:
             ensure_litebw_session(log)

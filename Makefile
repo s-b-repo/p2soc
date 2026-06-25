@@ -129,6 +129,11 @@ clean:  ## stop dev procs and remove dev runtime state
 	rm -rf dev/run/xdgrt/soc-profiles dev/run/*.log dev/run/*.png
 	@echo "cleaned"
 
+.PHONY: package-clean
+package-clean:  ## remove build cruft (__pycache__/*.pyc/.egg-info) so nfpm packages a clean tree
+	@find . -path ./.venv -prune -o \( -name '__pycache__' -o -name '*.py[cod]' -o -name '*.egg-info' -o -name '.pytest_cache' \) -print0 2>/dev/null | xargs -0 rm -rf 2>/dev/null || true
+	@echo "package-clean: stripped __pycache__/*.pyc/.pytest_cache"
+
 .PHONY: distclean
 distclean: clean  ## also remove venv and all dev/run state
 	docker rm -f soc-vaultwarden 2>/dev/null || true

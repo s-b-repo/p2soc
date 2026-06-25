@@ -474,7 +474,9 @@ if ! setfacl -m u:"$SVC_USER":r "$ETC/soc.env" 2>/dev/null; then
 fi
 
 # default the vault backend to litebw (pure-Python; rbw/dev stay selectable).
-# Only rewrite the shipped 'rbw' default — never clobber an operator's choice.
+# The shipped soc.env.example already defaults to litebw; this only migrates a
+# legacy 'rbw' default left in an existing soc.env (pre-litebw installs) and
+# backfills a missing key — never clobbering an operator's explicit choice.
 if grep -q '^SOC_VAULT_BACKEND=rbw[[:space:]]*$' "$ETC/soc.env"; then
   sed -i 's/^SOC_VAULT_BACKEND=rbw[[:space:]]*$/SOC_VAULT_BACKEND=litebw/' "$ETC/soc.env"
 elif ! grep -q '^SOC_VAULT_BACKEND=' "$ETC/soc.env"; then
@@ -718,7 +720,7 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
   # SOC_BRANDING_FILE points at the just-installed source so operator edits win).
   if [ -x "$VENV_PY" ] && SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
        PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -m host.branding desktop \
-       /opt/soc-display/scripts/soc-wall-menu soc-wall > "$DESKTOP_DST" 2>/dev/null \
+       "$SOC_ROOT/scripts/soc-wall-menu" soc-wall > "$DESKTOP_DST" 2>/dev/null \
      && [ -s "$DESKTOP_DST" ]; then
     log "generated $DESKTOP_DST from branding"
     DESKTOP_FILE="$DESKTOP_DST"
@@ -879,18 +881,19 @@ $(printf '\033[32mInstall complete.\033[0m')  Next steps:
      master password is NOT here — it is sealed at first-run, step 3).
   3. First-time setup: python3 $SOC_ROOT/setup.py first-run
      -> generates a ONE-TIME PIN + seals the master password host-bound (no
-        plaintext .env), and points rbw at pinentry-vault.py. Record the PIN.
-  3. Vaultwarden config is in its systemd unit (no .env). /admin is off; to create
+        plaintext .env), and points the vault backend (litebw by default) at
+        pinentry-vault.py. Record the PIN.
+  4. Vaultwarden config is in its systemd unit (no .env). /admin is off; to create
      the account, temporarily allow signups (systemctl edit vaultwarden ->
      Environment=SIGNUPS_ALLOWED=true), restart, create it, then revert.
-  4. Start the vault:   $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start vaultwarden" || echo "(start vaultwarden via your init)")
+  5. Start the vault:   $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start vaultwarden" || echo "(start vaultwarden via your init)")
      Create the kiosk account in the web vault (http://<host>:8222 via SSH tunnel
      or temporarily on the LAN), add your logins named to match vault_item.
      If using the Fortinet VPN, also add a login named to match vpn.vault_item
      (FortiGate username + password) — see docs/CONFIGURATION.md (vpn section).
      If using a proxy with auth, add a login for it and set proxy.vault_item.
-  5. Tunnel key (if used): see $SOC_ROOT/security/tunnel_key.note
-  6. Reboot:  $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl reboot" || echo "reboot")
+  6. Tunnel key (if used): see $SOC_ROOT/security/tunnel_key.note
+  7. Reboot:  $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl reboot" || echo "reboot")
 $([ "$HAS_SYSTEMD" = 1 ] || printf '%s\n' "  NOTE: no systemd here — see the warnings above for service supervision +")
 $([ "$HAS_SYSTEMD" = 1 ] || printf '%s\n' "        tty1 autologin you must wire into your init before the wall starts.")
 

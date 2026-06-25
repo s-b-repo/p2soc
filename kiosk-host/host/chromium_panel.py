@@ -484,6 +484,15 @@ class ChromiumPanel:
                     respawn_delay = min(respawn_delay * 2, RESPAWN_MAX)
                     continue
                 if not self._attach_cdp():
+                    # spawned but the DevTools socket never became attachable
+                    # (slow/loaded board, never-opened CDP). _attach_cdp() has
+                    # already reaped the child and cleared self.proc, so without
+                    # backing off here the loop would respawn with no delay — the
+                    # exact uncapped spawn loop the backoff exists to prevent.
+                    self.log(f"[{p.id}] chromium attach failed; "
+                             f"retrying in {respawn_delay:.0f}s")
+                    self._stop.wait(respawn_delay)
+                    respawn_delay = min(respawn_delay * 2, RESPAWN_MAX)
                     continue
                 spawn_time = time.monotonic()   # mark a fresh, attached spawn
 

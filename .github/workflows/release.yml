@@ -85,6 +85,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # strip __pycache__/*.pyc so the recursive nfpm globs can't ship build cruft
+          make package-clean
 
           # packager:arch pairs, using nfpm's own arch naming per packager.
           #   deb : arm64, armhf, amd64

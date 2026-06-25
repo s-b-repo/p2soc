@@ -6,7 +6,7 @@ set -euo pipefail
 
 ROOT="${SOC_ROOT:-/opt/soc-display}"
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
-[ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+[ -r "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 export SOC_PANELS_FILE="${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}"
 
 PYBIN="$ROOT/.venv/bin/python"

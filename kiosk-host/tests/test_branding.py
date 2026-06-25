@@ -82,6 +82,11 @@ def test_icon_path_missing_returns_empty(monkeypatch, tmp_path):
     monkeypatch.setenv("SOC_ROOT", str(tmp_path))
     _point_at(monkeypatch, tmp_path,
               "icon: {}\n".format(tmp_path / "nope.svg"))
+    # Hermetic: ignore any system-installed icon (the absolute /usr/share fallback)
+    # so this asserts the "nothing found anywhere" contract regardless of the host.
+    _real_exists = branding.os.path.exists
+    monkeypatch.setattr(branding.os.path, "exists",
+                        lambda p: _real_exists(p) and str(p).startswith(str(tmp_path)))
     branding.load(refresh=True)
     assert branding.icon_path() == ""
 

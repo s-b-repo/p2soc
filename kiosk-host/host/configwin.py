@@ -27,6 +27,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
+from . import config as cfg  # noqa: E402
 from . import style  # noqa: E402
 
 
@@ -375,8 +376,8 @@ class ConfigWindow(Gtk.Window):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.set_border_width(12)
         note = Gtk.Label(label="Store a login's username + password directly in "
-                               "Vaultwarden (the wall reads them via rbw). Skip a "
-                               "row to leave it for the web vault.")
+                               "Vaultwarden, so the wall reads them automatically. "
+                               "Skip a row to leave it for the web vault.")
         note.get_style_context().add_class("soc-config-sub")
         note.set_xalign(0.0)
         note.set_line_wrap(True)
@@ -588,7 +589,7 @@ class ConfigWindow(Gtk.Window):
         box.set_border_width(12)
         configured = sum(1 for p in self.panels if getattr(p, "configured", False))
         lines = [
-            f"vault backend : {os.environ.get('SOC_VAULT_BACKEND', 'litebw')}",
+            f"vault backend : {os.environ.get('SOC_VAULT_BACKEND', cfg.DEFAULT_VAULT_BACKEND)}",
             f"panels        : {configured}/{len(self.panels)} configured",
             f"auto-login    : {sum(1 for p in self.panels if p.vault_item)} panel(s)",
             "VPN status    : shown in the top bar (click the pill to re-check)",

@@ -18,6 +18,11 @@ if command -v realpath >/dev/null 2>&1; then
   SELF="$(realpath "$0")"
 fi
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+# When deployed the launcher lives at /usr/local/bin/litebw, so the self-located
+# ROOT is /usr/local — which has no kiosk-host. Fall back to the install root
+# (SOC_ROOT, default /opt/soc-display) so `litebw unlock` works from any shell
+# that doesn't already export SOC_ROOT. Mirrors scripts/soc-wall-menu et al.
+[ -d "$ROOT/kiosk-host" ] || ROOT="${SOC_ROOT:-/opt/soc-display}"
 
 # Pick the venv python if present, else system python3.
 PYBIN="$ROOT/.venv/bin/python"

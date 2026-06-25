@@ -4,7 +4,7 @@ SOC kiosk host — entry point.
 Boot sequence:
   1. load + validate config (panels.yaml) — a broken config fails loudly with
      every problem listed
-  2. open the vault (rbw unlock + sync)  [required]
+  2. open the vault (unlock + sync via the vault backend, litebw by default)  [required]
   3. wait for the VPN (if any) + each tunnel's local port to answer  [best-effort]
   4. create the panel views, staggered:
        layout windows : one GTK window per panel (Openbox/labwc places them)
@@ -177,7 +177,7 @@ class KioskHost:
             return None
 
     def open_vault(self):
-        backend = os.environ.get("SOC_VAULT_BACKEND", "litebw")
+        backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND)
         log(f"opening vault (backend={backend}) ...")
         self.vault.open()
         log("vault unlocked + synced")
@@ -185,7 +185,7 @@ class KioskHost:
     def prewarm_creds(self):
         """Fetch every panel/proxy/remembered login into the cache in the
         background, so the first login of each panel is served from cache and
-        never blocks the GTK thread on an rbw call."""
+        never blocks the GTK thread on a vault call."""
         import threading
         from . import loginmemory
         items = [p.vault_item for p in self.conf.panels if p.vault_item]
@@ -361,6 +361,25 @@ class KioskHost:
             self.wall.set_vpn_status(css, label)
         return False
 
+    def _restart_vpn_service(self, ok_msg, fail_msg, on_done=None):
+        """Best-effort `systemctl restart forti-vpn` off the GTK thread (needs
+        privilege; the single unit supervises Fortinet/OpenVPN/WireGuard). Logs
+        ok_msg/fail_msg and, if given, schedules on_done() on the GTK loop."""
+        import subprocess
+        import threading
+
+        def work():
+            try:
+                subprocess.run(["systemctl", "restart", "forti-vpn"],
+                               timeout=10, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                log(ok_msg)
+            except Exception as e:  # noqa: BLE001
+                log(f"{fail_msg} ({e})")
+            if on_done is not None:
+                on_done()
+        threading.Thread(target=work, daemon=True).start()
+
     def vpn_action(self):
         """Pill click: show 'checking', best-effort reconnect, then re-poll. The
         reconnect runs off the GTK thread so it can't freeze the wall."""
@@ -369,19 +388,10 @@ class KioskHost:
         if not (self.conf.vpn or {}).get("enabled"):
             self._poll_vpn()
             return
-        import subprocess
-        import threading
-
-        def work():
-            try:                                       # best-effort; needs privilege
-                subprocess.run(["systemctl", "restart", "forti-vpn"],
-                               timeout=10, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log("VPN reconnect requested (systemctl restart forti-vpn)")
-            except Exception as e:  # noqa: BLE001
-                log(f"VPN reconnect not permitted from the wall ({e}); re-checking")
-            GLib.timeout_add_seconds(2, self._poll_vpn)
-        threading.Thread(target=work, daemon=True).start()
+        self._restart_vpn_service(
+            "VPN reconnect requested (systemctl restart forti-vpn)",
+            "VPN reconnect not permitted from the wall; re-checking",
+            on_done=lambda: GLib.timeout_add_seconds(2, self._poll_vpn))
 
     # ---- on-screen configuration ------------------------------------------
     def open_config(self):
@@ -441,24 +451,15 @@ class KioskHost:
     def _restart_vpn_async(self):
         """A VPN-tab change — restart the VPN service so it re-reads the config
         (off the GTK thread; best-effort, needs privilege)."""
-        import threading
-        import subprocess
-
-        def work():
-            try:
-                subprocess.run(["systemctl", "restart", "forti-vpn"], timeout=10,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-                log("VPN config changed — restarted forti-vpn")
-            except Exception as e:  # noqa: BLE001
-                log(f"VPN restart not permitted from the wall ({e})")
-        threading.Thread(target=work, daemon=True).start()
+        self._restart_vpn_service(
+            "VPN config changed — restarted forti-vpn",
+            "VPN restart not permitted from the wall")
 
     def _push_config_to_vault(self):
         """After an on-screen edit, write the merged config back to the vault note
         (the source of truth) so it does not drift. Off the GTK thread, best-effort
         — the local overrides remain the durable record if this fails."""
-        if os.environ.get("SOC_VAULT_BACKEND", "litebw") not in ("rbw", "litebw", "native"):
+        if os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND) not in ("rbw", "litebw", "native"):
             return
         item = os.environ.get("SOC_CONFIG_VAULT_ITEM", "SOC Wall Config")
         if not item:
@@ -540,7 +541,7 @@ def load_config(vault: Vault) -> cfg.Config:
     Vaultwarden secure-note (SOC_CONFIG_VAULT_ITEM, default 'SOC Wall Config') is
     the source of truth, and a local panels.yaml is only an offline fallback. The
     dev backend always reads the file. SOC_CONFIG_FROM_VAULT=0 forces the file."""
-    backend = os.environ.get("SOC_VAULT_BACKEND", "litebw")
+    backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND)
     item = os.environ.get("SOC_CONFIG_VAULT_ITEM", "SOC Wall Config")
     if backend in ("rbw", "litebw", "native") and item and os.environ.get("SOC_CONFIG_FROM_VAULT", "1") != "0":
         try:
@@ -585,7 +586,7 @@ def main():
     #    in the vault, so it must be unlocked before we can read the config.
     #    Required: fail loudly if it will not open within the timeout.
     vault = Vault(ttl=cfg.env_float("SOC_CRED_TTL", 30.0, lo=1.0))
-    backend = os.environ.get("SOC_VAULT_BACKEND", "litebw")
+    backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND)
     log(f"opening vault (backend={backend}) ...")
     ready_timeout = cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
     deadline = time.time() + ready_timeout
@@ -638,7 +639,7 @@ def main():
     host = KioskHost(conf, vault=vault)
 
     # warm the credential cache off-thread while we wait for VPN/tunnels, so
-    # the first login of each panel never blocks the GTK loop on an rbw call
+    # the first login of each panel never blocks the GTK loop on a vault call
     host.prewarm_creds()
 
     # 3. VPN + tunnels (best-effort). VPN first: its routes may be what makes a

@@ -9,7 +9,7 @@ ROOT="${SOC_ROOT:-/opt/soc-display}"
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 
 # Load environment (vault creds, ports, timeouts). Keep this file on tmpfs 0600.
-if [ -f "$ENV_FILE" ]; then
+if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
