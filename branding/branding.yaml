@@ -18,16 +18,39 @@ homepage: "https://github.com/s-b-repo/p2soc"
 # Replace the file (or point this elsewhere) to rebrand the app icon.
 icon: "share/icons/soc-wall.svg"
 
-# Accent palette (hex). `primary` is the brand colour; setup/desktop/kiosk tint
-# the three launcher cards; background/text/text_dim theme the window.
+# Theme palette (hex). The default is a crisp SOC green-on-white console:
+# light surfaces, an operational SOC-green primary, near-black-green text and a
+# subtle green focus glow. Edit these to reskin BOTH the launcher and the wizard
+# in one place; a rebrand only needs to override the keys it wants to change.
+#
+#   primary        SOC-green brand accent: mono eyebrow, status dot, left-borders,
+#                  focus glow. Drives colors.primary (and desktop card).
+#   setup/desktop  the green left-border accent for the Setup + Desktop cards.
+#   kiosk          teal-green Kiosk card accent — same family, distinct hue so the
+#                  three launcher tiles stay differentiable on white.
+#   background     app/window background — the clean near-white console field.
+#   surface_top    card/page/panel surface — a barely-green tinted white so cards
+#                  lift off the bg without a drop shadow (flatness is the look).
+#   surface_bottom sunken/checked card + input wells (the flat second stop).
+#   border         thin green-grey hairline borders + dividers (low-chroma).
+#   text           near-black-green primary text (high contrast, never pure black).
+#   text_dim       green-grey secondary: subtitles, '//'-headers, hints.
+#   accent_strong  darker green for button fills, hover borders, the header top-rule.
+#   good           valid-field ring + ONLINE status (= primary).
+#   warn           amber-on-white caution — the only non-green accent, used sparingly.
+#   bad            error ring + invalid status (a brick red that survives on white).
 colors:
-  primary: "#2BE0C8"
-  setup: "#8B9CFF"
-  desktop: "#2BE0C8"
-  kiosk: "#F5B14C"
-  background: "#0B1220"
-  surface_top: "#16213A"
-  surface_bottom: "#0F1828"
-  border: "#22324E"
-  text: "#E8EEF7"
-  text_dim: "#8194B0"
+  primary: "#1FA463"
+  setup: "#1FA463"
+  desktop: "#1FA463"
+  kiosk: "#0E7C7B"
+  background: "#FFFFFF"
+  surface_top: "#F4F8F5"
+  surface_bottom: "#EAF1EC"
+  border: "#CFE0D4"
+  text: "#0B1F14"
+  text_dim: "#5B7567"
+  accent_strong: "#157A49"
+  good: "#1FA463"
+  warn: "#B8860B"
+  bad: "#C0341D"

@@ -68,13 +68,15 @@ def launch_setup() -> bool:
     return False
 
 
-# (title, subtitle, tag, css_class, colour_key, action). colour_key indexes
-# host.branding colours so a rebrand recolours the cards.
+# (num, title, subtitle, tag, css_class, colour_key, action). `num` is the mono
+# tile numeral watermark (01/02/03); colour_key indexes host.branding colours so
+# a rebrand recolours the cards.
 _ENTRIES = (
-    ("Setup / Configure", "Panels, vault and VPN", "", "soc-setup", "setup", launch_setup),
-    ("Desktop mode", "Run the wall in a window", "windowed", "soc-desktop", "desktop",
+    ("01", "Setup / Configure", "Panels, vault and VPN", "", "soc-setup", "setup",
+     launch_setup),
+    ("02", "Desktop mode", "Run the wall in a window", "windowed", "soc-desktop", "desktop",
      lambda: launch_wall("--window")),
-    ("Kiosk mode", "Fill this display, no desktop", "fullscreen", "soc-kiosk", "kiosk",
+    ("03", "Kiosk mode", "Fill this display, no desktop", "fullscreen", "soc-kiosk", "kiosk",
      lambda: launch_wall("--fullscreen")),
 )
 
@@ -95,32 +97,47 @@ def _rgba(hexc: str, alpha: float) -> str:
 
 
 def _css() -> bytes:
+    """Build the launcher stylesheet from the branding palette: a crisp green-on-
+    white technical console — flat surfaces, thin accent left-borders, low radius,
+    a green hover glow. Every colour flows from branding so a rebrand reskins it."""
     c = branding.load().get("colors", {})
 
     def col(k, d):
         return c.get(k) or d
-    bg = col("background", "#0B1220")
-    s_top = col("surface_top", "#16213A")
-    s_bot = col("surface_bottom", "#0F1828")
-    border = col("border", "#22324E")
-    setup, desktop, kiosk = col("setup", "#8B9CFF"), col("desktop", "#2BE0C8"), col("kiosk", "#F5B14C")
+    bg = col("background", "#FFFFFF")
+    s_top = col("surface_top", "#F4F8F5")
+    s_bot = col("surface_bottom", "#EAF1EC")
+    border = col("border", "#CFE0D4")
+    accent = col("primary", "#1FA463")
+    accent_strong = col("accent_strong", "#157A49")
+    text_dim = col("text_dim", "#5B7567")
+    setup, desktop, kiosk = (col("setup", "#1FA463"), col("desktop", "#1FA463"),
+                             col("kiosk", "#0E7C7B"))
+    glow = _rgba(accent, 0.28)
+
+    def card(cls, ac):
+        # flat fill at rest; on hover the accent left-border, an inset accent ring
+        # and the green focus glow lift the card off the white field.
+        return (f".{cls} {{ border-left-color: {ac}; }}\n"
+                f".{cls}:hover {{ border-color: {ac};\n"
+                f"  box-shadow: inset 0 0 0 1px {ac}, 0 6px 18px {glow}; }}")
+
     return f"""
 window.soc-launcher {{ background-color: {bg}; }}
-.soc-header {{ background-image: linear-gradient(to bottom, {s_top}, {bg});
+.soc-header {{ background-color: {s_top};
+  border-top: 2px solid {accent_strong};
   border-bottom: 1px solid {border}; padding: 18px 20px 16px 20px; }}
-.soc-body {{ padding: 16px 18px 20px 18px; }}
-.soc-card {{ background-image: linear-gradient(to bottom, {s_top}, {s_bot});
-  border: 1px solid {border}; border-left: 4px solid {border}; border-radius: 14px;
-  padding: 13px 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.28); transition: all 160ms ease; }}
-.soc-card:hover {{ background-image: linear-gradient(to bottom, {s_top}, {s_top}); }}
+.soc-body {{ padding: 16px 18px 20px 18px; background-color: {bg}; }}
+.soc-card {{ background-color: {s_top};
+  border: 1px solid {border}; border-left: 4px solid {border}; border-radius: 6px;
+  padding: 13px 16px; transition: all 160ms ease; }}
+.soc-card:hover {{ background-color: {s_bot}; }}
 .soc-card:focus {{ outline: none; }}
-.soc-setup {{ border-left-color: {setup}; }}
-.soc-setup:hover {{ border-color: {setup}; box-shadow: 0 8px 24px {_rgba(setup, 0.22)}; }}
-.soc-desktop {{ border-left-color: {desktop}; }}
-.soc-desktop:hover {{ border-color: {desktop}; box-shadow: 0 8px 24px {_rgba(desktop, 0.20)}; }}
-.soc-kiosk {{ border-left-color: {kiosk}; }}
-.soc-kiosk:hover {{ border-color: {kiosk}; box-shadow: 0 8px 24px {_rgba(kiosk, 0.20)}; }}
-.soc-tag {{ background-color: rgba(129,148,176,0.12); border-radius: 999px; padding: 2px 9px; }}
+{card("soc-setup", setup)}
+{card("soc-desktop", desktop)}
+{card("soc-kiosk", kiosk)}
+.soc-tag {{ background-color: {s_bot}; border: 1px solid {border};
+  border-radius: 4px; padding: 2px 9px; color: {text_dim}; }}
 """.encode()
 
 
@@ -167,20 +184,28 @@ def _build_window():
             pass
     htext = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
     htext.set_valign(Gtk.Align.CENTER)
-    primary = cols.get("primary", "#2BE0C8")
+    primary = cols.get("primary", "#1FA463")
+    dim = cols.get("text_dim", "#5B7567")
+    # '//'-overline (mono, dim) above the wide-tracked green name eyebrow — the
+    # kept comment-style + terminal-console signature, recoloured to SOC-green.
+    over = Gtk.Label(xalign=0)
+    over.set_markup(f'<span font_family="monospace" foreground="{dim}" '
+                    f'size="8200" letter_spacing="800">// launcher</span>')
     name_spaced = _esc(b.get("name", "SOC Video Wall")).upper().replace(" ", "&#160;")
     eyebrow = Gtk.Label(xalign=0)
     eyebrow.set_markup(f'<span font_family="monospace" foreground="{primary}" '
                        f'size="9000" weight="bold" letter_spacing="2600">{name_spaced}</span>')
     sub = Gtk.Label(xalign=0)
-    sub.set_markup(f'<span foreground="{cols.get("text_dim", "#8194B0")}" size="9500">'
+    sub.set_markup(f'<span foreground="{dim}" size="9500">'
                    f'{_esc(b.get("tagline", "Operations console"))}</span>')
+    htext.pack_start(over, False, False, 0)
     htext.pack_start(eyebrow, False, False, 0)
     htext.pack_start(sub, False, False, 0)
     header.pack_start(htext, True, True, 0)
+    # live SOC-green status dot = ONLINE/secure (uses `good`, falls back to accent).
     dot = Gtk.Label()
     dot.set_valign(Gtk.Align.START)
-    dot.set_markup(f'<span foreground="{primary}" size="11000">●</span>')
+    dot.set_markup(f'<span foreground="{cols.get("good", primary)}" size="11000">●</span>')
     header.pack_start(dot, False, False, 0)
     root.pack_start(header, False, False, 0)
 
@@ -189,14 +214,22 @@ def _build_window():
     body.get_style_context().add_class("soc-body")
     root.pack_start(body, True, True, 0)
 
+    # '//'-section header above the numbered action tiles (mono, dim).
+    comment = Gtk.Label(xalign=0)
+    comment.set_markup(f'<span font_family="monospace" foreground="{dim}" '
+                       f'size="8200" letter_spacing="800">// actions</span>')
+    comment.set_margin_bottom(2)
+    body.pack_start(comment, False, False, 0)
+
+    text = cols.get("text", "#0B1F14")
+
     def on(action):
         def _cb(_btn):
             action()
             win.destroy()
         return _cb
 
-    dim = cols.get("text_dim", "#8194B0")
-    for title, subtitle, tag, css_class, colour_key, action in _ENTRIES:
+    for num, title, subtitle, tag, css_class, colour_key, action in _ENTRIES:
         accent = branding.color(colour_key)
         btn = Gtk.Button()
         btn.set_relief(Gtk.ReliefStyle.NONE)
@@ -204,9 +237,20 @@ def _build_window():
         btn.get_style_context().add_class(css_class)
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        # mono '01/02/03' numeral watermark: low-opacity accent behind the title.
+        numl = Gtk.Label()
+        numl.set_valign(Gtk.Align.START)
+        # Pango `alpha` (0-65535) renders the numeral as a ~30%% accent watermark;
+        # `foreground` itself only accepts a solid colour spec, not rgba().
+        numl.set_markup(f'<span font_family="monospace" foreground="{accent}" alpha="30%" '
+                        f'size="20000" weight="bold">{_esc(num)}</span>')
+        row.pack_start(numl, False, False, 0)
+
         txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         t = Gtk.Label(xalign=0)
-        t.set_markup(f'<span foreground="{accent}" size="12800" weight="bold">{_esc(title)}</span>')
+        # title in near-black-green display bold with tight tracking (sans, technical).
+        t.set_markup(f'<span foreground="{text}" size="12800" weight="bold" '
+                     f'letter_spacing="-300">{_esc(title)}</span>')
         s = Gtk.Label(xalign=0)
         s.set_markup(f'<span foreground="{dim}" size="9800">{_esc(subtitle)}</span>')
         txt.pack_start(t, False, False, 0)
@@ -216,9 +260,15 @@ def _build_window():
             tg = Gtk.Label()
             tg.get_style_context().add_class("soc-tag")
             tg.set_valign(Gtk.Align.CENTER)
-            tg.set_markup(f'<span font_family="monospace" foreground="#9FB0CC" '
+            tg.set_markup(f'<span font_family="monospace" foreground="{dim}" '
                           f'size="8200" letter_spacing="800">{_esc(tag)}</span>')
             row.pack_start(tg, False, False, 0)
+        # mono '▸' marker = the run/select cue, in the card's accent.
+        mark = Gtk.Label()
+        mark.set_valign(Gtk.Align.CENTER)
+        mark.set_markup(f'<span font_family="monospace" foreground="{accent}" '
+                        f'size="11000">▸</span>')
+        row.pack_start(mark, False, False, 0)
         btn.add(row)
         btn.connect("clicked", on(action))
         body.pack_start(btn, False, False, 0)
@@ -230,7 +280,7 @@ def _build_window():
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--check" in argv:               # CI: verify wiring, no GTK / no display
-        assert len(_ENTRIES) == 3 and all(callable(e[-1]) for e in _ENTRIES)
+        assert len(_ENTRIES) == 3 and all(len(e) == 7 and callable(e[-1]) for e in _ENTRIES)
         branding.load()                 # branding must load without raising
         print("launchermenu ok")
         return 0

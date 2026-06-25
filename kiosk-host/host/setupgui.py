@@ -9,9 +9,9 @@ it imports ``setup.py`` as a module and calls its renderers (``render_panels_yam
 / ``render_soc_env`` / ``render_wall_unit``), its validators (``v_*``), and its
 credential + master-seal flow — so the two wizards can never drift.
 
-Styling matches host.launchermenu (the ops-room navy launcher) via a shared
+Styling matches host.launchermenu (the green-on-white SOC console) via a shared
 Gtk.CssProvider; window title / header / accents come from host.branding so a
-rebrand reskins it automatically.
+rebrand (branding/branding.yaml) reskins both the launcher and this wizard.
 
 Two entry points share ``main(argv=None)``:
 
@@ -391,46 +391,106 @@ def _esc(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _rgba(hexc: str, alpha: float) -> str:
+def _to_rgb(hexc: str) -> "tuple[int, int, int]":
     h = (hexc or "").lstrip("#")
     if len(h) == 3:
         h = "".join(ch * 2 for ch in h)
     try:
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     except (ValueError, IndexError):
-        r, g, b = 136, 136, 136
+        return 136, 136, 136
+
+
+def _rgba(hexc: str, alpha: float) -> str:
+    r, g, b = _to_rgb(hexc)
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def _mix(fg: str, bg: str, t: float) -> str:
+    """Solid #RRGGBB = `fg` blended `t` of the way toward `bg`. Used for the
+    low-opacity watermark numerals, since Pango markup ``foreground=`` accepts a
+    colour spec but NOT an rgba() with alpha (unlike CSS)."""
+    fr, fgc, fb = _to_rgb(fg)
+    br, bg2, bb = _to_rgb(bg)
+    t = max(0.0, min(1.0, t))
+    r = round(fr + (br - fr) * t)
+    g = round(fgc + (bg2 - fgc) * t)
+    b = round(fb + (bb - fb) * t)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 def _css(branding) -> bytes:
+    """The green-on-white console theme, driven entirely from branding colours so a
+    rebrand (branding.yaml) reskins the wizard exactly as it reskins the launcher.
+    Flat surfaces, low radius, a 4px green left-border + green focus glow — the
+    recoloured terminal/console aesthetic. No gradients, no rest-state shadows."""
     c = branding.load().get("colors", {})
 
     def col(k, d):
         return c.get(k) or d
-    bg = col("background", "#0B1220")
-    s_top = col("surface_top", "#16213A")
-    s_bot = col("surface_bottom", "#0F1828")
-    border = col("border", "#22324E")
-    setup_c = col("setup", "#8B9CFF")
-    text_dim = col("text_dim", "#8194B0")
-    good = "#2BE0C8"
-    bad = "#F56565"
+    bg = col("background", "#FFFFFF")
+    surface = col("surface_top", "#F4F8F5")
+    sunken = col("surface_bottom", "#EAF1EC")
+    border = col("border", "#CFE0D4")
+    text = col("text", "#0B1F14")
+    text_dim = col("text_dim", "#5B7567")
+    accent = col("primary", "#1FA463")
+    accent_strong = col("accent_strong", "#157A49")
+    setup_c = col("setup", "#1FA463")
+    good = col("good", "#1FA463")
+    bad = col("bad", "#C0341D")
+    glow = _rgba(accent, 0.28)
     return f"""
 window.soc-assistant {{ background-color: {bg}; }}
 assistant.soc-assistant {{ background-color: {bg}; }}
-.soc-assistant {{ background-color: {bg}; color: {col("text", "#E8EEF7")}; }}
-.soc-header {{ background-image: linear-gradient(to bottom, {s_top}, {bg});
-  border-bottom: 1px solid {border}; padding: 16px 20px 14px 20px; }}
-.soc-page {{ background-image: linear-gradient(to bottom, {s_top}, {s_bot});
-  padding: 16px 18px; }}
-.soc-section-title {{ color: {setup_c}; font-weight: bold; }}
-.soc-card {{ background-image: linear-gradient(to bottom, {s_top}, {s_bot});
-  border: 1px solid {border}; border-left: 4px solid {setup_c}; border-radius: 12px;
-  padding: 11px 14px; transition: all 160ms ease; }}
-.soc-card:hover {{ border-color: {setup_c}; box-shadow: 0 8px 24px {_rgba(setup_c, 0.22)}; }}
-.soc-card:checked {{ border-color: {setup_c}; background-image: linear-gradient(to bottom, {s_top}, {s_top}); }}
+.soc-assistant {{ background-color: {bg}; color: {text}; }}
+.soc-assistant headerbar {{ background-color: {surface};
+  border-bottom: 1px solid {border}; box-shadow: inset 0 2px 0 {accent}; }}
+.soc-header {{ background-color: {surface};
+  border-top: 2px solid {accent}; border-bottom: 1px solid {border};
+  padding: 16px 20px 14px 20px; }}
+.soc-page {{ background-color: {surface}; padding: 16px 18px; }}
+.soc-section-title {{ color: {accent}; font-weight: bold; }}
+.soc-divider {{ background-color: {border}; min-height: 1px; }}
+
+.soc-card {{ background-color: {surface};
+  border: 1px solid {border}; border-left: 4px solid {setup_c}; border-radius: 6px;
+  padding: 13px 16px; transition: all 160ms ease; }}
+.soc-card:hover {{ border-color: {accent}; background-color: {sunken};
+  box-shadow: inset 0 0 0 1px {accent}, 0 6px 18px {glow}; }}
+.soc-card:checked {{ border-color: {accent}; border-left: 4px solid {accent};
+  background-color: {sunken}; }}
+
+/* Gtk.Assistant left page-list sidebar — recolour the default-GTK selection
+   (blue) current-page marker to a green left-bar + green-tinted fill so the
+   page list reads as the green console, not stock GTK. */
+.soc-assistant .sidebar {{ background-color: {surface};
+  border-right: 1px solid {border}; }}
+.soc-assistant .sidebar label {{ color: {text_dim}; padding: 4px 10px; }}
+.soc-assistant .sidebar label.highlight {{ background-color: {sunken};
+  color: {accent_strong}; box-shadow: inset 3px 0 0 {accent}; font-weight: bold; }}
+
+/* Preset-tile radio indicators — the tile already shows a green '▸' marker on
+   selection, so hide the default-GTK (blue) check/ring for a clean card look. */
+.soc-assistant radio {{ -gtk-icon-source: none; min-width: 0; min-height: 0;
+  margin: 0; padding: 0; border: 0; background: none; box-shadow: none; }}
+
+entry {{ background-color: {sunken}; color: {text};
+  border: 1px solid {border}; border-radius: 4px; padding: 6px 8px; }}
+entry:focus {{ border: 1px solid {accent}; box-shadow: 0 0 0 2px {glow}; }}
 .soc-field-bad {{ border: 1px solid {bad}; }}
-.soc-field-good {{ border: 1px solid {_rgba(good, 0.6)}; }}
+.soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.28)}; }}
+.soc-field-good {{ border: 1px solid {good}; }}
+
+button.soc-primary {{ background-image: none; background-color: {accent_strong};
+  color: #FFFFFF; border: 1px solid {accent_strong}; border-radius: 6px;
+  font-weight: bold; padding: 6px 14px; }}
+button.soc-primary:hover {{ background-color: {accent}; border-color: {accent}; }}
+button.soc-ghost {{ background-image: none; background-color: transparent;
+  color: {accent_strong}; border: 1px solid {border}; border-radius: 6px;
+  padding: 6px 12px; }}
+button.soc-ghost:hover {{ background-color: {sunken}; border-color: {accent}; }}
+
 .soc-mono {{ font-family: monospace; font-size: 10px; }}
 .soc-problem {{ color: {bad}; }}
 """.encode()
@@ -459,15 +519,36 @@ class SetupAssistant:
         self.assistant = None
         self._review_label = None
         self._preview_buf = None
+        self._step = 0              # '// step NN' counter for page overlines
         self._build()
 
+    def _step_overline(self, label):
+        """Next '// step NN — <label>' overline; bumps the page counter."""
+        self._step += 1
+        return f"step {self._step:02d} — {label}"
+
     # ---- shared widget helpers ------------------------------------------ #
-    def _header(self, title, subtitle):
+    def _comment(self, text):
+        """A '// comment-style' mono overline (text_dim) — the kept section-header
+        signature. The literal '// ' prefix reads as a code comment."""
         Gtk = self.Gtk
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup(
+            f'<span font_family="monospace" size="8800" '
+            f'foreground="{self.branding.color("text_dim")}">'
+            f'// {_esc(text)}</span>')
+        return lbl
+
+    def _header(self, title, subtitle, overline=None):
+        """A page/section header: a '// <overline>' mono comment, a TIGHT bold sans
+        title in near-black-green text, then a body subtitle in text_dim."""
+        Gtk = self.Gtk
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        if overline:
+            box.pack_start(self._comment(overline), False, False, 0)
         t = Gtk.Label(xalign=0)
-        t.set_markup(f'<span size="13000" weight="bold" '
-                     f'foreground="{self.branding.color("setup")}">{_esc(title)}</span>')
+        t.set_markup(f'<span size="13000" weight="bold" letter_spacing="-400" '
+                     f'foreground="{self.branding.color("text")}">{_esc(title)}</span>')
         s = Gtk.Label(xalign=0, wrap=True)
         s.set_markup(f'<span size="9800" foreground="'
                      f'{self.branding.color("text_dim")}">{_esc(subtitle)}</span>')
@@ -475,13 +556,20 @@ class SetupAssistant:
         box.pack_start(s, False, False, 0)
         return box
 
-    def _page(self, title, subtitle):
+    def _page(self, title, subtitle, overline=None):
         Gtk = self.Gtk
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         page.get_style_context().add_class("soc-page")
         page.set_border_width(8)
-        page.pack_start(self._header(title, subtitle), False, False, 0)
+        page.pack_start(self._header(title, subtitle, overline=overline),
+                        False, False, 0)
         return page
+
+    def _divider(self):
+        Gtk = self.Gtk
+        sep = Gtk.Box()
+        sep.get_style_context().add_class("soc-divider")
+        return sep
 
     def _entry(self, value, validator, on_change):
         """A Gtk.Entry that runs a setup.v_* validator on every change, toggles
@@ -540,8 +628,40 @@ class SetupAssistant:
         self.assistant = Gtk.Assistant()
         self.assistant.get_style_context().add_class("soc-assistant")
         b = self.branding
-        self.assistant.set_title((b.get("short_name") or b.get("name")
-                                  or "SOC Wall") + " — Setup")
+        brand_title = (b.get("short_name") or b.get("name") or "SOC Wall") + " — Setup"
+        # FIX: Gtk.Assistant copies each page's set_page_title() into the window
+        # title bar, leaking the per-page name ("Display", "Vault", ...). Attach a
+        # custom Gtk.HeaderBar carrying the branded '<name> — Setup' title (+ tagline
+        # subtitle) so the window chrome always reads as the product, not the page.
+        # set_title() is kept as a fallback for WMs that ignore client-side headerbars.
+        self.assistant.set_title(brand_title)
+        try:
+            hb = Gtk.HeaderBar()
+            hb.set_show_close_button(True)
+            hb.set_title(brand_title)
+            tagline = b.get("tagline") or ""
+            if tagline:
+                hb.set_subtitle(tagline)
+            icon0 = b.icon_path()
+            if icon0:
+                try:
+                    px = self.GdkPixbuf.Pixbuf.new_from_file_at_size(icon0, 20, 20)
+                    hb.pack_start(self.Gtk.Image.new_from_pixbuf(px))
+                except Exception:
+                    pass
+            self.assistant.set_titlebar(hb)
+            self._headerbar = hb
+        except Exception:
+            self._headerbar = None
+        self._brand_title = brand_title
+        # Gtk.Assistant's own 'prepare' default-handler stamps the *current page's*
+        # title onto the window every transition (running AFTER our 'prepare'), which
+        # leaks "Display"/"Vault"/... into the chrome. Clamp it: whenever the window
+        # title is changed to anything but our branded title, set it straight back.
+        # notify::title fires after Assistant's write, so this always wins. A reentry
+        # guard stops our own set_title from recursing.
+        self._title_guard = False
+        self.assistant.connect("notify::title", self._clamp_title)
         self.assistant.set_resizable(True)
         self.assistant.set_default_size(-1, -1)
         self.assistant.set_position(Gtk.WindowPosition.CENTER)
@@ -565,35 +685,59 @@ class SetupAssistant:
         self.assistant.connect("destroy", lambda *_: self.Gtk.main_quit())
         self.assistant.connect("apply", self._on_apply)
         self.assistant.connect("prepare", self._on_prepare)
+        # The page appends above stamped page-0's title onto the chrome; restore it.
+        self._clamp_title()
 
     # ---- Page 1: presets ------------------------------------------------- #
     def _page_preset(self):
         Gtk = self.Gtk
         page = self._page("Choose a starting point",
-                          "Pick a preset to load, then customise it on the next pages.")
+                          "Pick a preset to load, then customise it on the next pages.",
+                          overline=self._step_overline("preset"))
+        accent = self.branding.color("primary")
+        text = self.branding.color("text")
+        dim = self.branding.color("text_dim")
+        surface = self.branding.color("surface_top")
         group = None
         first = True
-        for name, disp, desc in discover_presets():
+        for n, (name, disp, desc) in enumerate(discover_presets()):
             btn = Gtk.RadioButton.new_from_widget(group)
             if group is None:
                 group = btn
             btn.set_label("")
             for ch in btn.get_children():
                 btn.remove(ch)
-            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            # Numbered tile: a low-opacity mono '01/02/03' watermark numeral, a
+            # tight bold sans title and a text_dim body description.
+            card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             card.get_style_context().add_class("soc-card")
+            num = Gtk.Label()
+            num.set_valign(Gtk.Align.START)
+            num.set_markup(
+                f'<span font_family="monospace" size="20000" weight="bold" '
+                f'foreground="{_mix(accent, surface, 0.62)}">{n + 1:02d}</span>')
+            card.pack_start(num, False, False, 0)
+            txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             t = Gtk.Label(xalign=0)
-            t.set_markup(f'<span weight="bold" foreground="'
-                         f'{self.branding.color("setup")}" size="11500">'
-                         f'{_esc(disp)}</span>')
+            t.set_markup(f'<span weight="bold" letter_spacing="-300" '
+                         f'foreground="{text}" size="12000">{_esc(disp)}</span>')
             d = Gtk.Label(xalign=0, wrap=True)
-            d.set_markup(f'<span foreground="{self.branding.color("text_dim")}" '
-                         f'size="9500">{_esc(desc)}</span>')
-            card.pack_start(t, False, False, 0)
-            card.pack_start(d, False, False, 0)
+            d.set_markup(f'<span foreground="{dim}" size="9500">{_esc(desc)}</span>')
+            txt.pack_start(t, False, False, 0)
+            txt.pack_start(d, False, False, 0)
+            card.pack_start(txt, True, True, 0)
+            # A mono '▸' selection marker, shown only on the active tile.
+            mark = Gtk.Label()
+            mark.set_valign(Gtk.Align.CENTER)
+            mark.set_markup(f'<span font_family="monospace" size="13000" '
+                            f'foreground="{accent}">▸</span>')
+            mark.set_no_show_all(True)
+            mark.set_visible(btn.get_active())
+            card.pack_start(mark, False, False, 0)
             btn.add(card)
 
-            def _toggled(b, nm=name, pg=page):
+            def _toggled(b, nm=name, mk=mark):
+                mk.set_visible(b.get_active())
                 if b.get_active():
                     err = self.model.apply_preset(nm)
                     if err:
@@ -605,6 +749,7 @@ class SetupAssistant:
             page.pack_start(btn, False, False, 0)
             if first:
                 self.model.apply_preset(name)
+                mark.set_visible(True)
                 first = False
 
         self.assistant.append_page(page)
@@ -616,7 +761,8 @@ class SetupAssistant:
     def _page_display(self):
         Gtk = self.Gtk
         page = self._page("Display & grid",
-                          "The screen is split into a cols x rows grid; one panel per cell.")
+                          "The screen is split into a cols x rows grid; one panel per cell.",
+                          overline=self._step_overline("display"))
         d = self.model.cfg()["display"]
 
         def spin(val, lo, hi):
@@ -674,7 +820,8 @@ class SetupAssistant:
         Gtk = self.Gtk
         page = self._page("Panels",
                           "Each row is one dashboard window. Validation runs over the whole "
-                          "wall, so duplicate ids / grid cells are caught here.")
+                          "wall, so duplicate ids / grid cells are caught here.",
+                          overline=self._step_overline("panels"))
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.set_min_content_height(260)
@@ -685,6 +832,8 @@ class SetupAssistant:
         btnbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         add = Gtk.Button.new_with_label("Add panel")
         rem = Gtk.Button.new_with_label("Remove last")
+        add.get_style_context().add_class("soc-ghost")
+        rem.get_style_context().add_class("soc-ghost")
         btnbar.pack_start(add, False, False, 0)
         btnbar.pack_start(rem, False, False, 0)
 
@@ -736,10 +885,18 @@ class SetupAssistant:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.get_style_context().add_class("soc-card")
         box.set_border_width(6)
+        thead = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        num = Gtk.Label()
+        num.set_markup(
+            f'<span font_family="monospace" size="13000" weight="bold" '
+            f'foreground="{_mix(self.branding.color("primary"), self.branding.color("surface_top"), 0.30)}">'
+            f'{idx + 1:02d}</span>')
         title = Gtk.Label(xalign=0)
-        title.set_markup(f'<span weight="bold" foreground="'
-                         f'{self.branding.color("setup")}">Panel {idx + 1}</span>')
-        box.pack_start(title, False, False, 0)
+        title.set_markup(f'<span weight="bold" letter_spacing="-300" foreground="'
+                         f'{self.branding.color("text")}">Panel {idx + 1}</span>')
+        thead.pack_start(num, False, False, 0)
+        thead.pack_start(title, False, False, 0)
+        box.pack_start(thead, False, False, 0)
 
         grid = Gtk.Grid()
         grid.set_column_spacing(8)
@@ -850,7 +1007,8 @@ class SetupAssistant:
         Gtk = self.Gtk
         page = self._page("Secrets vault & master password",
                           "Where the kiosk reads logins from, and how the master password "
-                          "is sealed. The master is NEVER written to any file.")
+                          "is sealed. The master is NEVER written to any file.",
+                          overline=self._step_overline("vault"))
         m = self.model
 
         backend = Gtk.ComboBoxText()
@@ -957,7 +1115,8 @@ class SetupAssistant:
     def _page_vpn(self):
         Gtk = self.Gtk
         page = self._page("VPN (optional)",
-                          "One supervised tunnel so VPN-side panels can use mode: direct.")
+                          "One supervised tunnel so VPN-side panels can use mode: direct.",
+                          overline=self._step_overline("vpn"))
         v = self.model.cfg()["vpn"]
 
         enable = Gtk.Switch()
@@ -1042,7 +1201,8 @@ class SetupAssistant:
     def _page_review(self):
         Gtk = self.Gtk
         page = self._page("Review & write",
-                          "Confirm the summary, then Apply to write the files and seal the master.")
+                          "Confirm the summary, then Apply to write the files and seal the master.",
+                          overline=self._step_overline("review"))
         self._review_label = Gtk.Label(xalign=0)
         self._review_label.get_style_context().add_class("soc-mono")
         page.pack_start(self._review_label, False, False, 0)
@@ -1082,7 +1242,28 @@ class SetupAssistant:
         if hasattr(self, "_rebuild_panels"):
             self._rebuild_panels()
 
+    def _clamp_title(self, assistant=None, _pspec=None):
+        """notify::title handler — keep the window/headerbar showing the branded
+        '<name> — Setup', overriding the per-page title Gtk.Assistant tries to set.
+        Guarded so our own set_title() doesn't recurse."""
+        bt = getattr(self, "_brand_title", None)
+        if not bt or getattr(self, "_title_guard", False):
+            return
+        hb = getattr(self, "_headerbar", None)
+        if hb is not None and hb.get_title() != bt:
+            try:
+                hb.set_title(bt)
+            except Exception:
+                pass
+        if self.assistant.get_title() != bt:
+            self._title_guard = True
+            try:
+                self.assistant.set_title(bt)
+            finally:
+                self._title_guard = False
+
     def _on_prepare(self, assistant, page):
+        self._clamp_title()
         if page is getattr(self, "_review_page", None):
             self._update_review()
         if page is getattr(self, "_panels_page", None) and hasattr(self, "_rebuild_panels"):
@@ -1113,9 +1294,13 @@ class SetupAssistant:
     def _set_status(self, text, bad=False):
         self._status = "" if bad else text
         if getattr(self, "_status_label", None) is not None:
-            col = self.branding.color("text_dim") if not bad else "#F56565"
+            col = (self.branding.color("bad") if bad
+                   else self.branding.color("good"))
+            glyph = "✗ " if bad else "● "
             self._status_label.set_markup(
-                f'<span foreground="{col}">{_esc(text)}</span>')
+                f'<span font_family="monospace" foreground="{col}">{glyph}</span>'
+                f'<span foreground="{col if bad else self.branding.color("text_dim")}">'
+                f'{_esc(text)}</span>')
 
     # ---- Apply / Write --------------------------------------------------- #
     def _on_apply(self, assistant):

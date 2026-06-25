@@ -28,16 +28,21 @@ _DEFAULTS = {
     "homepage": "https://github.com/s-b-repo/p2soc",
     "icon": "share/icons/soc-wall.svg",
     "colors": {
-        "primary": "#2BE0C8",
-        "setup": "#8B9CFF",
-        "desktop": "#2BE0C8",
-        "kiosk": "#F5B14C",
-        "background": "#0B1220",
-        "surface_top": "#16213A",
-        "surface_bottom": "#0F1828",
-        "border": "#22324E",
-        "text": "#E8EEF7",
-        "text_dim": "#8194B0",
+        # SOC green-on-white console theme. Recolour here to rebrand.
+        "primary": "#1FA463",        # SOC-green brand: eyebrow, status dot, focus glow
+        "setup": "#1FA463",          # Setup card accent (unified green)
+        "desktop": "#1FA463",        # Desktop card accent (green)
+        "kiosk": "#0E7C7B",          # Kiosk card accent (teal-green, differentiated hue)
+        "background": "#FFFFFF",     # app/window background (clean near-white field)
+        "surface_top": "#F4F8F5",    # card/page surface (barely-green tinted white)
+        "surface_bottom": "#EAF1EC", # sunken/checked card + input wells
+        "border": "#CFE0D4",         # thin green-grey hairline borders + dividers
+        "text": "#0B1F14",           # near-black-green primary text
+        "text_dim": "#5B7567",       # green-grey secondary (subtitles, hints)
+        "accent_strong": "#157A49",  # darker green: button fills, hover borders, header rule
+        "good": "#1FA463",           # valid-field ring + ONLINE status (= accent)
+        "warn": "#B8860B",           # amber-on-white caution (the lone non-green accent)
+        "bad": "#C0341D",            # error ring + invalid status (brick red on white)
     },
 }
 

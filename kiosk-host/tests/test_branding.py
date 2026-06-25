@@ -36,7 +36,8 @@ def test_defaults_when_no_file(monkeypatch, tmp_path):
     data = branding.load(refresh=True)
     assert data["name"] == "SOC Video Wall"
     assert data["short_name"] == "SOC Wall"
-    assert data["colors"]["primary"] == "#2BE0C8"
+    # SOC green-on-white console theme is the built-in default.
+    assert data["colors"]["primary"] == "#1FA463"
 
 
 def test_env_override_merges_over_defaults(monkeypatch, tmp_path):
@@ -52,8 +53,8 @@ def test_env_override_merges_over_defaults(monkeypatch, tmp_path):
     assert data["short_name"] == "SOC Wall"
     assert data["tagline"] == "Operations console"
     # Unspecified colours keep defaults (deep merge, not replace).
-    assert data["colors"]["kiosk"] == "#F5B14C"
-    assert data["colors"]["background"] == "#0B1220"
+    assert data["colors"]["kiosk"] == "#0E7C7B"
+    assert data["colors"]["background"] == "#FFFFFF"
 
 
 def test_color_resolution(monkeypatch, tmp_path):
@@ -61,7 +62,7 @@ def test_color_resolution(monkeypatch, tmp_path):
     branding.load(refresh=True)
     assert branding.color("kiosk") == "#123456"
     # Falls back to default colour for an unspecified name.
-    assert branding.color("primary") == "#2BE0C8"
+    assert branding.color("primary") == "#1FA463"
     # Unknown colour name with an explicit default.
     assert branding.color("nope", "#000111") == "#000111"
     # Unknown colour name, no default -> the module's last-resort grey.
@@ -98,7 +99,7 @@ def test_malformed_file_falls_back_to_defaults(monkeypatch, tmp_path):
     data = branding.load(refresh=True)
     # Must not raise; whatever survived, defaults still fill the gaps.
     assert data["short_name"] == "SOC Wall"
-    assert data["colors"]["primary"] == "#2BE0C8"
+    assert data["colors"]["primary"] == "#1FA463"
     assert isinstance(data["colors"], dict)
 
 
@@ -131,7 +132,7 @@ def test_stdlib_parser_when_pyyaml_unavailable(monkeypatch, tmp_path):
     data = branding.load(refresh=True)
     assert data["name"] == "Stdlib NOC"
     assert data["colors"]["primary"] == "#0A0B0C"
-    assert data["colors"]["background"] == "#0B1220"  # default preserved
+    assert data["colors"]["background"] == "#FFFFFF"  # default preserved
 
 
 def test_desktop_cli_emits_branded_entry(monkeypatch, tmp_path):
