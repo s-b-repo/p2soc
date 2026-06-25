@@ -783,6 +783,7 @@ fi
 # when branding/python isn't available (trimmed deploy / pre-venv).
 DESKTOP_FILE=""
 SETUP_DESKTOP_FILE=""
+APPEARANCE_DESKTOP_FILE=""
 ICON_FILE=""
 BRANDING_FILE=""
 VENV_PY="$SOC_ROOT/.venv/bin/python"
@@ -853,6 +854,20 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
       chmod +x "$SOC_ROOT/scripts/soc-wall-setup-gui.sh" 2>/dev/null || true
   else
     warn "no $SOC_ROOT/soc-wall-setup.desktop — skipping setup launcher entry"
+  fi
+
+  # Companion entry: "SOC Wall Appearance" — the graphical theme editor. Shares the
+  # soc-wall icon and execs the appearance launcher. Static copy (product-neutral
+  # name, NOT regenerated from branding); chmod +x the gui launcher so it works.
+  APPEARANCE_DESKTOP_DST="/usr/share/applications/soc-wall-appearance.desktop"
+  if [ -f "$SOC_ROOT/soc-wall-appearance.desktop" ]; then
+    install -Dm0644 "$SOC_ROOT/soc-wall-appearance.desktop" "$APPEARANCE_DESKTOP_DST"
+    APPEARANCE_DESKTOP_FILE="$APPEARANCE_DESKTOP_DST"
+    log "installed appearance launcher -> $APPEARANCE_DESKTOP_DST"
+    [ -f "$SOC_ROOT/scripts/soc-wall-appearance.sh" ] && \
+      chmod +x "$SOC_ROOT/scripts/soc-wall-appearance.sh" 2>/dev/null || true
+  else
+    warn "no $SOC_ROOT/soc-wall-appearance.desktop — skipping appearance launcher entry"
   fi
 
   # refresh the desktop + icon caches best-effort (absent on headless/minimal)
@@ -937,6 +952,7 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
     printf 'FILE|%s/tarpit.env|tarpit arm-flag (remove on uninstall)\n' "$ETC"
   [ -n "$DESKTOP_FILE" ] && printf 'FILE|%s|XDG desktop launcher (rebrand-generated; remove on uninstall)\n' "$DESKTOP_FILE"
   [ -n "$SETUP_DESKTOP_FILE" ] && printf 'FILE|%s|XDG setup launcher (remove on uninstall)\n' "$SETUP_DESKTOP_FILE"
+  [ -n "$APPEARANCE_DESKTOP_FILE" ] && printf 'FILE|%s|XDG appearance launcher (remove on uninstall)\n' "$APPEARANCE_DESKTOP_FILE"
   [ -n "$ICON_FILE" ]    && printf 'FILE|%s|app icon (remove on uninstall)\n' "$ICON_FILE"
   # branding source lives under $ETC -> operator data, preserved unless --purge
   [ -n "$BRANDING_FILE" ] && printf 'FILE|%s|branding source (preserve unless --purge; edit to rebrand)\n' "$BRANDING_FILE"

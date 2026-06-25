@@ -51,6 +51,10 @@ fi
 export SOC_ROOT="$ROOT"
 export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
 
+# Cap GLib/GTK per-thread malloc arenas (default 8*ncpu) — the single biggest RSS
+# cut on the 1GB Pi (same rationale as launcher.sh).
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
 

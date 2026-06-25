@@ -51,6 +51,10 @@ dev: .venv dev-vault  ## run the wall in a Xephyr window (interactive; Ctrl-C to
 wizard-gui: .venv  ## graphical setup wizard (presets + live validation; needs a display)
 	PYTHONPATH=kiosk-host $(PY) -m host.setupgui
 
+.PHONY: appearance
+appearance: .venv  ## graphical theme editor (presets + per-colour pickers; needs a display)
+	PYTHONPATH=kiosk-host $(PY) -m host.appearance
+
 .PHONY: desktop-dev
 desktop-dev: .venv  ## install user-level app icons pointing at THIS checkout (no sudo)
 	@mkdir -p $(HOME)/.local/share/applications $(HOME)/.local/share/icons/hicolor/scalable/apps
@@ -60,9 +64,12 @@ desktop-dev: .venv  ## install user-level app icons pointing at THIS checkout (n
 	@printf '%s\n' '[Desktop Entry]' 'Name=SOC Wall Setup' 'Comment=Configure the SOC video wall' \
 	  'Exec=$(CURDIR)/scripts/soc-wall-setup-gui.sh' 'Icon=soc-wall' 'Terminal=false' \
 	  'Type=Application' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-setup.desktop
+	@printf '%s\n' '[Desktop Entry]' 'Name=SOC Wall Appearance' 'Comment=Theme colours and presets' \
+	  'Exec=$(CURDIR)/scripts/soc-wall-appearance.sh' 'Icon=soc-wall' 'Terminal=false' \
+	  'Type=Application' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-appearance.desktop
 	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
 	@command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
-	@echo "dev app icons installed -> $(HOME)/.local/share/applications (SOC Video Wall + SOC Wall Setup)"
+	@echo "dev app icons installed -> $(HOME)/.local/share/applications (SOC Video Wall + SOC Wall Setup + SOC Wall Appearance)"
 
 .PHONY: verify
 verify: .venv dev-vault  ## headless end-to-end check (Xvfb) — asserts logins + tunnel + screenshot

@@ -163,6 +163,209 @@ def icon_path() -> str:
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# Persistence — write the palette back to branding.yaml (the Appearance editor's
+# Save). PURE STDLIB (no PyYAML) so branding stays importable before the venv,
+# exactly like load(). Comment-preserving: only colour *values* are rewritten;
+# the heavily-commented header + per-key docs + key order survive untouched.
+# --------------------------------------------------------------------------- #
+_COLOR_KEYS = tuple(_DEFAULTS["colors"].keys())
+
+
+def _fmt_hex(value: str) -> str:
+    """Validate + normalise a colour to #RRGGBB uppercase. Accepts #RGB / #RRGGBB
+    (with or without the leading '#'); raises ValueError on anything else so a bad
+    pick can never corrupt the file."""
+    h = str(value).strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    if len(h) != 6:
+        raise ValueError(f"not a hex colour: {value!r}")
+    try:
+        int(h, 16)
+    except ValueError:
+        raise ValueError(f"not a hex colour: {value!r}")
+    return "#" + h.upper()
+
+
+def _save_target(path: str | None) -> str:
+    """Resolve the branding.yaml write target, mirroring _candidates()'s order and
+    honouring SOC_BRANDING_FILE. Returns the first tier whose parent dir the euid
+    can create+write; raises PermissionError (with the exact path) otherwise — the
+    editor catches it and tells the operator to re-run elevated / fix perms. Never
+    escalates to /etc here (that stays the wizard's pkexec path)."""
+    def _writable(target: str) -> bool:
+        d = os.path.dirname(os.path.abspath(target)) or "."
+        p = d
+        while p and not os.path.exists(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        return os.access(p or "/", os.W_OK)
+
+    # 1. explicit path arg (the headless / test hook).
+    if path:
+        if not _writable(path):
+            raise PermissionError(
+                f"cannot write branding to {path!r} (directory not writable) — "
+                f"re-run as root or fix the directory permissions")
+        return os.path.abspath(path)
+    # 2. $SOC_BRANDING_FILE.
+    env = os.environ.get("SOC_BRANDING_FILE")
+    if env:
+        if not _writable(env):
+            raise PermissionError(
+                f"cannot write branding to $SOC_BRANDING_FILE={env!r} "
+                f"(directory not writable) — re-run as root or fix permissions")
+        return os.path.abspath(env)
+    # 3. /etc/soc-display/branding.yaml ONLY if the dir exists and is writable.
+    etc = "/etc/soc-display/branding.yaml"
+    if os.path.isdir("/etc/soc-display") and os.access("/etc/soc-display", os.W_OK):
+        return etc
+    # If /etc exists but isn't ours, don't silently drop to repo — but only refuse
+    # if there's also no repo checkout to fall back to (deployed box, non-root).
+    repo = os.path.join(_root(), "branding", "branding.yaml")
+    if os.path.isdir("/etc/soc-display") and not _writable(repo):
+        raise PermissionError(
+            f"cannot write branding to {etc!r} (not writable by this user) and no "
+            f"writable repo fallback — re-run as root, or set SOC_BRANDING_FILE to "
+            f"a path you own")
+    # 4. repo file (dev / the file load() already reads).
+    if not _writable(repo):
+        raise PermissionError(
+            f"cannot write branding to {repo!r} (directory not writable) — "
+            f"set SOC_BRANDING_FILE to a path you own")
+    return os.path.abspath(repo)
+
+
+def _rewrite_colors_inplace(lines: "list[str]", colors: dict) -> "list[str]":
+    """In an existing file's text, rewrite ONLY the values of `  <key>: "<hex>"`
+    lines inside the `colors:` block (keeping indentation, key, quote style and any
+    inline trailing comment). Keys absent from the file are appended inside the
+    block. Everything else — comments, blanks, key order, non-colour lines — is
+    preserved verbatim."""
+    out: "list[str]" = []
+    in_colors = False
+    colors_indent = ""
+    seen: "set[str]" = set()
+    last_color_idx = -1  # index in `out` of the last colour line written
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        # Detect the start of the top-level `colors:` block (no indent, value-less).
+        if not (line[:1] in (" ", "\t")) and stripped.rstrip() == "colors:":
+            in_colors = True
+            out.append(line)
+            continue
+        if in_colors:
+            indented = line[:1] in (" ", "\t")
+            # A new top-level (non-indented, non-blank, non-comment) key ends the block.
+            if stripped and not stripped.startswith("#") and not indented:
+                in_colors = False
+            elif indented and stripped and not stripped.startswith("#"):
+                key, sep, rest = stripped.partition(":")
+                key = key.strip()
+                if sep and key in colors:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    colors_indent = colors_indent or indent
+                    # Preserve any inline trailing comment that follows the VALUE.
+                    # The value itself starts with '#' (a hex colour) and may be
+                    # quoted, so only a '#' that appears AFTER the value token (the
+                    # first whitespace-separated chunk) counts as a comment.
+                    comment = ""
+                    val_part = rest.strip()
+                    after = ""
+                    if val_part:
+                        bits = val_part.split(None, 1)
+                        after = bits[1] if len(bits) > 1 else ""
+                    hashpos = after.find("#")
+                    if hashpos != -1:
+                        comment = "  " + after[hashpos:].strip()
+                    new_val = _fmt_hex(colors[key])
+                    out.append(f'{indent}{key}: "{new_val}"{comment}')
+                    seen.add(key)
+                    last_color_idx = len(out) - 1
+                    continue
+        out.append(line)
+
+    # Append any colour keys present in `colors` but missing from the file, inside
+    # the colours block (after the last colour line), in _DEFAULTS order.
+    missing = [k for k in _COLOR_KEYS if k in colors and k not in seen]
+    # also honour any non-default keys the caller passed
+    missing += [k for k in colors if k not in _COLOR_KEYS and k not in seen]
+    if missing:
+        indent = colors_indent or "  "
+        insert = [f'{indent}{k}: "{_fmt_hex(colors[k])}"' for k in missing]
+        if last_color_idx >= 0:
+            out[last_color_idx + 1:last_color_idx + 1] = insert
+        else:
+            out.extend(insert)
+    return out
+
+
+def _render_fresh(colors: dict) -> "list[str]":
+    """Render a brand-new branding.yaml when the target doesn't exist: a short
+    header, a `colors:` block with the 14 keys in _DEFAULTS order, then any extra
+    keys. Also carries through name/short_name/tagline/icon from load() so a
+    from-scratch /etc file is still a valid full branding.yaml."""
+    b = load()
+    lines = ["# Theme palette written by the Appearance editor — edit to rebrand."]
+    for k in ("name", "short_name", "tagline", "vendor", "homepage", "icon"):
+        v = b.get(k)
+        if v:
+            lines.append(f'{k}: "{v}"')
+    lines.append("colors:")
+    keys = list(_COLOR_KEYS) + [k for k in colors if k not in _COLOR_KEYS]
+    for k in keys:
+        if k in colors:
+            lines.append(f'  {k}: "{_fmt_hex(colors[k])}"')
+    return lines
+
+
+def save_colors(colors: dict, path: str | None = None) -> str:
+    """Write the palette in `colors` back to branding.yaml and return the path
+    written. PURE STDLIB. Resolves the target via _save_target (SOC_BRANDING_FILE >
+    /etc/soc-display > repo, honouring an explicit `path`), preserving the file's
+    comments/structure when it already exists (only colour values are rewritten;
+    NEVER secrets — only palette keys are ever touched). Atomic: writes a temp file
+    in the same dir + os.replace(); mode 0644. Refreshes the in-process cache so the
+    live process picks up the new palette."""
+    if not isinstance(colors, dict) or not colors:
+        raise ValueError("save_colors: colors must be a non-empty dict")
+    # Validate every value up front so a bad pick aborts before any write.
+    clean = {str(k): _fmt_hex(v) for k, v in colors.items()}
+
+    target = _save_target(path)
+    d = os.path.dirname(target) or "."
+    os.makedirs(d, exist_ok=True)
+
+    if os.path.exists(target):
+        with open(target, encoding="utf-8") as fh:
+            src_lines = fh.read().splitlines()
+        out_lines = _rewrite_colors_inplace(src_lines, clean)
+    else:
+        out_lines = _render_fresh(clean)
+    text = "\n".join(out_lines) + "\n"
+
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".branding.", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    load(refresh=True)
+    return target
+
+
 def _main(argv) -> int:
     if not argv:
         for k in ("name", "short_name", "tagline", "vendor", "homepage", "icon"):
