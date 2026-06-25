@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Name=SOC Video Wall
+Comment=Open the SOC video-wall launcher (setup, desktop or kiosk mode)
+Exec=/opt/soc-display/scripts/soc-wall-menu
+Icon=soc-wall
+Terminal=false
+Type=Application
+Categories=System;Utility;
+Keywords=soc;security;wall;kiosk;dashboard;

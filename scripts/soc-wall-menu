@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# SOC wall launcher menu — soc-wall.desktop runs this when the app icon is
+# clicked. It shows a small chooser (Setup / Desktop mode / Kiosk mode) and then
+# dispatches to scripts/soc-wall-desktop.sh (--window | --fullscreen) or the
+# setup wizard. It attaches to the current desktop session; it never takes over
+# tty1. Pure launcher: real work is host/launchermenu.py.
+set -euo pipefail
+
+ROOT="${SOC_ROOT:-/opt/soc-display}"
+ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
+
+# Load the (tmpfs, 0600) env if present so the launched wall sees the same config.
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+export SOC_ROOT="$ROOT"
+export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
+
+PYBIN="$ROOT/.venv/bin/python"
+[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+
+exec "$PYBIN" -m host.launchermenu "$@"

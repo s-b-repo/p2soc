@@ -148,10 +148,19 @@ configure with the interactive wizard and run the installer:
 
 ```bash
 sudo python3 setup.py deploy      # end-to-end: install + configure + seal PIN + push config + creds
-sudo ./install.sh                 # VW_MODE=docker (default) | native ; HARDEN=1 to firewall
+sudo ./install.sh                 # INSTALL_MODE=desktop (default) | kiosk
+                                  # VW_MODE=docker (default) | native ; HARDEN=1 to firewall
                                   # SESSION=x11 (default) | wayland | auto
                                   # SOC_SKIP_PACKAGES=1 on an unsupported distro
 ```
+
+By default (`INSTALL_MODE=desktop`) the installer is **desktop-friendly**: it
+deploys everything and adds a clickable **"SOC Wall"** launcher to your apps
+menu, but leaves your systemd default target and tty1 untouched — your existing
+desktop keeps working and you start the wall on demand from the menu icon (it
+runs against the current `$DISPLAY`/`$WAYLAND_DISPLAY`). Use `INSTALL_MODE=kiosk`
+for the dedicated appliance, which **takes over tty1** with autologin and boots
+straight into the wall.
 
 Auto-installs packages via apt/dnf/pacman/zypper/apk/xbps; honours an existing
 X.Org **or XLibre** server; degrades gracefully without systemd (prints the
@@ -164,8 +173,12 @@ files; see the [full setup guide](docs/SETUP.md). You can also edit the
 The installer: installs deps, creates the `soc` (kiosk) and `socsvc` (tunnel)
 users, deploys to `/opt/soc-display`, builds the venv, lays down `/etc/soc-display`
 config, sets up Vaultwarden + autossh systemd units, zram, the Openbox session,
-and tty1 autologin. It **disables the desktop session** (keeps your preloaded
-card; the desktop just doesn't run) — same RAM benefit as Pi OS Lite, reversible.
+and the "SOC Wall" menu launcher. In **kiosk** mode it additionally enables tty1
+autologin and **disables the desktop session** (keeps your preloaded card; the
+desktop just doesn't run) — same RAM benefit as Pi OS Lite. Either way it is
+**reversible**: the install records a manifest and `./uninstall.sh` (or `make
+uninstall`) replays it, preserving operator vault data by default and restoring
+the console; `--purge` removes everything (see [docs/INSTALL.md](docs/INSTALL.md#uninstall)).
 
 Then finish setup (the installer prints this):
 

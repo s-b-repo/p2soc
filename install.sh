@@ -28,6 +28,12 @@
 #                             runtime try Wayland -> XWayland -> XLibre -> Xorg.
 #                             wayland/xwayland install the Wayland compositor;
 #                             xlibre/xorg/x11 install the X11 server + openbox.
+#   INSTALL_MODE=desktop|kiosk how the wall starts             (default: desktop)
+#                             desktop = deploy everything but DON'T touch the boot
+#                             (your DE/login manager keeps working; launch the wall
+#                             from the desktop icon or `systemctl start soc-wall`).
+#                             kiosk   = dedicated appliance: enable tty1 autologin +
+#                             `systemctl set-default multi-user.target`.
 #   VW_MODE=docker|native     how to run Vaultwarden           (default: docker)
 #   HARDEN=1                  apply nftables + sshd hardening  (default: off)
 #   KIOSK_USER=soc            kiosk login user                 (default: soc)
@@ -49,6 +55,11 @@ HARDEN="${HARDEN:-0}"
 KIOSK_USER="${KIOSK_USER:-soc}"
 SVC_USER="${SVC_USER:-socsvc}"
 COMPOSITOR="${COMPOSITOR:-labwc}"
+# desktop (default): deploy everything but DON'T hijack the boot — the existing
+# DE/login manager keeps working; the wall launches via the desktop icon or
+# `systemctl start soc-wall`. kiosk: the tty1 takeover (autologin + multi-user
+# default target) for a dedicated SOC-wall appliance.
+INSTALL_MODE="${INSTALL_MODE:-desktop}"
 SKIP_PACKAGES="${SOC_SKIP_PACKAGES:-0}"
 DEPS_ONLY=0
 FRESH="${SOC_FRESH:-0}"
@@ -68,6 +79,8 @@ die(){ printf '\033[31mEE\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo ./install.sh)"
 case "$SESSION" in auto|wayland|xwayland|xlibre|xorg|x11) ;; *)
   die "SESSION must be auto|wayland|xwayland|xlibre|xorg|x11 (got '$SESSION')";; esac
+case "$INSTALL_MODE" in desktop|kiosk) ;; *)
+  die "INSTALL_MODE must be desktop|kiosk (got '$INSTALL_MODE')";; esac
 
 # systemd is preferred but not required — degrade gracefully without it.
 HAS_SYSTEMD=0
@@ -627,22 +640,70 @@ fi
 EOF
 chown -R "$KIOSK_USER:$KIOSK_USER" "$HOME_DIR/.config" "$HOME_DIR/.xinitrc" "$HOME_DIR/.bash_profile"
 
+# Capture the original default target BEFORE we touch it, so uninstall.sh can
+# restore it (only meaningful with systemd). Recorded into the manifest below.
+ORIG_DEFAULT_TARGET=""
 if [ "$HAS_SYSTEMD" = "1" ]; then
-  log "Enabling tty1 autologin"
-  mkdir -p /etc/systemd/system/getty@tty1.service.d
-  sed "s/--autologin soc /--autologin $KIOSK_USER /" \
-    "$SOC_ROOT/systemd/getty-autologin.conf" > /etc/systemd/system/getty@tty1.service.d/override.conf
-  systemctl set-default multi-user.target    # no desktop env; we run our own session
-  systemctl daemon-reload
-else
-  warn "no systemd — set up tty1 autologin for '$KIOSK_USER' with your init."
-  warn "  agetty:  agetty --autologin $KIOSK_USER --noclear tty1 (in inittab/respawn)"
-  warn "  Its login runs ~$KIOSK_USER/.bash_profile, which execs the SOC session."
+  ORIG_DEFAULT_TARGET="$(systemctl get-default 2>/dev/null || true)"
 fi
 
-# kernel console blanking off (Raspberry Pi)
+# tty1 takeover (autologin + multi-user default target) is the dedicated-appliance
+# behaviour — kiosk mode only. In desktop mode we deploy the same session bits but
+# leave the boot alone so the existing DE/login manager keeps working; the wall is
+# launched on demand (desktop icon / `systemctl start soc-wall`).
+DID_SET_DEFAULT=0
+if [ "$INSTALL_MODE" = "kiosk" ]; then
+  if [ "$HAS_SYSTEMD" = "1" ]; then
+    log "Enabling tty1 autologin (INSTALL_MODE=kiosk)"
+    mkdir -p /etc/systemd/system/getty@tty1.service.d
+    sed "s/--autologin soc /--autologin $KIOSK_USER /" \
+      "$SOC_ROOT/systemd/getty-autologin.conf" > /etc/systemd/system/getty@tty1.service.d/override.conf
+    systemctl set-default multi-user.target    # no desktop env; we run our own session
+    DID_SET_DEFAULT=1
+    systemctl daemon-reload
+  else
+    warn "no systemd — set up tty1 autologin for '$KIOSK_USER' with your init."
+    warn "  agetty:  agetty --autologin $KIOSK_USER --noclear tty1 (in inittab/respawn)"
+    warn "  Its login runs ~$KIOSK_USER/.bash_profile, which execs the SOC session."
+  fi
+else
+  log "INSTALL_MODE=desktop — leaving the boot/default target + getty untouched"
+  log "  launch the wall from the 'SOC Video Wall' desktop icon, or:"
+  log "  $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start soc-wall" || echo "$SOC_ROOT/scripts/launcher.sh")"
+  log "  (re-run with INSTALL_MODE=kiosk for a dedicated tty1-autologin appliance)"
+fi
+
+# kernel console blanking off (Raspberry Pi). Track whether WE added it so
+# uninstall.sh only strips it back out if this install introduced it.
+DID_CONSOLEBLANK=0
 if [ -f /boot/firmware/cmdline.txt ] && ! grep -q consoleblank /boot/firmware/cmdline.txt; then
   sed -i 's/$/ consoleblank=0/' /boot/firmware/cmdline.txt
+  DID_CONSOLEBLANK=1
+fi
+
+# --------------------------------------------------------------------------- #
+# Clickable launcher: an XDG .desktop app + icon so the wall can be started on
+# demand against the current display (no tty1 required). Installed in BOTH modes
+# — it's the primary entry point in desktop mode. Guarded so a repo that hasn't
+# shipped the asset yet (or a trimmed deploy) degrades gracefully.
+DESKTOP_FILE=""
+ICON_FILE=""
+if [ -f "$SOC_ROOT/soc-wall.desktop" ]; then
+  log "Installing desktop launcher (SOC Video Wall app icon)"
+  install -Dm0644 "$SOC_ROOT/soc-wall.desktop" /usr/share/applications/soc-wall.desktop
+  DESKTOP_FILE="/usr/share/applications/soc-wall.desktop"
+  if [ -f "$SOC_ROOT/share/icons/soc-wall.svg" ]; then
+    install -Dm0644 "$SOC_ROOT/share/icons/soc-wall.svg" \
+      /usr/share/icons/hicolor/scalable/apps/soc-wall.svg
+    ICON_FILE="/usr/share/icons/hicolor/scalable/apps/soc-wall.svg"
+  fi
+  # refresh the desktop + icon caches best-effort (absent on headless/minimal)
+  command -v update-desktop-database >/dev/null 2>&1 && \
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+    gtk-update-icon-cache -qtf /usr/share/icons/hicolor >/dev/null 2>&1 || true
+else
+  warn "no $SOC_ROOT/soc-wall.desktop — skipping desktop launcher install"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -658,10 +719,80 @@ if [ "$HARDEN" = "1" ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# Install manifest + revert state for uninstall.sh. Simple line format:
+#   TYPE|VALUE|NOTE
+# TYPE is one of: META, DIR, FILE, UNIT, USER, SYSCHANGE, REVERT. Idempotent —
+# rewritten in full on every run. uninstall.sh reads REVERT lines to restore the
+# default systemd target and (only if WE added it) the consoleblank cmdline flag.
+# By convention uninstall.sh PRESERVES operator data (users, $ETC secrets,
+# /var/lib/vaultwarden) unless run with --purge; the manifest tags those rows so
+# it knows what to keep.
+log "Recording install manifest at $ETC/.install-manifest"
+HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
+{
+  printf 'META|version|1\n'
+  printf 'META|date|%s\n' "$(date -Is 2>/dev/null || date 2>/dev/null || echo unknown)"
+  printf 'META|install_mode|%s\n' "$INSTALL_MODE"
+  printf 'META|arch|%s\n' "$ARCH"
+  printf 'META|session|%s\n' "$SESSION"
+  printf 'META|vw_mode|%s\n' "$VW_MODE"
+  printf 'META|harden|%s\n' "$HARDEN"
+  printf 'META|kiosk_user|%s\n' "$KIOSK_USER"
+  printf 'META|svc_user|%s\n' "$SVC_USER"
+  printf 'META|has_systemd|%s\n' "$HAS_SYSTEMD"
+
+  # users (PRESERVE on plain uninstall; --purge removes)
+  printf 'USER|%s|kiosk user (preserve unless --purge)\n' "$KIOSK_USER"
+  printf 'USER|%s|service user (preserve unless --purge)\n' "$SVC_USER"
+  [ "$VW_MODE" = "native" ] && printf 'USER|%s|vaultwarden user (preserve unless --purge)\n' vaultwarden
+
+  # deployed trees + config (config dir holds secrets -> preserve unless --purge)
+  printf 'DIR|%s|project root (remove on uninstall)\n' "$SOC_ROOT"
+  printf 'DIR|%s|config + sealed secrets (preserve unless --purge)\n' "$ETC"
+  [ "$VW_MODE" = "native" ] && printf 'DIR|%s|vaultwarden data (preserve unless --purge)\n' /var/lib/vaultwarden
+
+  # files on PATH / shared trees
+  printf 'FILE|/usr/local/bin/litebw|litebw launcher (remove on uninstall)\n'
+  [ -n "$DESKTOP_FILE" ] && printf 'FILE|%s|XDG desktop launcher (remove on uninstall)\n' "$DESKTOP_FILE"
+  [ -n "$ICON_FILE" ]    && printf 'FILE|%s|app icon (remove on uninstall)\n' "$ICON_FILE"
+
+  # systemd units (and any drop-ins/configs we dropped). Listed regardless of
+  # enabled-state; uninstall.sh disables+removes them.
+  if [ "$HAS_SYSTEMD" = "1" ]; then
+    printf 'UNIT|vaultwarden.service|%s\n' "$([ "$VW_MODE" = native ] && echo "/etc/systemd/system/vaultwarden.service" || echo "docker-run unit")"
+    printf 'UNIT|autossh-tunnel.service|/etc/systemd/system/autossh-tunnel.service\n'
+    printf 'UNIT|forti-vpn.service|/etc/systemd/system/forti-vpn.service\n'
+    printf 'UNIT|soc-wall.service|/etc/systemd/system/soc-wall.service\n'
+    [ "$INSTALL_MODE" = "kiosk" ] && \
+      printf 'FILE|/etc/systemd/system/getty@tty1.service.d/override.conf|tty1 autologin drop-in (kiosk)\n'
+    [ "$HARDEN" = "1" ] && printf 'UNIT|nftables.service|enabled by HARDEN=1\n'
+    printf 'FILE|/etc/sysctl.d/99-soc.conf|sysctl tuning (remove on uninstall)\n'
+    printf 'FILE|/etc/systemd/zram-generator.conf|zram config (remove on uninstall)\n'
+    printf 'FILE|/etc/systemd/journald.conf.d/10-soc.conf|journald cap (remove on uninstall)\n'
+    printf 'FILE|/etc/systemd/coredump.conf.d/10-soc.conf|coredump off (remove on uninstall)\n'
+  fi
+  if [ "$HARDEN" = "1" ]; then
+    printf 'FILE|/etc/nftables.conf|firewall (HARDEN=1; review before removing)\n'
+    printf 'FILE|/etc/ssh/sshd_config.d/10-soc-hardening.conf|sshd hardening (HARDEN=1)\n'
+  fi
+
+  # other system changes touched in place (NOT owned by us — informational only)
+  [ "$FAMILY" = "debian" ] && printf 'SYSCHANGE|/etc/X11/Xwrapper.config|allowed_users=anybody (edited in place)\n'
+
+  # revert state for uninstall.sh
+  printf 'REVERT|orig_default_target|%s\n' "${ORIG_DEFAULT_TARGET:-unknown}"
+  printf 'REVERT|did_set_default|%s\n' "$DID_SET_DEFAULT"
+  printf 'REVERT|did_consoleblank|%s\n' "$DID_CONSOLEBLANK"
+  printf 'REVERT|cmdline_path|%s\n' "/boot/firmware/cmdline.txt"
+  [ -n "$HOME_DIR_M" ] && printf 'SYSCHANGE|%s|kiosk session dotfiles (.bash_profile/.xinitrc/.config/openbox)\n' "$HOME_DIR_M"
+} > "$ETC/.install-manifest" 2>/dev/null || warn "could not write $ETC/.install-manifest"
+chmod 0644 "$ETC/.install-manifest" 2>/dev/null || true
+
+# --------------------------------------------------------------------------- #
 # Stamp a successful full install so re-runs + `setup.py deploy` can fast-path
 # the package step (skip unless --fresh).
-printf 'installed=%s arch=%s session=%s\n' \
-  "$(date -Is 2>/dev/null || date 2>/dev/null || echo unknown)" "$ARCH" "$SESSION" \
+printf 'installed=%s arch=%s session=%s mode=%s\n' \
+  "$(date -Is 2>/dev/null || date 2>/dev/null || echo unknown)" "$ARCH" "$SESSION" "$INSTALL_MODE" \
   > "$ETC/.installed" 2>/dev/null || true
 
 cat <<EOF
@@ -692,6 +823,6 @@ $(printf '\033[32mInstall complete.\033[0m')  Next steps:
 $([ "$HAS_SYSTEMD" = 1 ] || printf '%s\n' "  NOTE: no systemd here — see the warnings above for service supervision +")
 $([ "$HAS_SYSTEMD" = 1 ] || printf '%s\n' "        tty1 autologin you must wire into your init before the wall starts.")
 
-The wall comes up automatically on tty1 -> $([ "$SESSION" = x11 ] && echo "startx -> Openbox" || echo "cage/labwc (Wayland)") -> logged-in panels.
+$(if [ "$INSTALL_MODE" = "kiosk" ]; then printf 'The wall comes up automatically on tty1 -> %s -> logged-in panels.' "$([ "$SESSION" = x11 ] && echo "startx -> Openbox" || echo "cage/labwc (Wayland)")"; else printf 'INSTALL_MODE=desktop: your DE/login manager is untouched. Launch the wall from\n  the "SOC Video Wall" desktop icon, or %s. Re-run with\n  INSTALL_MODE=kiosk for a dedicated tty1-autologin appliance.' "$([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start soc-wall" || echo "$SOC_ROOT/scripts/launcher.sh")"; fi)
 Debugging: $([ "$HAS_SYSTEMD" = 1 ] && echo "journalctl -t soc-kiosk -f (host)  journalctl -u forti-vpn -f (VPN)" || echo "the launcher logs to stdout/syslog; run forti-vpn-connect.py in the foreground to watch it")
 EOF

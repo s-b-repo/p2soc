@@ -99,6 +99,10 @@ lint: .venv verify-arm  ## syntax-check shell + python + run the aarch64 gate
 install:  ## install on the Pi (run as root)
 	sudo ./install.sh
 
+.PHONY: uninstall
+uninstall:  ## uninstall from the Pi (root; preserves data — ARGS="--purge" to wipe)
+	sudo ./uninstall.sh $(ARGS)
+
 .PHONY: clean
 clean:  ## stop dev procs and remove dev runtime state
 	-pkill -f "dummy-panels/server.py" 2>/dev/null

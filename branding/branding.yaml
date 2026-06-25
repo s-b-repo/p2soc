@@ -1,0 +1,33 @@
+# =============================================================================
+# REBRAND THE WALL HERE.  Edit this one file to rebrand the whole product — the
+# name, tagline, icon and accent colours flow into the launcher menu, the setup
+# wizard, the desktop app entry (at install time) and the packaged metadata.
+#
+# Anything you leave out falls back to the built-in defaults, so a partial file
+# is fine. Override at runtime with SOC_BRANDING_FILE=/path/to/branding.yaml, or
+# drop a branding.yaml in /etc/soc-display/ on a deployed box.
+# =============================================================================
+
+name: "SOC Video Wall"          # full product name (titles, headers)
+short_name: "SOC Wall"          # compact name (window title, menus)
+tagline: "Operations console"   # one-line subtitle under the name
+vendor: "s-b-repo"
+homepage: "https://github.com/s-b-repo/p2soc"
+
+# Scalable icon (SVG). Path is relative to the repo/deploy root, or absolute.
+# Replace the file (or point this elsewhere) to rebrand the app icon.
+icon: "share/icons/soc-wall.svg"
+
+# Accent palette (hex). `primary` is the brand colour; setup/desktop/kiosk tint
+# the three launcher cards; background/text/text_dim theme the window.
+colors:
+  primary: "#2BE0C8"
+  setup: "#8B9CFF"
+  desktop: "#2BE0C8"
+  kiosk: "#F5B14C"
+  background: "#0B1220"
+  surface_top: "#16213A"
+  surface_bottom: "#0F1828"
+  border: "#22324E"
+  text: "#E8EEF7"
+  text_dim: "#8194B0"

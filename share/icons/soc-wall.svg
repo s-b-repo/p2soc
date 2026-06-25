@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none" role="img" aria-label="SOC Video Wall">
+  <title>SOC Video Wall</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#101B2E"/>
+      <stop offset="1" stop-color="#0A111F"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="69" y1="69" x2="107" y2="107" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#46F2D8"/>
+      <stop offset="1" stop-color="#15A893"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#24344F"/>
+      <stop offset="1" stop-color="#18253C"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2BE0C8" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#2BE0C8" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.2"/>
+    </filter>
+  </defs>
+
+  <!-- app tile -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#tile)"/>
+  <rect x="5" y="5" width="118" height="118" rx="27" fill="none" stroke="#26374F" stroke-width="2"/>
+
+  <!-- ambient glow behind the live panel -->
+  <circle cx="88" cy="88" r="34" fill="url(#glow)"/>
+
+  <!-- 2x2 video-wall grid; bottom-right panel is "live" -->
+  <g>
+    <rect x="21" y="21" width="38" height="38" rx="8" fill="url(#panel)" stroke="#314A6E" stroke-width="1.25"/>
+    <rect x="69" y="21" width="38" height="38" rx="8" fill="url(#panel)" stroke="#314A6E" stroke-width="1.25"/>
+    <rect x="21" y="69" width="38" height="38" rx="8" fill="url(#panel)" stroke="#314A6E" stroke-width="1.25"/>
+    <rect x="69" y="69" width="38" height="38" rx="8" fill="url(#cyan)" filter="url(#soft)" opacity="0.9"/>
+    <rect x="69" y="69" width="38" height="38" rx="8" fill="url(#cyan)"/>
+    <rect x="74" y="75" width="28" height="3.4" rx="1.7" fill="#093B36" opacity="0.55"/>
+    <rect x="74" y="83" width="20" height="3.4" rx="1.7" fill="#093B36" opacity="0.4"/>
+  </g>
+
+  <!-- scan rows on the dim panels -->
+  <g fill="#46608A" opacity="0.5">
+    <rect x="27" y="31" width="26" height="2.6" rx="1.3"/>
+    <rect x="27" y="38" width="18" height="2.6" rx="1.3"/>
+    <rect x="75" y="31" width="26" height="2.6" rx="1.3"/>
+    <rect x="75" y="38" width="18" height="2.6" rx="1.3"/>
+    <rect x="27" y="79" width="26" height="2.6" rx="1.3"/>
+    <rect x="27" y="86" width="18" height="2.6" rx="1.3"/>
+  </g>
+</svg>

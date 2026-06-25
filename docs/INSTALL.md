@@ -2,7 +2,16 @@
 
 Primary target: **Raspberry Pi 5 (1 GB+)**, Raspberry Pi OS (64-bit, Bookworm),
 HDMI monitor — but the installer runs on any mainstream Linux. It keeps your
-existing system and simply **runs its own kiosk session** on tty1 (reversible).
+existing system intact.
+
+By default (`INSTALL_MODE=desktop`) it is **desktop-friendly**: it deploys
+everything (users, `/opt/soc-display`, `/etc/soc-display`, systemd units, the
+`litebw` client) and adds a **clickable "SOC Wall" launcher** to your apps menu,
+but it does **not** touch the systemd default target and does **not** enable tty1
+autologin — your existing desktop / login manager keeps working, and you start
+the wall on demand from the menu icon. Choose `INSTALL_MODE=kiosk` only when you
+want the dedicated appliance behavior, where the box **autologins on tty1 into
+its own kiosk session** at boot (reversible — see [Uninstall](#uninstall)).
 
 ## Supported distros
 
@@ -51,6 +60,7 @@ Knobs (env vars):
 
 | Var | Default | Meaning |
 |---|---|---|
+| `INSTALL_MODE` | `desktop` | `desktop`: deploy everything + add the "SOC Wall" menu launcher, but leave the systemd default target and tty1 untouched (your DE keeps working). `kiosk`: also take over tty1 (autologin into the kiosk session) and `set-default multi-user.target` — the dedicated-appliance path |
 | `SESSION` | `auto` | display stack: `auto` (install both; at runtime try **Wayland → XWayland → XLibre → Xorg**), or force one of `wayland` / `xwayland` / `xlibre` / `xorg` / `x11` |
 | `VW_MODE` | `docker` | `docker` (official image) or `native` (binary at `/usr/local/bin/vaultwarden`) |
 | `HARDEN` | `0` | `1` also installs the nftables firewall + key-only sshd |
@@ -62,9 +72,24 @@ Knobs (env vars):
 The installer is **idempotent** — safe to re-run. It installs deps, creates the
 users, deploys to `/opt/soc-display`, builds the venv, lays down
 `/etc/soc-display`, installs the systemd units (or prints the manual equivalents
-without systemd), configures zram, generates the 2×2 layout, and enables tty1
-autologin. The chosen `SESSION` is written to `soc.env` as `SOC_SESSION` and can
-be changed there any time.
+without systemd), configures zram, generates the 2×2 layout, and installs the
+"SOC Wall" menu launcher. In **kiosk** mode it additionally enables tty1
+autologin and sets `multi-user.target` as the default; in the default
+**desktop** mode it does neither (your DE is untouched). The chosen `SESSION` is
+written to `soc.env` as `SOC_SESSION` and can be changed there any time.
+
+The installer records every file it lays down and every system change it makes
+in a manifest at `/etc/soc-display/install-manifest` — that is what
+[`uninstall.sh`](#uninstall) replays to revert cleanly.
+
+### Launching the wall (desktop mode)
+
+After a desktop-mode install, open your applications menu and click **SOC Wall**
+(category: System / Network). The launcher sources `/etc/soc-display/soc.env` and
+runs the kiosk host against your **current** display (`$DISPLAY` /
+`$WAYLAND_DISPLAY`) — no tty1, no separate login. Run it from a terminal the same
+way with `/opt/soc-display/scripts/soc-wall-desktop.sh`. Close the windows to
+stop the wall; it leaves your desktop session as it was.
 
 > Easiest path: after the installer, run the guided wizard
 > `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
@@ -152,8 +177,43 @@ size directly. Just plug in any HDMI monitor.
 sudo systemctl reboot     # or: reboot  (non-systemd)
 ```
 
-The wall comes up automatically: tty1 → session dispatcher → (`startx` → Openbox,
-or cage/labwc on Wayland) → four logged-in panels in a 2×2 grid, no manual steps.
+**Kiosk mode:** the wall comes up automatically: tty1 → session dispatcher →
+(`startx` → Openbox, or cage/labwc on Wayland) → four logged-in panels in a 2×2
+grid, no manual steps.
+
+**Desktop mode:** the machine boots back into your normal desktop; launch the
+wall when you want it from the **SOC Wall** menu icon (see above). No reboot is
+required to start it.
+
+## Uninstall
+
+The install is fully reversible via the manifest-driven uninstaller:
+
+```bash
+sudo ./uninstall.sh          # or: sudo make uninstall
+```
+
+By default it **preserves operator data**: the `soc`/`socsvc` users, the
+`/etc/soc-display` secrets (sealed master password, config), and the Vaultwarden
+data at `/var/lib/vaultwarden` are kept, so you can re-install without re-sealing
+the vault. Everything else the installer added is reversed: it stops/disables the
+units and removes them, removes the `/opt/soc-display` tree, the `litebw`
+launcher, the "SOC Wall" menu entry, and — if this was a **kiosk** install —
+restores the previous systemd default target and removes the tty1 autologin
+drop-in, handing the console back to your DE/login manager.
+
+To wipe everything, including the operator data above:
+
+```bash
+sudo ./uninstall.sh --purge      # or: sudo make uninstall PURGE=1
+```
+
+`--purge` additionally deletes `/etc/soc-display`, the Vaultwarden data
+directory, and the kiosk/service users. Use it only when you are decommissioning
+the box — sealed vault credentials are gone after a purge.
+
+> Without systemd, the uninstaller reverses the file deploy and prints the
+> autostart/supervision lines to remove by hand, mirroring the install.
 
 ## Bring-up checklist
 
