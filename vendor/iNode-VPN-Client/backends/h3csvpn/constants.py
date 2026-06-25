@@ -45,6 +45,7 @@ OS_FIELD = "Linux"
 TUNNEL_VERB = "NET_EXTEND"        # NET_EXTEND / HTTP/1.1  (custom upgrade verb)
 FRAME_HEADER_LEN = 4              # [type u8][subtype u8][len u16 BE]
 BIG_BUF_SIZE = 0x14000            # 81920 — client receive buffer
+MAX_FRAME_BUFFER = 1024 * 1024    # reassembly cap (>> one max frame of 64 KB)
 ENTUNNEL_Q_MAX = 255
 HEARTBEAT_TICK = 1.0              # heartbeat thread loop tick (usleep 1_000_000)
 # The client loop ticks every second but only SENDS a heartbeat every

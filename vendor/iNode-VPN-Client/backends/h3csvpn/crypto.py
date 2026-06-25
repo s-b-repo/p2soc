@@ -37,8 +37,8 @@ def urlencode_body(xml: str) -> str:
       * every other byte (including ``-`` ``.`` ``_`` ``~`` ``<`` ``>`` ``/``
         ``@`` ``%`` and any non-ASCII/UTF-8 byte) becomes ``%XX``.
 
-    This matters: a username like ``stephan botes`` goes out as
-    ``stephan+botes``.  A gateway whose CGI maps only ``+``->space (and treats a
+    This matters: a username like ``jane doe`` goes out as
+    ``jane+doe``.  A gateway whose CGI maps only ``+``->space (and treats a
     literal ``%20`` as text) would otherwise reject the username.  (Earlier this
     used ``quote(safe="")`` which emits ``%20`` and keeps ``-._~`` — both wrong.)
     """

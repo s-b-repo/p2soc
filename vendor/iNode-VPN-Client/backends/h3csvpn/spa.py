@@ -7,14 +7,19 @@ HOTP over a random per-packet counter (PROTOCOL.md §5.6, §7.3).  The per-clien
 (``/api/terminal/...``) — that registration is deployment-specific and out of
 scope for this reference client, so the key/aid are supplied by the caller.
 
-SpaKnockPacket (47 bytes base, big-endian):
-    0x00  u16  declaredLen = 0x0110
-    0x02  [32] clientAid (padded/truncated to 32 bytes)
-    0x22  u32  pktID  (random; also the HOTP counter)
-    0x26  [6]  password = HOTP(clientKey, pktID)
-    0x2c  u8   portCount = (nports // 2) + 1     # recovered formula; VALIDATE
-    0x2d  u16  port0 (htons)
+SpaKnockPacket (47 bytes base). Confirmed against libZeroTrust.so
+``onKnockUDPMsg`` @0x22630:
+    0x00  u16  declaredLen = 0x0110, written *native little-endian* -> bytes 10 01
+    0x02  [32] clientAid (raw bytes, padded/truncated to 32)
+    0x22  u32  pktID  = bswap(rand) -> the random counter in big-endian on the wire
+    0x26  [6]  password = HOTP(clientKey, counter), counter == the same rand value
+               (5 digits mod 100000 + 1 Luhn digit, HMAC-SHA1, 8-byte BE counter)
+    0x2c  u8   portCount = number of ports following
+    0x2d  u16  port0 (htons)  -- the knock/primary port
     0x2f  u16  portN... (htons, optional)
+Because pktID on the wire is the big-endian form of the same ``rand`` value used
+as the HOTP counter, encoding ``pkt_id`` as ``>I`` and feeding it to ``hotp`` as
+the counter is byte-identical to the binary (verified).
 """
 from __future__ import annotations
 
@@ -42,9 +47,13 @@ def build_knock(cfg: SpaConfig, pkt_id: int | None = None) -> bytes:
     # digits=5 + RFC4226 Luhn checksum -> 6 chars filling the password[6] field.
     pw = hotp_bytes(cfg.client_key, pkt_id, nbytes=6, digits=cfg.digits,
                     add_checksum=True)
-    nports = len(cfg.ports)
-    port_count = (nports // 2) + 1
-    pkt = struct.pack(">H", C.SPA_DECLARED_LEN)
+    # portCount = number of ports in the packet. The real client lays out one
+    # primary port at 0x2d and N extra knock-list ports at 0x2f, with
+    # portCount = N + 1 = total ports (verified in libZeroTrust.so onKnockUDPMsg
+    # @0x22d08). Our sequential layout below is byte-identical; just count them.
+    port_count = len(cfg.ports)
+    # declaredLen is stored in native little-endian by the client (0x0110 -> 10 01).
+    pkt = struct.pack("<H", C.SPA_DECLARED_LEN)
     pkt += aid
     pkt += struct.pack(">I", pkt_id)
     pkt += pw

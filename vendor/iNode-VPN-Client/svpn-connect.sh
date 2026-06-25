@@ -7,10 +7,10 @@
 #
 # Examples:
 #   # Authenticate only — no tunnel, no root (best for testing credentials):
-#   ./svpn-connect.sh --auth-only vpn.example.com:3000 sslvpn
+#   ./svpn-connect.sh --auth-only 102.134.120.103:3000 sslvpn
 #
 #   # Full tunnel (creates a TUN device; needs root via pkexec/sudo):
-#   ./svpn-connect.sh vpn.example.com:3000 sslvpn
+#   ./svpn-connect.sh 102.134.120.103:3000 sslvpn
 #
 #   # Self-signed gateway — pin the cert (secure) or skip verification:
 #   ./svpn-connect.sh gw:443 user -- --pin-sha256 AA:BB:CC:...

@@ -12,17 +12,17 @@ A Qt6 / KF6-native, KDE-friendly reimplementation of the H3C iNode authenticatio
 | **WLAN** (wireless 802.1X) | ✅ Working | `nmcli` for association, then the 802.1X supplicant |
 | **Portal v2** (GB/T 28181) | ✅ Working | Native UDP client with MD5-keyed checksum, keep-alive |
 | **L2TP/IPSec** | ✅ Working (RFC-compliant servers) | `strongswan` + `xl2tpd` via polkit helper |
-| **H3C Portal (TLV dialect)** | 🚧 Stub | — |
+| **H3C Portal (proprietary dialect)** | 🧪 Experimental (faithful framing, untested vs live H3C) | Native UDP, H3C opcode space + attributes, MD5 authenticator |
 | **SSL VPN** (H3C SVPN, "V7") | ✅ Working (auth + tunnel) | bundled `h3csvpn` clean-room backend via `inode-svpn-helper` |
-| **EAD** (posture check) | 🚧 Stub — effectively blocked without inside access | — |
-| **SDP** | 🚧 Not implemented | — |
+| **EAD** (posture check) | 🧪 Standalone SEC posture implemented (untested vs live iMC); SSL-VPN host-check ✅ | Native UDP/9019, keyed-MD5 SEC packets |
+| **SDP** | 🧪 Experimental (SPA knock + SSL VPN) | `h3csvpn` SPA knock (HOTP) then the SSL VPN flow |
 
 ### Client surface — parity with the original
 
 | Feature | Original client | Qt edition |
 |---|---|---|
 | Profile list + per-scenario connections | ✅ | ✅ |
-| Secure credential storage | ✅ (custom keystore) | ✅ (KWallet; obfuscated fallback) |
+| Secure credential storage | ✅ (custom keystore) | ✅ (KWallet → freedesktop Secret Service → obfuscated fallback) |
 | Auto-connect on startup | ✅ | ✅ (per-profile flag) |
 | Auto-reconnect with backoff | ❌ | ✅ (per-profile, capped retries) |
 | System tray icon + state badges | ✅ | ✅ (QSystemTrayIcon + desktop notifications) |
@@ -41,7 +41,7 @@ A Qt6 / KF6-native, KDE-friendly reimplementation of the H3C iNode authenticatio
 | Posture agent (EAD blob signer) | ✅ | ✗ — deliberately absent |
 | DLP / DAM / TRLD / VNC | ✅ (mandatory) | ✗ — out of scope |
 
-"Stub" protocols still register in the UI; picking one and hitting **Connect** surfaces an honest error instead of faking it. See [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md) for the roadmap per stub.
+Experimental protocols (🧪) register in the UI and attempt a real, wire-faithful connection; where a deployment-specific detail is still unknown they log an honest warning rather than faking success. See [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md) for what is verified vs. unconfirmed per protocol.
 
 ## Why this exists
 
@@ -78,7 +78,7 @@ cmake --build build -j
 | Portal v2 | None — pure Qt UDP. |
 | SSL VPN | `python3` (stdlib); `tesseract` for CAPTCHA OCR; `polkit`/`pkexec` for the TUN tunnel. Optional `python3-defusedxml`, `python3-cryptography`. |
 | DHCP renew | `nmcli` (preferred), otherwise `dhclient`. |
-| Secure credentials | `kwalletmanager6` / `kwalletd6`. Without it, passwords use an obfuscated QSettings fallback. |
+| Secure credentials | Any of: KWallet (`kwalletd6`) **or** a freedesktop Secret Service daemon — `gnome-keyring`, `ksecretd`, KeePassXC, … (`libsecret-1.so.0`, loaded at runtime). Without any keyring, passwords fall back to an obfuscated QSettings store. |
 
 ## Installation
 
@@ -158,9 +158,23 @@ The protocol surface (`IProtocol`) is deliberately small so each of the stub pro
   OCR-defeated CAPTCHA, SMS/challenge 2FA, `NET_EXTEND` tunnel, TUN/routes/DNS).
   Defaults to an **enterprise split tunnel**: only the gateway's own subnets are
   routed through the VPN, so general internet traffic stays on the local link.
-- **Not yet** connection-compatible with H3C's Portal TLV dialect or EAD — those
-  require separate reverse-engineering work per protocol. PRs welcome.
+- **Experimental, faithful-but-unverified** for H3C's proprietary Portal dialect
+  and the standalone iMC EAD (SEC) posture protocol — both fully reverse-
+  engineered from the original client's libraries and implemented to match the
+  wire format byte-for-byte, but **untested against a live H3C Portal / iMC EIA
+  server** (we have none). See [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md). Captures
+  / PRs from anyone with such a deployment are very welcome.
 
-## License
+## License — fully free / open source
 
-The Qt code in this tree is original and may be redistributed under the terms of GPL-3.0-or-later. The original H3C iNode binaries it aims to replace are *not* redistributed here.
+Licensed **GPL-3.0-or-later** (full text in [`LICENSE`](LICENSE)). This repository is
+**100% FOSS** and self-contained:
+
+- All Qt/KF6 code is original.
+- The SSL VPN backend (`backends/h3csvpn/`) is a **clean-room** pure-Python
+  reimplementation — no decompiled or vendor code.
+- **No proprietary H3C binaries are included or redistributed** (they are
+  `.gitignore`d). The app links none of them at build or runtime; it speaks the
+  protocols over the wire instead.
+- `docs/PROTOCOLS.md` documents the wire formats and constants recovered by
+  reverse-engineering for **interoperability** — protocol facts, not vendor code.

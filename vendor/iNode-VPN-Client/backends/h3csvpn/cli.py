@@ -71,6 +71,20 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="enterprise split tunnel: route only the gateway's "
                      "own subnets through the VPN and leave the default route + "
                      "system DNS alone, so general internet traffic is unaffected")
+    sdp = p.add_argument_group(
+        "Zero-Trust / SDP",
+        "Single-Packet-Authorization (SPA) knock sent before connecting, for "
+        "SDP gateways that keep the SSL VPN port closed until a valid knock "
+        "arrives. The per-client key/AID come from an SDP registration that is "
+        "out of scope here — supply them from your enrolled client.")
+    sdp.add_argument("--spa-key", help="SPA HOTP key (hex) — enables the knock")
+    sdp.add_argument("--spa-aid", default="", help="SPA client AID (hex)")
+    sdp.add_argument("--spa-ports", default="",
+                     help="comma-separated ports to request (default 443)")
+    sdp.add_argument("--spa-knock-port", type=int, default=C.SPA_KNOCK_PORT_GW,
+                     help=f"UDP port to send the knock to (default "
+                     f"{C.SPA_KNOCK_PORT_GW})")
+
     adv.add_argument("--dry-run", action="store_true",
                      help="print the login request body and exit (no connection)")
     p.add_argument("-v", "--verbose", action="count", default=0)
@@ -144,8 +158,27 @@ def main(argv=None) -> int:
                          f"retries={settings.captcha_retries}, "
                          f"show_captcha={settings.show_captcha})\n")
 
+    # Zero-Trust / SDP: build the SPA knock config when a key is supplied.
+    zero_trust = None
+    if args.spa_key:
+        import binascii
+        from .spa import SpaConfig
+        def _unhex(s: str) -> bytes:
+            return binascii.unhexlify(s.replace(":", "").replace(" ", "")) if s else b""
+        try:
+            ports = tuple(int(p) for p in args.spa_ports.split(",") if p.strip()) \
+                or (C.SPA_AUTH_PORT,)
+            zero_trust = SpaConfig(aid=_unhex(args.spa_aid),
+                                   client_key=_unhex(args.spa_key), ports=ports)
+        except (binascii.Error, ValueError) as exc:
+            sys.stderr.write(f"[x] invalid --spa-* value: {exc}\n")
+            return 2
+        sys.stderr.write(f"[SPA] Zero-Trust knock enabled (ports={ports}, "
+                         f"knock-port={args.spa_knock_port})\n")
+
     opts = Options(host=host, port=port, language=args.language, mac=args.mac,
                    tls=tls, rsa_pubkey=rsa, ead=args.ead,
+                   zero_trust=zero_trust, spa_knock_port=args.spa_knock_port,
                    auto_captcha=settings.auto_captcha,
                    captcha_retries=settings.captcha_retries,
                    show_captcha=settings.show_captcha)

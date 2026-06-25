@@ -30,13 +30,13 @@ docs/               ← README + protocol notes
 
 ```bash
 # 1) Test credentials only — no tunnel, no root needed:
-./svpn-connect.sh --auth-only vpn.example.com:3000 <username>
+./svpn-connect.sh --auth-only 102.134.120.103:3000 <username>
 
 # 2) Full VPN tunnel (asks for root via pkexec/sudo to create the TUN device):
-./svpn-connect.sh vpn.example.com:3000 <username>
+./svpn-connect.sh 102.134.120.103:3000 <username>
 
 # With an auth domain:
-./svpn-connect.sh vpn.example.com:3000 <username> system
+./svpn-connect.sh 102.134.120.103:3000 <username> system
 
 # Self-signed gateway — pin its certificate (secure) or skip verification:
 ./svpn-connect.sh gw:443 <username> -- --pin-sha256 AA:BB:CC:...
@@ -63,7 +63,7 @@ Add a profile → set **Protocol = SSL VPN**, fill in the gateway host/port,
 username, domain, and (under trust) a CA file or pin for a self-signed gateway →
 **Connect**. The GUI prompts for root (pkexec) when it brings the tunnel up.
 
-## Notes on the test gateway (vpn.example.com:3000)
+## Notes on the test gateway (102.134.120.103:3000)
 
 The gateway's local SSL VPN accounts are `sslvpn`, `test`, `vpn` (service
 "SSL VPN") in the `system` domain. If login is rejected with *"incorrect

@@ -66,7 +66,22 @@ PYTHON=$(command -v python3 || command -v python || true)
 case "$cmd" in
     connect)
         [[ -n $BACKEND ]] || die "connect requires --backend DIR"
+        # SECURITY: this helper runs as root (pkexec). It will import and execute
+        # python from --backend, so an attacker who can point it at a writable
+        # dir containing a malicious h3csvpn/ would get code execution as root.
+        # Canonicalize and refuse transient/world-writable locations. We cannot
+        # require root ownership (the portable package legitimately runs from the
+        # user's home dir), but we DO refuse any group/other-writable backend so
+        # a malicious module can't be planted or swapped in.
+        BACKEND=$(realpath -e "$BACKEND" 2>/dev/null) || die "backend path does not resolve"
+        case "$BACKEND" in
+            /tmp/*|/var/tmp/*|/dev/shm/*|/run/*|/proc/*)
+                die "refusing backend under a transient/world-writable dir: $BACKEND" ;;
+        esac
         [[ -f "$BACKEND/h3csvpn/__init__.py" ]] || die "backend not found at $BACKEND"
+        if [[ -n $(find "$BACKEND/h3csvpn" -perm /022 -print -quit 2>/dev/null) ]]; then
+            die "backend is group/other-writable; refusing to load it as root: $BACKEND"
+        fi
         [[ ${#PYARGS[@]} -gt 0 ]] || die "connect requires -- <h3csvpn argv...>"
 
         if [[ $WITH_PASSWORD -eq 1 ]]; then
@@ -80,6 +95,11 @@ case "$cmd" in
         # 'h3csvpn' in cwd can't shadow the vendored backend. Ignored on older
         # pythons (harmless).
         export PYTHONSAFEPATH=1
+        # Don't write __pycache__/*.pyc into the backend tree. Running as root we
+        # could otherwise drop group/other-writable bytecode (depending on the
+        # inherited umask) right back into $BACKEND, which would re-trip the
+        # group/other-writable check above on the next connect.
+        export PYTHONDONTWRITEBYTECODE=1
 
         # Run the backend in the background so we can record its PID, then
         # forward terminating signals to it for a graceful logout/teardown.

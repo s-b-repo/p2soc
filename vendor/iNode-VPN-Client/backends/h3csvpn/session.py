@@ -44,6 +44,7 @@ class Options:
     private_blob: str = ""        # empty = let the gateway accept default
     rsa_pubkey: Optional[bytes] = None   # enables RSA password mode if set
     zero_trust: Optional[spa_mod.SpaConfig] = None
+    spa_knock_port: int = C.SPA_KNOCK_PORT_GW   # UDP port for the SDP knock
     ead: bool = False
     keepalive_max_miss: int = C.DEFAULT_KEEPALIVE_MAX_MISS
     # CAPTCHA handling (the live gateway gates login on a weak BMP captcha)
@@ -112,7 +113,8 @@ class SslVpnSession:
     def authenticate(self) -> AuthState:
         if self.opts.zero_trust:
             self._log("SPA: sending Zero-Trust knock")
-            spa_mod.send_knock(self.opts.host, self.opts.zero_trust)
+            spa_mod.send_knock(self.opts.host, self.opts.zero_trust,
+                               port=self.opts.spa_knock_port)
 
         conn = tls_connect(self.opts.host, self.opts.port, self.opts.tls)
         self._log(f"TLS connected to {self.opts.host}:{self.opts.port}")
@@ -295,7 +297,8 @@ class SslVpnSession:
         if not self.auth:
             raise RuntimeError("authenticate() first")
         if self.opts.zero_trust:
-            spa_mod.send_knock(self.opts.host, self.opts.zero_trust)
+            spa_mod.send_knock(self.opts.host, self.opts.zero_trust,
+                               port=self.opts.spa_knock_port)
         tconn = tls_connect(self.opts.host, self.opts.port, self.opts.tls)
         self._log("tunnel: TLS connected, sending NET_EXTEND")
         tconn.request(C.TUNNEL_VERB, "/", ua=C.UA_V7,

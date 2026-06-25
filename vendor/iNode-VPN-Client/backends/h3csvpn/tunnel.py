@@ -39,6 +39,12 @@ class FrameDecoder:
 
     def feed(self, data: bytes) -> list[tuple[int, int, bytes]]:
         self._buf += data
+        # SECURITY: a single frame can never exceed FRAME_HEADER_LEN + 65535,
+        # so an ever-growing buffer means the gateway is dribbling partial
+        # frames (or garbage) that never complete — a slow memory-exhaustion
+        # DoS. Cap the reassembly buffer well above one max frame and bail.
+        if len(self._buf) > C.MAX_FRAME_BUFFER:
+            raise ValueError("frame reassembly buffer overflow (stalled/garbage stream)")
         out: list[tuple[int, int, bytes]] = []
         while len(self._buf) >= C.FRAME_HEADER_LEN:
             ftype, subtype, length = struct.unpack_from(">BBH", self._buf, 0)

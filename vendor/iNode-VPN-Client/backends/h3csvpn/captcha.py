@@ -52,6 +52,22 @@ def decode_bmp(data: bytes) -> Tuple[int, int, List[List[Pixel]]]:
     top_down = height < 0
     h = abs(height)
 
+    # SECURITY: width/height are attacker-controlled header fields. Without a
+    # cap, a tiny BMP declaring huge dimensions makes the row loops below build
+    # a width*height matrix of Python tuples (~72 B each) — e.g. 40000x40000
+    # demands ~100 GB and the kernel OOM-kills the process (exit 137). A real
+    # vldimg CAPTCHA is a few-glyph image, so bound it hard and verify the
+    # declared pixel array actually fits in the body before allocating.
+    MAX_DIM = 4096
+    MAX_PIXELS = 1 << 20  # 1M px ceiling (a captcha is ~tens of KB)
+    if not (0 < width <= MAX_DIM and 0 < h <= MAX_DIM):
+        raise ValueError(f"BMP dimensions out of range: {width}x{height}")
+    if width * h > MAX_PIXELS:
+        raise ValueError(f"BMP too large: {width}x{h} pixels")
+    _row_stride = ((bpp * width + 31) // 32) * 4
+    if pix_off + _row_stride * h > len(data):
+        raise ValueError("BMP pixel data truncated / inconsistent with header")
+
     palette: List[Pixel] = []
     if bpp <= 8:
         ncol = struct.unpack_from("<I", data, 46)[0] or (1 << bpp)
