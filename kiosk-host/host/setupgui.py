@@ -675,6 +675,7 @@ class SetupAssistant:
                 pass
 
         self._page_preset()
+        self._page_appearance()
         self._page_display()
         self._page_panels()
         self._page_vault()
@@ -689,6 +690,10 @@ class SetupAssistant:
         self.assistant.connect("prepare", self._on_prepare)
         # The page appends above stamped page-0's title onto the chrome; restore it.
         self._clamp_title()
+        # One collect after the whole page tree is built reclaims the short-lived
+        # Python wrappers GTK construction creates, before Gtk.main() idles.
+        import gc
+        gc.collect()
 
     # ---- Page 1: presets ------------------------------------------------- #
     def _page_preset(self):
@@ -759,7 +764,42 @@ class SetupAssistant:
         self.assistant.set_page_title(page, "Preset")
         self.assistant.set_page_complete(page, True)
 
-    # ---- Page 2: display ------------------------------------------------- #
+    # ---- Page 2: appearance (theme) ------------------------------------- #
+    def _page_appearance(self):
+        """Embed the host.appearance editor as a wizard page (runs at first-run).
+        Cosmetic — page-complete is always True so it never blocks the config flow.
+        on_apply monkeypatches branding's in-memory palette + repaints the wizard's
+        cached theme provider (preview only); Save persists via branding.save_colors
+        and repaints from the now-persisted palette."""
+        Gtk = self.Gtk
+        from host import appearance  # type: ignore  (gi-only path; already imported)
+        page = self._page("Appearance (theme)",
+                          "Pick a preset or tune the palette. Live preview; Save persists "
+                          "it as the theme used everywhere.",
+                          overline=self._step_overline("appearance"))
+
+        def on_apply(colors):
+            cur = self.branding.load()
+            cur.setdefault("colors", {}).update(colors)
+            if getattr(self, "_theme_provider", None) is not None:
+                self._theme_provider.load_from_data(_css(self.branding))
+
+        def on_saved(_colors):
+            self.branding.load(refresh=True)
+            if getattr(self, "_theme_provider", None) is not None:
+                self._theme_provider.load_from_data(_css(self.branding))
+
+        editor = appearance.AppearanceEditor(
+            (self.Gtk, self.Gdk, self.GdkPixbuf), on_apply=on_apply, on_saved=on_saved)
+        editor.build_body(page)
+        self._appearance_editor = editor   # keep a ref so its providers live
+
+        self.assistant.append_page(page)
+        self.assistant.set_page_type(page, Gtk.AssistantPageType.CONTENT)
+        self.assistant.set_page_title(page, "Appearance")
+        self.assistant.set_page_complete(page, True)
+
+    # ---- Page 3: display ------------------------------------------------- #
     def _page_display(self):
         Gtk = self.Gtk
         page = self._page("Display & grid",
@@ -1492,6 +1532,8 @@ def run_gui() -> int:
         os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     paths = setup.resolve_paths(target, can_escalate=can_escalate)
 
+    # ONE cached theme provider, added to the screen once. The Appearance page
+    # repaints it via load_from_data for a live preview (never re-adds it).
     provider = Gtk.CssProvider()
     provider.load_from_data(_css(branding))
     Gtk.StyleContext.add_provider_for_screen(
@@ -1500,6 +1542,7 @@ def run_gui() -> int:
 
     model = WizardModel(setup, paths)
     sa = SetupAssistant(model, setup, (Gtk, Gdk, GLib, GdkPixbuf))
+    sa._theme_provider = provider
     sa.assistant.show_all()
     Gtk.main()
     return 0

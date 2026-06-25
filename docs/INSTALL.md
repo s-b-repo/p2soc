@@ -108,10 +108,36 @@ python3 setup.py wizard-gui          # degrades to the text wizard with no displ
 /opt/soc-display/scripts/soc-wall-setup-gui.sh   # on a deployed box
 ```
 
+### Appearance (theme colours & presets)
+
+A third desktop entry, **SOC Wall Appearance**, opens the **graphical theme
+editor** — and the launcher menu carries a matching **Appearance** card. Pick a
+built-in **theme preset** (`SOC Green/White` [default], `Midnight` [dark],
+`High Contrast`, `Amber Ops`) or fine-tune any of the 14 palette colours with the
+per-colour pickers. Changes preview **live** on a sample card, and **Save**
+persists them to `branding.yaml` — which **is** the startup theme: every launch
+(launcher, wizard, error dialogs) reads its colours, so a saved theme applies on
+the next boot with no extra step. The wizard's first-run flow shows the same
+Appearance page. Launch it any of these ways:
+
+```bash
+make appearance                                   # from the repo (dev)
+python3 -m host.appearance --list-presets         # discover presets (no display)
+python3 -m host.appearance --preset midnight --output ./branding.yaml  # headless write
+/opt/soc-display/scripts/soc-wall-appearance.sh   # on a deployed box
+```
+
+Save targets the same file the loader reads: `$SOC_BRANDING_FILE` if set, else
+`/etc/soc-display/branding.yaml` on a deployed box (when writable), else the repo
+`branding/branding.yaml`. Only the colour palette is rewritten — the file's
+comments, `name`/`tagline`/`icon` and key order are preserved; no secrets are
+ever written. If the target isn't writable the editor tells you the exact path
+and to re-run elevated rather than failing silently.
+
 ### Rebranding
 
-The whole product — the launcher menu, the installed desktop entry and the setup
-wizard — reskins from one file, `branding/branding.yaml` (packaged to
+The whole product — the launcher menu, the installed desktop entries, the setup
+wizard and the appearance editor — reskins from one file, `branding/branding.yaml` (packaged to
 `/opt/soc-display/branding/branding.yaml`). Edit its `name`, `short_name`,
 `tagline`, `icon` and `colors` (a partial file is fine — anything omitted falls
 back to the built-in defaults). The app icon is `share/icons/soc-wall.svg`;

@@ -88,9 +88,21 @@ def launch_setup() -> bool:
     return False
 
 
+def launch_appearance() -> bool:
+    """Open the theme/appearance editor. Prefer the shell wrapper (detached, so the
+    menu can stay open / exit independently); fall back to spawning the module."""
+    sh = _script("soc-wall-appearance.sh")
+    if os.path.exists(sh):
+        return _spawn(["bash", sh])
+    kiosk = os.path.join(ROOT, "kiosk-host")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = kiosk + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    return _spawn([sys.executable, "-m", "host.appearance"], cwd=kiosk, env=env)
+
+
 # (num, title, subtitle, tag, css_class, colour_key, action). `num` is the mono
-# tile numeral watermark (01/02/03); colour_key indexes host.branding colours so
-# a rebrand recolours the cards.
+# tile numeral watermark (01/02/03/04); colour_key indexes host.branding colours
+# so a rebrand recolours the cards.
 _ENTRIES = (
     ("01", "Setup / Configure", "Panels, vault and VPN", "", "soc-setup", "setup",
      launch_setup),
@@ -98,6 +110,8 @@ _ENTRIES = (
      lambda: launch_wall("--window")),
     ("03", "Kiosk mode", "Fill this display, no desktop", "fullscreen", "soc-kiosk", "kiosk",
      lambda: launch_wall("--fullscreen")),
+    ("04", "Appearance", "Theme colours & presets", "", "soc-appearance", "primary",
+     launch_appearance),
 )
 
 
@@ -133,6 +147,7 @@ def _css() -> bytes:
     text_dim = col("text_dim", "#5B7567")
     setup, desktop, kiosk = (col("setup", "#1FA463"), col("desktop", "#1FA463"),
                              col("kiosk", "#0E7C7B"))
+    appearance = col("primary", "#1FA463")  # the Appearance tile uses the brand accent
     glow = _rgba(accent, 0.28)
 
     def card(cls, ac):
@@ -156,9 +171,53 @@ window.soc-launcher {{ background-color: {bg}; }}
 {card("soc-setup", setup)}
 {card("soc-desktop", desktop)}
 {card("soc-kiosk", kiosk)}
+{card("soc-appearance", appearance)}
 .soc-tag {{ background-color: {s_bot}; border: 1px solid {border};
   border-radius: 4px; padding: 2px 9px; color: {text_dim}; }}
 """.encode()
+
+
+class _Launcher:
+    """A tiny holder so an in-launcher Appearance edit can repaint the launcher's
+    ONE cached CssProvider live (re-adding a provider to the screen would stack
+    duplicates = a leak + cumulative parse cost). Built once in _build_window."""
+    provider = None
+    Gtk = None
+    Gdk = None
+
+
+def _reapply():
+    """Repaint the launcher's cached provider from the (refreshed) branding palette
+    — the in-launcher Appearance editor calls this after a live colour change so the
+    open launcher window recolours instantly. No new provider is added to the screen."""
+    if _Launcher.provider is not None:
+        _Launcher.provider.load_from_data(_css())
+
+
+def _open_appearance(parent_win):
+    """Open the Appearance editor IN-PROCESS as a child window so a live colour
+    change recolours the open launcher (on_apply -> _reapply). gi is already loaded
+    here (we're in the launcher GUI), so this never re-pays the GTK import cost."""
+    from host import appearance  # lazy; gi already up in this codepath
+    Gtk, Gdk = _Launcher.Gtk, _Launcher.Gdk
+    from gi.repository import GdkPixbuf
+
+    def on_apply(colors):
+        # Monkeypatch branding's in-memory palette so _css() reflects the preview,
+        # then repaint the launcher's cached provider (no persistence yet).
+        cur = branding.load()
+        cur.setdefault("colors", {}).update(colors)
+        _reapply()
+
+    def on_saved(_colors):
+        branding.load(refresh=True)   # pick up the persisted palette
+        _reapply()
+
+    editor = appearance.AppearanceEditor((Gtk, Gdk, GdkPixbuf),
+                                         on_apply=on_apply, on_saved=on_saved)
+    win = editor.build_window()
+    win.set_transient_for(parent_win)
+    win.show_all()
 
 
 def _build_window():
@@ -174,6 +233,8 @@ def _build_window():
     Gtk.StyleContext.add_provider_for_screen(
         Gdk.Screen.get_default(), provider,
         Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _Launcher.provider = provider
+    _Launcher.Gtk, _Launcher.Gdk = Gtk, Gdk
 
     win = Gtk.Window(title=b.get("short_name") or b.get("name") or "SOC Video Wall")
     win.get_style_context().add_class("soc-launcher")
@@ -245,6 +306,12 @@ def _build_window():
 
     def on(action):
         def _cb(_btn):
+            # Appearance opens IN-PROCESS as a child window (so a live colour change
+            # recolours THIS launcher) and the menu stays open. Every other tile
+            # spawns its detached helper and closes the menu.
+            if action is launch_appearance:
+                _open_appearance(win)
+                return
             action()
             win.destroy()
         return _cb
@@ -294,13 +361,18 @@ def _build_window():
         body.pack_start(btn, False, False, 0)
 
     win.connect("destroy", Gtk.main_quit)
+    # One collect after the whole tree is built reclaims the many short-lived Python
+    # wrappers GTK construction creates, before Gtk.main() idles. One-shot, cheap.
+    import gc
+    gc.collect()
     return win, Gtk
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--check" in argv:               # CI: verify wiring, no GTK / no display
-        assert len(_ENTRIES) == 3 and all(len(e) == 7 and callable(e[-1]) for e in _ENTRIES)
+        assert len(_ENTRIES) == 4 and all(len(e) == 7 and callable(e[-1]) for e in _ENTRIES)
+        assert any(e[4] == "soc-appearance" and e[-1] is launch_appearance for e in _ENTRIES)
         branding.load()                 # branding must load without raising
         print("launchermenu ok")
         return 0

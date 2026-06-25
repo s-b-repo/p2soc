@@ -103,14 +103,17 @@ contents:
   - src: ./branding/**
     dst: /opt/soc-display/branding
 
-  # ---- clickable launcher: XDG .desktop entry + icon ----
-  # The .desktop file (and its icon under share/) ship inside the prod tree;
-  # postinstall (install.sh, SOC_SKIP_PACKAGES=1) installs the entry onto the
-  # system apps menu against the operator's existing DE.
+  # ---- clickable launchers: XDG .desktop entries + icon ----
+  # The .desktop files (launcher menu, setup wizard, appearance editor) and their
+  # icon under share/ ship inside the prod tree; postinstall (install.sh,
+  # SOC_SKIP_PACKAGES=1) installs the entries onto the system apps menu against
+  # the operator's existing DE.
   - src: ./soc-wall.desktop
     dst: /opt/soc-display/soc-wall.desktop
   - src: ./soc-wall-setup.desktop
     dst: /opt/soc-display/soc-wall-setup.desktop
+  - src: ./soc-wall-appearance.desktop
+    dst: /opt/soc-display/soc-wall-appearance.desktop
   - src: ./share/**
     dst: /opt/soc-display/share
 

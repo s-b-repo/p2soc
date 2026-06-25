@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Name=SOC Wall Appearance
+Comment=Theme colours and presets for the SOC video wall
+Exec=/opt/soc-display/scripts/soc-wall-appearance.sh
+Icon=soc-wall
+Terminal=false
+Type=Application
+Categories=Settings;
+Keywords=soc;theme;appearance;colors;colours;
