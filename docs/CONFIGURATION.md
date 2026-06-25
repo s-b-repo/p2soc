@@ -19,6 +19,21 @@ display:
 
 Cell geometry is computed as `(width - gap*(cols-1)) / cols` × `(height - gap*(rows-1)) / rows`.
 
+## Vault backend (`SOC_VAULT_BACKEND`)
+
+Logins, the config note, and VPN/proxy creds all come from Vaultwarden. The
+backend that talks to it is selected by `SOC_VAULT_BACKEND` in `soc.env`:
+
+| `SOC_VAULT_BACKEND` | What it is | Use when |
+|---|---|---|
+| `litebw` *(default)* | **`litebw`** — a pure-Python, rbw-compatible Vaultwarden client (`host/litebw.py`). Needs **no Rust toolchain**, so it runs on the 1 GB Pi without compiling anything. (`native` is an alias.) | production, the Pi, anywhere |
+| `rbw` | the legacy [`rbw`](https://github.com/doy/rbw) CLI, unlocked through `scripts/pinentry-vault.py` | a host that already has `rbw` installed and prefers it |
+| `dev` | a plain JSON file (`$SOC_DEV_VAULT`) — no Vaultwarden needed | local testing / `make test` only |
+
+`litebw` and `rbw` share the same unattended-unlock model: they unseal the
+host-bound master (see below) so **no plaintext master password lives on disk**.
+Credentials are held only in a short-TTL in-RAM cache.
+
 ## Vault master-password source (`SOC_MASTER_SOURCE`)
 
 The Vaultwarden master password (which `litebw`/`rbw` need to derive the account
@@ -252,7 +267,11 @@ vpn:
   gateway: "vpn.example.com"        # FortiGate SSL-VPN host
   port: 443
   vault_item: "SOC FortiGate VPN"   # Vaultwarden login: FortiGate user + password
-  trusted_cert: ""                  # sha256 digest to pin the gateway cert (recommended)
+  trusted_cert: ""                  # digest to pin the gateway cert (recommended); a
+                                    # SHA-256 (64 hex) OR SHA-1 (40 hex) fingerprint,
+                                    # case-insensitive — SHA-256 preferred
+  interface: ""                     # tunnel interface-name override (e.g. ppp1/tunN) so
+                                    # the on-wall VPN pill finds a non-default device
   realm: ""                         # FortiGate realm, if your gateway uses one
   set_routes: true                  # accept routes pushed by the gateway
   set_dns: false                    # usually keep the local resolver
@@ -283,11 +302,14 @@ misses.
 
 How the password stays safe: the supervisor reads the FortiGate password from the
 vault and hands it to openfortivpn through a **pinentry helper**
-(`scripts/forti-pinentry.sh`), exactly like `rbw` is unlocked — so it is **never
+(`scripts/forti-pinentry.sh`), exactly like `litebw` (or `rbw`) is unlocked — so it is **never
 on the command line and never written to disk**. Only the gateway, username, and
 routing flags are visible in the process list.
 
-**Pin the cert.** Get the digest from the first connection attempt's error, or:
+**Pin the cert.** `trusted_cert` accepts a **SHA-256 (64 hex)** *or* **SHA-1 (40
+hex)** fingerprint, case-insensitive (openfortivpn takes both; SHA-256 is
+preferred, SHA-1 is for older gateways). Get the digest from the first connection
+attempt's error, or:
 
 ```bash
 openssl s_client -connect vpn.example.com:443 </dev/null 2>/dev/null \
@@ -393,3 +415,51 @@ Other tips:
 - For Grafana/Kibana-style panels, add kiosk/refresh params to the URL, e.g.
   `…/d/abc?kiosk&refresh=30s`, to cut live-update CPU/RAM.
 - On 32-bit ARM (armv7), run a 64-bit OS instead if you can — WebKitGTK is heavy.
+
+## Install mode (`INSTALL_MODE`)
+
+`install.sh` deploys the same files either way; `INSTALL_MODE` (env var, **default
+`desktop`**) only decides whether the box becomes a dedicated appliance:
+
+| `INSTALL_MODE` | Effect |
+|---|---|
+| `desktop` *(default)* | deploy everything but **leave the systemd default target and tty1 autologin untouched** — your desktop environment keeps working. Launch the wall on demand from the desktop icon (Setup / Desktop mode / Kiosk mode). |
+| `kiosk` | the appliance takeover: enable **tty1 autologin** so the box boots straight into the fullscreen wall. |
+
+```bash
+sudo ./install.sh                      # desktop (default)
+sudo INSTALL_MODE=kiosk ./install.sh   # dedicated tty1-autologin appliance
+```
+
+The install records `/etc/soc-display/.install-manifest`; `./uninstall.sh` (or
+`make uninstall`) is manifest-driven, restores the boot target, and **preserves
+operator data by default** (`--purge` to wipe it).
+
+## Branding (`branding/branding.yaml`)
+
+Rebrand the whole product from one file — **`branding/branding.yaml`** (loaded by
+`host/branding.py`). Name, tagline, icon and accent colours flow into the launcher
+menu, the desktop app entry (generated at install) and the setup wizard. A partial
+file is fine; anything you omit falls back to the built-in defaults.
+
+```yaml
+name: "SOC Video Wall"          # full product name (titles, headers)
+short_name: "SOC Wall"          # compact name (window title, menus)
+tagline: "Operations console"   # one-line subtitle under the name
+vendor: "s-b-repo"
+homepage: "https://github.com/s-b-repo/p2soc"
+icon: "share/icons/soc-wall.svg"   # SVG; repo-relative or absolute
+colors:
+  primary: "#2BE0C8"            # brand colour
+  setup: "#8B9CFF"             # tints the three launcher cards…
+  desktop: "#2BE0C8"
+  kiosk: "#F5B14C"
+  background: "#0B1220"         # …and themes the window
+  text: "#E8EEF7"
+  text_dim: "#8194B0"
+```
+
+Override the source at runtime with **`SOC_BRANDING_FILE=/path/to/branding.yaml`**,
+or drop a `branding.yaml` in **`/etc/soc-display/`** on a deployed box (the
+`SOC_BRANDING_FILE` env var wins, then `/etc/soc-display/branding.yaml`, then the
+repo file).

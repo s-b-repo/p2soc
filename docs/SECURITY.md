@@ -30,8 +30,9 @@ derived (scrypt) from this host's `machine-id` **and** a one-time PIN that
 PIN is itself sealed under a machine-id-only key, so the wall self-unlocks at
 boot with no prompt, while the sealed files (`/etc/soc-display/secret/*.enc`,
 `0600`, owned by the kiosk user) are **useless if copied to another machine** — a
-different `machine-id` makes the GCM authentication fail. `rbw` gets the master
-password from `scripts/pinentry-vault.py`, which unseals it in memory.
+different `machine-id` makes the GCM authentication fail. `litebw` (default) — or
+the legacy `rbw` — gets the master password from `scripts/pinentry-vault.py`,
+which unseals it in memory.
 
 The wall **config** is the vault's too: a secure-note (`SOC Wall Config`) is the
 source of truth, fetched after unlock; the local `panels.yaml` is only an offline
@@ -95,7 +96,7 @@ unattended appliance.
 
 If even that is unacceptable:
 
-- Do not seal: keep the wall attended and run `rbw unlock` once after each reboot
+- Do not seal: keep the wall attended and run `litebw unlock` (or `rbw unlock`) once after each reboot
   (e.g. over SSH) within `SOC_READY_TIMEOUT` — the host retries opening the vault
   and logs in only once it is unlocked.
 - Keep the one-time PIN off the device; you need it only to re-seal (re-deploy,
@@ -158,24 +159,53 @@ So even if the Pi is compromised, that key cannot open a shell or forward
 anywhere except the whitelisted panels. Full steps in
 [`security/tunnel_key.note`](../security/tunnel_key.note).
 
-## Fortinet VPN credentials
+## VPN credentials
 
-`forti-vpn.service` logs into the FortiGate with a username + password kept in the
-**same vault** as the panels (`vpn.vault_item`). The password is read into memory
-and handed to `openfortivpn` through a **pinentry helper** (`forti-pinentry.sh`) —
-the identical mechanism that unlocks `rbw`. So the FortiGate password is **never
-on the command line** (where `ps`/`/proc` would expose it) and **never written to
-disk**; only the gateway, username, and routing flags appear in the process list.
+The supervised VPN supports `vpn.type: fortinet` (openfortivpn), `openvpn`,
+`wireguard`, and `inode` (the bundled H3C client). Whichever backend is in use, the
+username + password live in the **same vault** as the panels (`vpn.vault_item`) and
+are read into memory — they **never reach `argv`** (where `ps`/`/proc` would expose
+them) and are **never written to disk**. Each backend has a secret path that keeps
+the password off the command line:
+
+- **fortinet:** handed to `openfortivpn` through a **pinentry helper** (`pinentry-env`
+  / `forti-pinentry.sh`) — the same unseal-in-memory mechanism that unlocks the vault.
+- **openvpn:** delivered over openvpn's **management socket** (`mgmt-socket`), not via
+  `--auth-user-pass` on a world-readable file or argv.
+- **inode (H3C):** read from `$H3C_SVPN_PASSWORD` in the process environment, never argv.
+
+Only the gateway, username, and routing flags appear in the process list. The
+gateway is validated as a hostname / IPv4 / IPv6 before use, and the trusted cert is
+pinned by **SHA-1 *or* SHA-256** with a **constant-time compare** so a pin check is
+not a timing oracle.
 
 Two caveats specific to the VPN unit:
 
 - **It runs as root.** Unlike `autossh-tunnel` (unprivileged), openfortivpn must
   run `pppd` and rewrite the routing table, so the unit runs as root with only
-  light sandboxing. Its rbw profile (under `/root`) is a second client of the same
+  light sandboxing. Its vault profile (under `/root`) is a second client of the same
   kiosk account.
 - **OTP on argv (opt-in).** `otp_from_vault: true` passes a one-time `--otp=` code
   on the command line. It is single-use and short-lived, but briefly visible in
   the process list — leave it off unless your gateway requires TOTP.
+
+### Bundled iNode / H3C client hardening
+
+The `inode` backend ships a pure-Python, aarch64-portable H3C SSL-VPN client
+(`vendor/iNode-VPN-Client`) that was security-hardened because it parses
+attacker-influenced network frames and server-supplied images:
+
+- **Frame-reassembly cap (1 MiB).** The wire reader caps reassembled frame size so a
+  malicious/compromised gateway cannot drive unbounded memory growth (the SPA
+  wire-format was also corrected).
+- **BMP dimension caps.** Server-supplied CAPTCHA bitmaps (decoded with tesseract)
+  have their width/height bounded before allocation, blocking decompression-bomb /
+  giant-allocation inputs at the parse boundary.
+- **Root-RCE-hardened privileged helper.** The root helper that applies routes was
+  hardened against argument/command injection so a compromised unprivileged caller
+  cannot turn it into local root code execution.
+- **Constant-time cert-pin compare.** The trusted-cert pin check uses a constant-time
+  comparison, so it cannot be probed as a timing side channel.
 
 **Account-lockout protection.** The supervisor classifies an auth failure and
 then *stops trying* for `SOC_VPN_AUTH_RETRY_DELAY` (default 300 s) rather than
@@ -205,8 +235,9 @@ The `forti-vpn` unit is deliberately lighter (`ProtectSystem=true`, `PrivateTmp`
 restricted address families incl. `AF_NETLINK`/`AF_PPPOX`) because `pppd` needs
 `/dev/ppp`, netlink, and write access to `/etc/resolv.conf` — over-hardening it
 breaks the tunnel. The vault master password is never in the unit nor in
-`soc.env`: the wrapper unlocks `rbw` via the same host-bound sealed secret +
-`pinentry-vault.py` as the kiosk host, so it never appears in `systemctl show`
+`soc.env`: the wrapper unlocks `litebw` (default; legacy `rbw`) via the same
+host-bound sealed secret + `pinentry-vault.py` as the kiosk host, so it never
+appears in `systemctl show`
 or the process environment.
 
 The kiosk session itself can run as a supervised unit (`soc-wall.service`,
@@ -215,6 +246,16 @@ lines instead of a sourced `soc.env`, and `Restart=always` so a dead compositor
 recovers rather than leaving a black screen. The vault master is never among
 those `Environment=` lines — it stays host-sealed. (Switching the boot from
 getty-autologin to this service is validated per-deployment on the target Pi.)
+
+## Uninstall preserves operator secrets
+
+`./uninstall.sh` (and `make uninstall`) is **manifest-driven** (it removes only what
+`install.sh` recorded in `/etc/soc-display/.install-manifest`) and **preserves
+operator data by default** — the sealed master secret + PIN (`/etc/soc-display/secret/*.enc`),
+the vault data, and your config are left in place, and the boot target / autologin
+are restored. Pass `--purge` to deliberately wipe operator secrets and data. So a
+routine uninstall/reinstall does **not** silently destroy the sealed credentials, and
+nothing is overwritten or deleted that the manifest did not create.
 
 ## Checklist before exposing anything
 

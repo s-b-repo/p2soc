@@ -5,6 +5,50 @@ All notable changes to **p2soc** (the SOC video-wall kiosk). Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Desktop-friendly install + kiosk opt-in.** `install.sh` takes
+  `INSTALL_MODE=desktop|kiosk` (default **desktop**): desktop deploys everything
+  but leaves the systemd default target / tty1 autologin alone, so the existing
+  desktop environment keeps working; `INSTALL_MODE=kiosk` is the tty1-autologin
+  appliance takeover.
+- **Clickable launcher menu.** The `soc-wall.desktop` entry opens a small GTK
+  chooser (`scripts/soc-wall-menu` → `kiosk-host/host/launchermenu.py`) with
+  three actions — **Setup**, **Desktop mode** (windowed), **Kiosk mode**
+  (fullscreen) — in a modern style, with the SVG icon at
+  `share/icons/soc-wall.svg`.
+- **Manifest-driven uninstall + easy revert.** `./uninstall.sh` (and
+  `make uninstall`) removes the wall from the manifest recorded by `install.sh`
+  at `/etc/soc-display/.install-manifest`, **preserving operator data by
+  default** (`--purge` to wipe), restoring the boot target, and is idempotent.
+- **Rebranding via one file.** `branding/branding.yaml` + `host/branding.py` set
+  the name, tagline, icon, and accent colours in one place; it flows into the
+  launcher, the generated desktop entry, and the setup wizard. Override with
+  `/etc/soc-display/branding.yaml` or `SOC_BRANDING_FILE`.
+- **Fortinet `EVENT_CONNECTING` progress event** so the on-wall VPN pill reflects
+  the in-progress connect state, not just up/down.
+- **`tesseract` dependency** added to the installer for the iNode/H3C login
+  CAPTCHA path.
+
+### Changed
+
+- **Fortinet/openfortivpn robustness.** Trusted-cert pins accept **SHA-1 or
+  SHA-256**; the gateway is validated as a hostname / IPv4 / IPv6; a new optional
+  `vpn.interface` override; `--persistent` is opt-in.
+- **iNode/H3C client hardening sync** (`vendor/iNode-VPN-Client`): SPA wire-format
+  fix, 1 MiB frame-reassembly cap and BMP-dimension caps, a root-RCE-hardened
+  helper, and constant-time cert-pin comparison.
+
+### Security
+
+- iNode/H3C client: bounded frame reassembly (1 MiB) and BMP-dimension caps at the
+  parse boundary, a root-RCE-hardened privileged helper, and constant-time
+  cert-pin compare (no timing oracle).
+- Fortinet cert-pin compare made robust across SHA-1 and SHA-256 pins with strict
+  gateway validation.
+
+## [1.0.0] - 2026-06-25
+
 ### Release-readiness pass (Pi-5 / aarch64, pure-Python vault, packaged release)
 
 - **litebw replaces rbw as the default vault backend — pure Python, no Rust.**
@@ -128,7 +172,7 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 - **All secrets in Vaultwarden, writable** (`host/vaultseed.py`): setup.py
   (`creds`) and the on-screen Settings can store each panel/VPN/proxy
   username+password (and a VPN config in Notes) directly in Vaultwarden over its
-  REST API — the wall still reads via rbw. Optional (`cryptography`); operator
+  REST API — the wall still reads via litebw (rbw legacy). Optional (`cryptography`); operator
   can still add logins in the web vault. The only on-disk secret is the
   unattended-unlock master password.
 - **Tabbed on-screen ⚙ Settings**: Panels (URL/title/vault/engine + advanced

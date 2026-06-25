@@ -28,10 +28,15 @@ You will produce three files:
 The **interactive wizard writes all three for you**. You can also write them by
 hand from the `*.example` templates.
 
-Two more things live outside these files: the vault **master password** is sealed
-host-bound under `/etc/soc-display/secret/` (`setup.py first-run`, no plaintext
-`.env`), and in production the wall **config is pushed into the Vaultwarden
-`SOC Wall Config` note** (the source of truth; `panels.yaml` is the fallback).
+Two more things live outside these files: the vault **master password** comes
+from a configurable source (`SOC_MASTER_SOURCE` in `host/mastersource.py`:
+`auto|sealed|secret-service|env`). The default `sealed` is host-bound
+AES-256-GCM under `$SOC_SECRET_DIR` (`setup.py first-run`); `secret-service`
+reads it from the freedesktop Secret Service (KWallet / GNOME-keyring /
+KeePassXC) via `secret-tool`; `env` is dev-only — **never plaintext in
+`.env`/`soc.env` in production**. And in production the wall **config is pushed
+into the Vaultwarden `SOC Wall Config` note** (the source of truth;
+`panels.yaml` is the fallback).
 
 ---
 
@@ -130,8 +135,10 @@ make vpn-check            # resolves VPN creds from the dev vault and prints the
 ## 3. Raspberry Pi walkthrough (production)
 
 Target: **Raspberry Pi 5 (1 GB+)**, Raspberry Pi OS 64-bit (Bookworm), HDMI
-monitor. The installer keeps your card and just **disables the desktop session**
-(reversible).
+monitor. The installer deploys everything but, by default
+(`INSTALL_MODE=desktop`), **leaves your desktop session and boot target
+untouched** — re-run with `INSTALL_MODE=kiosk` for the dedicated tty1-autologin
+appliance takeover. Everything is reversible (`./uninstall.sh`).
 
 ### 3.1 Prepare
 
@@ -151,8 +158,17 @@ sudo python3 setup.py            # menu → Configure (panels.yaml + soc.env)
 sudo ./install.sh                # deps, users, /opt/soc-display, systemd units, zram, autologin
 ```
 
-Installer knobs (env): `VW_MODE=docker|native`, `HARDEN=1` (nftables + key-only
-sshd), `KIOSK_USER=soc`, `SVC_USER=socsvc`. It is **idempotent**.
+Installer knobs (env): `INSTALL_MODE=desktop|kiosk` (default `desktop` — only
+`kiosk` switches the boot/default target + tty1 autologin),
+`VW_MODE=docker|native`, `HARDEN=1` (nftables + key-only sshd),
+`KIOSK_USER=soc`, `SVC_USER=socsvc`. It is **idempotent**, records
+`/etc/soc-display/.install-manifest`, and is reversible via `./uninstall.sh`
+(preserves operator data; `--purge` to wipe).
+
+Either way you also get a clickable **desktop launcher** (`soc-wall.desktop` →
+`scripts/soc-wall-menu` → `host/launchermenu.py`): a small GTK chooser with
+**Setup**, **Desktop mode** (windowed), and **Kiosk mode** (fullscreen) entries.
+The **Setup** entry runs the configuration flow from the desktop.
 
 The installer auto-enables `autossh-tunnel.service` only if a panel uses
 `mode: tunnel`, and `forti-vpn.service` only if `vpn.enabled` has a gateway.
@@ -200,9 +216,9 @@ openssl s_client -connect vpn.example.com:443 </dev/null 2>/dev/null \
   | openssl x509 -noout -fingerprint -sha256 | sed 's/.*=//;s/://g' | tr A-Z a-z
 ```
 
-On first start, `forti-vpn.service` unlocks root's `rbw` via the same host-bound
-sealed secret + `pinentry-vault.py` as the kiosk host (no plaintext password) and
-connects. The FortiGate password
+On first start, `forti-vpn.service` unlocks root's vault (litebw by default) via
+the same master-password source + `pinentry-vault.py` as the kiosk host (no
+plaintext password) and connects. The FortiGate password
 is fed to openfortivpn via a pinentry helper — **never on the command line or
 disk**. Watch it:
 
@@ -215,7 +231,7 @@ ip a show ppp0                      # has an address once connected
 Routing note: accepting all gateway routes can pull your LAN/SSH path over the
 VPN. Use `half_internet_routes: true` or `set_routes: false` to keep your own
 default route, and `set_dns: false` to keep your resolver. See
-[CONFIGURATION.md](CONFIGURATION.md#vpn-fortinet--fortigate-ssl-vpn).
+[CONFIGURATION.md](CONFIGURATION.md#vpn-fortinet-openvpn-wireguard-or-inode).
 
 ### 3.6 Calibrate the monitor (if not 1920×1080)
 
@@ -233,8 +249,9 @@ sudo -u soc /opt/soc-display/.venv/bin/python \
 sudo systemctl reboot
 ```
 
-The wall comes up automatically: tty1 → `startx` → Openbox → four logged-in
-panels, hands-free.
+In `kiosk` mode the wall comes up automatically: tty1 → `startx` → Openbox →
+four logged-in panels, hands-free. In `desktop` mode your DE keeps booting as
+usual — launch the wall on demand from the desktop launcher (Desktop / Kiosk).
 
 ---
 
@@ -247,7 +264,7 @@ panels, hands-free.
 - [ ] each VPN-side panel host answers from the Pi (`nc -z <host> <port>`)
 - [ ] `zramctl` shows an active zram swap device
 - [ ] no credentials appear in `journalctl` (incl. `journalctl -u forti-vpn`)
-- [ ] the master password is **sealed** (`setup.py first-run`); the one-time PIN is recorded off-device
+- [ ] the master password resolves from its configured source (default **sealed** via `setup.py first-run`, or `secret-service`); the one-time PIN is recorded off-device — never plaintext in `.env`/`soc.env`
 
 ---
 
