@@ -533,7 +533,11 @@ class KioskHost:
         """Compare on-disk file hashes against the deploy-time manifest and
         paint a top-bar warning if anything has drifted. Best-effort +
         non-fatal: a missing/unreadable manifest, or any other error, is logged
-        and skipped — the warning only appears when we positively find drift."""
+        and skipped — the warning only appears when we positively find drift.
+
+        check_drift() SHA-256-hashes the whole deploy tree, which is slow on the
+        SD card — run it on a daemon worker so the just-mapped wall stays
+        interactive, and deliver the warning via idle_add (mirrors _poll_vpn)."""
         if self.wall is None:
             return
         try:
@@ -542,27 +546,31 @@ class KioskHost:
             log(f"manifest check skipped: import failed ({e})")
             return
         deploy_root = os.environ.get("SOC_DEPLOY_ROOT", "/opt/soc-display")
-        try:
-            drift = _mf.check_drift(deploy_root)
-        except FileNotFoundError:
-            log(f"manifest check skipped: no manifest at "
-                f"{_mf.MANIFEST_PATH} (re-run install.sh to enable)")
-            return
-        except (OSError, ValueError, KeyError) as e:
-            log(f"manifest check skipped: {e}")
-            return
-        msg = _mf.format_drift_summary(drift)
-        if msg:
-            # Pass the full drift dict so wall.py can open a detail modal
-            # listing changed / missing / extras + a link to the deployed
-            # commit on GitHub.
-            self.wall.show_top_bar_warning(msg, detail=drift)
-            log(f"file drift detected: {len(drift['changed'])} changed, "
-                f"{len(drift['missing'])} missing, "
-                f"{len(drift['extras'])} extras (commit "
-                f"{(drift.get('commit') or 'unknown')[:12]})")
-        else:
-            log("manifest check ok — no drift")
+        import threading
+
+        def work():
+            try:
+                drift = _mf.check_drift(deploy_root)
+            except FileNotFoundError:
+                log(f"manifest check skipped: no manifest at "
+                    f"{_mf.MANIFEST_PATH} (re-run install.sh to enable)")
+                return
+            except (OSError, ValueError, KeyError) as e:
+                log(f"manifest check skipped: {e}")
+                return
+            msg = _mf.format_drift_summary(drift)
+            if msg:
+                # Pass the full drift dict so wall.py can open a detail modal
+                # listing changed / missing / extras + a link to the deployed
+                # commit on GitHub.
+                GLib.idle_add(self.wall.show_top_bar_warning, msg, drift)
+                log(f"file drift detected: {len(drift['changed'])} changed, "
+                    f"{len(drift['missing'])} missing, "
+                    f"{len(drift['extras'])} extras (commit "
+                    f"{(drift.get('commit') or 'unknown')[:12]})")
+            else:
+                log("manifest check ok — no drift")
+        threading.Thread(target=work, daemon=True).start()
 
     def _config_closed(self):
         self._config_win = None
@@ -651,8 +659,11 @@ class KioskHost:
             if hasattr(v, "stop"):
                 try:
                     v.stop()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Surface which panel failed (a swallowed Chromium stop can
+                    # orphan a child / leak a CDP port + profile lock across
+                    # 24/7 restarts) but never block main_quit on one bad panel.
+                    log(f"[{getattr(v.panel, 'id', '?')}] stop failed: {e}")
         Gtk.main_quit()
         return False
 
@@ -779,6 +790,7 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
         btns.set_halign(Gtk.Align.CENTER)
 
         def _open_setup(_b):
+            import subprocess  # local: subprocess isn't a module-level import
             root = os.environ.get("SOC_ROOT", "/opt/soc-display")
             sh = os.path.join(root, "scripts", "soc-wall-setup-gui.sh")
             argv = (["bash", sh] if os.path.exists(sh)

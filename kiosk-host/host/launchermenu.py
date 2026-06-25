@@ -155,17 +155,28 @@ def _rgba(hexc: str, alpha: float) -> str:
 # them. A Pango-unicode fallback (_GLYPH_FALLBACK) covers a box whose gdk-pixbuf
 # lacks the librsvg SVG loader, so the tile always shows SOMETHING branded.
 # --------------------------------------------------------------------------- #
-def _svg_gear(ac: str) -> str:
-    # cog: outer circle + 8 short radial teeth + inner hub — "configure".
-    teeth = ""
+# Gear-teeth endpoints are a pure deterministic function of i (cog centred at 12,12,
+# 8 radial spokes from r=7.2 to r=9.6) — precompute the <line> markup once at import
+# so _svg_gear is a plain join with no per-call trig / in-function `import math` on
+# each launcher open. `math` is touched only here at import, not on the hot path.
+def _gear_teeth() -> str:
     import math
+    out = []
     for i in range(8):
         a = i * math.pi / 4
-        x1, y1 = 12 + 7.2 * math.cos(a), 12 + 7.2 * math.sin(a)
-        x2, y2 = 12 + 9.6 * math.cos(a), 12 + 9.6 * math.sin(a)
-        teeth += f'<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}"/>'
+        out.append(
+            f'<line x1="{12 + 7.2 * math.cos(a):.2f}" y1="{12 + 7.2 * math.sin(a):.2f}" '
+            f'x2="{12 + 9.6 * math.cos(a):.2f}" y2="{12 + 9.6 * math.sin(a):.2f}"/>')
+    return "".join(out)
+
+
+_GEAR_TEETH = _gear_teeth()
+
+
+def _svg_gear(ac: str) -> str:
+    # cog: outer circle + 8 short radial teeth (precomputed) + inner hub — "configure".
     return (f'<g fill="none" stroke="{ac}" stroke-width="1.7" '
-            f'stroke-linecap="round">{teeth}'
+            f'stroke-linecap="round">{_GEAR_TEETH}'
             f'<circle cx="12" cy="12" r="6.4"/><circle cx="12" cy="12" r="2.4"/></g>')
 
 
@@ -335,6 +346,16 @@ def _open_appearance(parent_win):
                                          on_apply=on_apply, on_saved=on_saved)
     win = editor.build_window()
     win.set_transient_for(parent_win)
+
+    def _on_close(_w):
+        # CANCEL path: on_apply mutated branding's process-wide cached palette in
+        # place to PREVIEW; closing without Save leaves that preview poisoning the
+        # cache, so later-built launcher widgets would inherit the wrong colours.
+        # Refresh from disk + repaint to revert to the persisted theme (on_saved
+        # already does this on the Save path; the bare-destroy path did not).
+        branding.load(refresh=True)
+        _reapply()
+    win.connect("destroy", _on_close)
     win.show_all()
 
 

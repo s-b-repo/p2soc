@@ -154,6 +154,13 @@ class Supervisor:
         self.stop_event = threading.Event()
         self.child = None
         self._materialized = None       # transient VPN config file from the vault
+        # ONE Vault for the supervisor's lifetime, opened lazily once and reused
+        # across reconnect attempts. A bounded TTL caches the decrypted creds so a
+        # flapping link doesn't redo a scrypt unseal + full HTTPS sync per attempt,
+        # while still re-fetching after the TTL so rotated passwords recover. A
+        # VaultError forces a re-open (vault-not-ready-at-boot also recovers).
+        self._vault = None
+        self._cred_ttl = cfg.env_float("SOC_VPN_CRED_TTL", 30.0, lo=0.0, hi=3600.0)
         self.watchdog = SdWatchdog()
         self.backoff = Backoff(
             initial=cfg.env_float("SOC_VPN_BACKOFF_INITIAL", 5.0, lo=0.1, hi=3600.0),
@@ -193,22 +200,37 @@ class Supervisor:
             pass
 
     # -- credentials -----------------------------------------------------------
+    def _open_vault(self):
+        """Lazily construct + open() the one shared Vault, reusing it across
+        attempts. Raises VaultError on failure (callers drop it so the next
+        attempt re-opens — boot races + rotated passwords still recover)."""
+        if self._vault is None:
+            self._vault = Vault(ttl=self._cred_ttl)
+        if not self._vault.ready():
+            self._vault.open()
+        return self._vault
+
     def _resolve_creds(self, timeout: float):
-        """Fresh read every attempt: passwords rotate, and a failed unlock at
-        boot (vaultwarden still starting) must not be permanent. Returns
-        (user, password) or None when asked to stop."""
+        """Reuse the shared Vault (bounded cred TTL) instead of a fresh unseal +
+        full sync per attempt. The TTL still expires within `SOC_VPN_CRED_TTL`,
+        so rotated passwords recover; a VaultError drops the instance and forces
+        a re-open, so a failed unlock at boot (vaultwarden still starting) is not
+        permanent. Returns (user, password) or None when asked to stop.
+
+        Note: the single-use OTP is fetched fresh per attempt in _spawn via
+        _otp_code() (a separate CLI call), so caching the Vault never reuses an
+        OTP."""
         deadline = time.monotonic() + timeout
         while not self.stop_event.is_set():
             self.watchdog.ping()
             try:
-                vault = Vault(ttl=0)
-                vault.open()
-                c = vault.creds(self.vpn["vault_item"])
+                c = self._open_vault().creds(self.vpn["vault_item"])
                 if not c["user"]:
                     self.log(f"WARNING vault item '{self.vpn['vault_item']}' "
                              f"has no username")
                 return c["user"], c["pass"]
             except VaultError as e:
+                self._vault = None        # force a clean re-open next try
                 if time.monotonic() > deadline:
                     self.log(f"ERROR vault/creds not ready within {timeout:.0f}s: {e}")
                     return None
@@ -274,10 +296,11 @@ class Supervisor:
             return True
         item = self.vpn.get("vault_item")
         try:
-            vault = Vault(ttl=0)
-            vault.open()
-            content = vault.notes(item)
+            # Reuse the one already-synced Vault instead of a second fresh
+            # unseal + sync; force a re-open on VaultError (transient outage).
+            content = self._open_vault().notes(item)
         except VaultError as e:
+            self._vault = None
             self.log(f"ERROR reading VPN config from vault item '{item}': {e}")
             return False
         if not content.strip():

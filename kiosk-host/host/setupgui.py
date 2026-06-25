@@ -266,13 +266,14 @@ class WizardModel:
         if raw is None:
             self._cfg = normalize_cfg(None, setup)
             return f"could not load preset {name!r}; starting blank"
+        # normalize ONCE; validate that same dict by rendering it (don't re-normalize)
+        normalized = normalize_cfg(raw, setup)
         try:
-            self._ensure_config_mod().load_str(setup.render_panels_yaml(
-                normalize_cfg(raw, setup)))
+            self._ensure_config_mod().load_str(setup.render_panels_yaml(normalized))
         except Exception as e:  # noqa: BLE001
             self._cfg = normalize_cfg(None, setup)
             return f"preset {name!r} did not validate ({e}); starting blank"
-        self._cfg = normalize_cfg(raw, setup)
+        self._cfg = normalized
         return None
 
     def _ensure_config_mod(self):

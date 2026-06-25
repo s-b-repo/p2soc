@@ -118,13 +118,19 @@ def sync_state() -> dict:
     panels_valid = None
     config_error = None
     vpn_configured = False
+    vpn = None  # secret-free vpn subset carried to probe_state (avoids a 2nd parse)
     if configured:
         try:
             from . import config as cfg
             conf = cfg.load(panels_path)
             panels_count = len(conf.panels)
             panels_valid = True
-            vpn_configured = bool((conf.vpn or {}).get("enabled"))
+            vc = conf.vpn or {}
+            vpn_configured = bool(vc.get("enabled"))
+            # Only the keys _vpn_state_fast/_expected_iface need; all non-secret
+            # (host:port/iface/path/type), so this stays safe to keep in memory.
+            vpn = {k: vc.get(k) for k in
+                   ("enabled", "type", "interface", "config", "ready_probe")}
         except ImportError:
             # PyYAML absent (pre-venv / headless) — defer the count, NOT a failure.
             panels_count = None
@@ -155,6 +161,7 @@ def sync_state() -> dict:
         "vault_note": vault_note,
         "vault_url_hostport": vault_url_hostport,
         "vpn_configured": vpn_configured,
+        "vpn": vpn,
         "overall_sync": overall,
     }
 
@@ -225,14 +232,18 @@ def probe_state(sync: "dict | None" = None, *, vault_timeout: float = PROBE_TIME
 
     vpn_state = None
     if sync.get("vpn_configured"):
-        # Need conf.vpn (yaml) — read it here in the probe thread so sync stays
-        # yaml-free-safe. Guarded so a missing yaml never raises.
-        try:
-            from . import config as cfg
-            conf = cfg.load(sync.get("panels_path"))
-            vpn_state = _vpn_state_fast(conf.vpn or {}, vpn_timeout)
-        except Exception:
+        # sync_state() already parsed+validated panels.yaml and carried the
+        # secret-free vpn block forward — reuse it instead of a 2nd full parse.
+        vpn = sync.get("vpn")
+        if vpn is None:
+            # No carried block (e.g. a hand-built sync) — degrade safely; never a
+            # second yaml parse on this path.
             vpn_state = None
+        else:
+            try:
+                vpn_state = _vpn_state_fast(vpn, vpn_timeout)
+            except Exception:
+                vpn_state = None
     else:
         # Either genuinely not configured, or we couldn't tell (yaml deferred).
         vpn_state = "not_configured" if sync.get("panels_valid") is True else None
@@ -334,7 +345,7 @@ def _check() -> int:
         return 1
     required = {"configured", "panels_path", "panels_tier", "panels_count",
                 "panels_valid", "config_error", "vault_note", "vault_url_hostport",
-                "vpn_configured", "overall_sync"}
+                "vpn_configured", "vpn", "overall_sync"}
     missing = required - set(s)
     if missing:
         problems.append(f"sync_state missing keys: {sorted(missing)}")
