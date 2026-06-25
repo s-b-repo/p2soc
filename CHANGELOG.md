@@ -1,11 +1,41 @@
 # Changelog
 
 All notable changes to **p2soc** (the SOC video-wall kiosk). Format follows
-[Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0.
+[Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.1.0] - 2026-06-25
+
+The first feature release after the 1.0 baseline — and the fix for a 1.0.0
+packaging bug that omitted the host-bound seal module.
 
 ### Added
+
+- **Pure-Python `litebw` vault backend + universal master source** — replaces the
+  Rust `rbw` (no compile/OOM on the 1 GB Pi); master from the sealed host-bound store /
+  freedesktop Secret Service (KWallet/GNOME-keyring/KeePassXC) / env, never plaintext `.env`.
+- **On-screen controls** (ported + adapted to single-VPN): kiosk **Lock** overlay
+  (PIN/TOTP), live **VPN-log viewer**, the **reconnect fix** (scoped sudoers + `sudo -n`
+  probe), `allowedOrigin` autofill gate, **nftables** fail-closed egress lockdown,
+  **manifest** tamper-detection, encrypted off-box **vault backup**, scanner **tarpit**.
+- **GTK setup wizard** (presets + live validation), a **green/white console theme**
+  (branding-driven + customizable), a clickable launcher menu, and a manifest-driven **uninstall**.
+- **Fail-safe launch** — a clear on-screen error (cause + **Open Setup**) when the wall
+  can't start, instead of a silent restart loop.
+- **Multi-arch release CI** — `deb`/`rpm`/`apk` (arm64/armhf/amd64) + source tarball on each `vX.Y.Z` tag.
+
+### Fixed
+
+- **Ship `kiosk-host/host/secretstore.py`** — the host-bound seal module was swallowed by
+  an over-broad `.gitignore` and missing from v1.0.0's repo + CI packages, breaking the
+  vault path on a fresh clone. `.gitignore` narrowed; the module is now tracked.
+
+### Security
+
+- Input/memory-safety hardening across the vault, VPN, and iNode parsers (KDF/TOTP/HTTP
+  DoS caps, atomic `0600` config-cache write), an adversarial whole-repo bug-hunter sweep,
+  and `make package-clean` so `__pycache__`/`.pyc` can never ship into packages.
+
+### Added (desktop/install batch)
 
 - **Desktop-friendly install + kiosk opt-in.** `install.sh` takes
   `INSTALL_MODE=desktop|kiosk` (default **desktop**): desktop deploys everything
