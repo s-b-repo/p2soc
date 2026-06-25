@@ -55,4 +55,35 @@ PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
 
 cd "$ROOT" 2>/dev/null || true
-exec "$PYBIN" -m host.setupgui "$@"
+
+# Headless / discovery runs (CI, setup.py reuse): let output flow and exec.
+if [ "$HEADLESS" -eq 1 ]; then
+  exec "$PYBIN" -m host.setupgui "$@"
+fi
+
+# GUI run: do NOT exec — a clickable .desktop launch (Terminal=false) discards
+# stderr, so a silent early failure would look like "the button does nothing".
+# Run it, and if it dies, surface the cause in a visible themed dialog (fail-safe).
+ERRLOG="$(mktemp 2>/dev/null || echo "/tmp/soc-wall-setup.$$.log")"
+set +e
+"$PYBIN" -m host.setupgui "$@" 2>"$ERRLOG"
+rc=$?
+set -e
+
+if [ "$rc" -ne 0 ]; then
+  cat "$ERRLOG" >&2 2>/dev/null || true       # still log to a terminal if there is one
+  detail="$(tail -n 15 "$ERRLOG" 2>/dev/null)"
+  [ -n "$detail" ] || detail="The setup wizard exited with status $rc and produced no message."
+  "$PYBIN" -m host.guierror "SOC Wall setup couldn't start (exit $rc)" "$detail" 2>/dev/null || true
+  rm -f "$ERRLOG" 2>/dev/null || true
+  exit "$rc"
+fi
+rm -f "$ERRLOG" 2>/dev/null || true
+
+# Success: when launched from the launcher menu, return to it (the "main page")
+# so the operator lands back where they started and can start the wall with the
+# fresh config. Standalone (.desktop) launches just exit back to the desktop.
+if [ "${SOC_RETURN_TO_MENU:-0}" = "1" ] && [ -x "$ROOT/scripts/soc-wall-menu" ]; then
+  exec "$ROOT/scripts/soc-wall-menu"
+fi
+exit 0

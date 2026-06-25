@@ -55,7 +55,12 @@ def launch_setup() -> bool:
     """Prefer the GUI setup wizard; fall back to the TTY wizard in a terminal."""
     gui = _script("soc-wall-setup-gui.sh")
     if os.path.exists(gui):
-        return _spawn(["bash", gui])
+        # Ask the wizard to come back HERE (the "main page") when it finishes, so
+        # the operator lands on the launcher again and can start the wall with the
+        # fresh config rather than being dropped back to the bare desktop.
+        env = dict(os.environ)
+        env["SOC_RETURN_TO_MENU"] = "1"
+        return _spawn(["bash", gui], env=env)
     setup = os.path.join(ROOT, "setup.py")
     term = next((t for t in ("x-terminal-emulator", "gnome-terminal", "konsole",
                              "xfce4-terminal", "mate-terminal", "xterm")
