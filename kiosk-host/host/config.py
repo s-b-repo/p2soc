@@ -13,6 +13,7 @@ them, which catches typos like `vault_iten:` before they bite at 3 AM.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -75,7 +76,7 @@ _VPN_KEYS = {"enabled", "type", "config", "config_from_vault", "gateway", "port"
              "vault_item", "trusted_cert", "ca_file", "realm", "set_routes",
              "set_dns", "half_internet_routes", "persistent", "otp_from_vault",
              "ready_probe", "extra_args", "health_check_interval",
-             "health_check_failures", "domain", "insecure"}
+             "health_check_failures", "domain", "insecure", "interface"}
 
 
 @dataclass
@@ -233,6 +234,10 @@ def openfortivpn_args(vpn: dict) -> list:
         args.append(f"--set-dns={1 if vpn['set_dns'] else 0}")
     if "half_internet_routes" in vpn:
         args.append(f"--half-internet-routes={1 if vpn['half_internet_routes'] else 0}")
+    # --persistent is OPT-IN only: our supervisor (host/fortivpn.py) already owns
+    # the reconnect policy (classified backoff, auth/cert lockout protection), so
+    # we never emit it by default — that would layer openfortivpn's own in-process
+    # reconnect on top of ours. Honour it only when the operator sets it explicitly.
     persistent = int(vpn.get("persistent", 0) or 0)
     if persistent > 0:
         args.append(f"--persistent={persistent}")
@@ -244,6 +249,16 @@ def vpn_kind(vpn: dict) -> str:
     """The VPN backend: 'fortinet' (default), 'openvpn', or 'wireguard'."""
     t = str((vpn or {}).get("type", "fortinet") or "fortinet").lower()
     return t if t in VALID_VPN_TYPES else "fortinet"
+
+
+def vpn_interface(vpn: dict) -> str:
+    """An explicit tunnel interface-name override for status detection.
+
+    openfortivpn/openvpn normally bring up ppp0/tun0, but a non-default
+    setup (e.g. ppp_name in the PPP profile, or `dev tunN` in an .ovpn) can use
+    another name. `vpn.interface` lets the on-wall indicator find it.
+    Empty ('' / unset) keeps the per-type default — behaviour unchanged."""
+    return str((vpn or {}).get("interface", "") or "").strip()
 
 
 def openvpn_args(vpn: dict) -> list:
@@ -342,6 +357,41 @@ def resolve_layout(conf: "Config", backend: str) -> str:
 # --------------------------------------------------------------------------- #
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_cert_pin(cert: str) -> bool:
+    """A FortiGate trusted-cert pin, openfortivpn-compatible: a SHA-256 (64 hex)
+    or SHA-1 (40 hex) digest, case-insensitive. openfortivpn --trusted-cert
+    accepts both, so we do too (SHA-256 is preferred — SHA-1 is for older
+    gateways/digests)."""
+    s = str(cert)
+    return len(s) in (40, 64) and all(c in "0123456789abcdefABCDEF" for c in s)
+
+
+# A hostname/IP for a VPN gateway: non-empty, no spaces or shell metacharacters,
+# and shaped like an RFC-1123 hostname, an IPv4 dotted-quad, or an IPv6 literal
+# (with optional %zone / [brackets]). Kept permissive enough for real gateways;
+# the value is only ever passed as a single argv token, so this is an early,
+# clear error — not a security boundary.
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?$")
+_IPV4_RE = re.compile(
+    r"^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$")
+_IPV6_RE = re.compile(r"^[0-9A-Fa-f:]+(?:%[0-9A-Za-z._-]+)?$")
+
+
+def _is_gateway_host(host: str) -> bool:
+    """True if `host` is a plausible gateway hostname or IP address. Rejects
+    empty strings, anything with whitespace, and shell/URL metacharacters."""
+    h = str(host).strip()
+    if not h or any(c.isspace() for c in h):
+        return False
+    if h.startswith("[") and h.endswith("]"):       # bracketed IPv6 literal
+        h = h[1:-1]
+    if _IPV4_RE.match(h) or _HOSTNAME_RE.match(h):
+        return True
+    return bool(":" in h and _IPV6_RE.match(h))      # IPv6 needs >=1 colon
 
 
 def _probe_ok(probe: str) -> bool:
@@ -577,16 +627,18 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
     if kind == "fortinet":
         if not vpn.get("gateway"):
             errs.append("vpn: type 'fortinet' but 'gateway' is not set")
+        elif not _is_gateway_host(vpn["gateway"]):
+            errs.append(f"vpn.gateway: not a valid hostname or IP address, "
+                        f"got {vpn['gateway']!r}")
         if not vpn.get("vault_item"):
             errs.append("vpn: type 'fortinet' but 'vault_item' is not set "
                         "(the vault login holding the FortiGate credentials)")
         if "port" in vpn and (not _is_int(vpn["port"]) or not (0 < vpn["port"] < 65536)):
             errs.append(f"vpn.port: must be a port number (1-65535), got {vpn['port']!r}")
         cert = vpn.get("trusted_cert", "")
-        if cert and not (len(cert) == 64
-                         and all(c in "0123456789abcdefABCDEF" for c in cert)):
-            errs.append(f"vpn.trusted_cert: expected a 64-char sha256 hex digest, "
-                        f"got {len(str(cert))} chars")
+        if cert and not _is_cert_pin(cert):
+            errs.append(f"vpn.trusted_cert: expected a sha256 (64-char) or sha1 "
+                        f"(40-char) hex digest, got {len(str(cert))} chars")
         if not cert and not vpn.get("ca_file"):
             warns.append("vpn: no trusted_cert / ca_file pinned — the connection "
                          "relies on system CAs; if the gateway uses a self-signed "
@@ -619,6 +671,9 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
         if not vpn.get("gateway"):
             errs.append("vpn: type 'inode' but 'gateway' is not set (the H3C "
                         "SSL-VPN gateway host)")
+        elif not _is_gateway_host(vpn["gateway"]):
+            errs.append(f"vpn.gateway: not a valid hostname or IP address, "
+                        f"got {vpn['gateway']!r}")
         if not vpn.get("vault_item"):
             errs.append("vpn: type 'inode' but 'vault_item' is not set (the vault "
                         "login holding the SSL-VPN username + password)")

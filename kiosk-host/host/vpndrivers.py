@@ -26,6 +26,7 @@ EVENT_UP = "up"
 EVENT_AUTH = "auth"
 EVENT_CERT = "cert"
 EVENT_DOWN = "down"
+EVENT_CONNECTING = "connecting"     # progress only — never drives backoff/reconnect
 
 
 def _match(line: str, patterns):
@@ -65,6 +66,7 @@ class FortinetDriver(Driver):
         ("Bad certificate sha256 digest", EVENT_CERT),
         ("Closed connection to gateway", EVENT_DOWN),
         ("Could not start tunnel", EVENT_DOWN),
+        ("Connecting to gateway", EVENT_CONNECTING),    # progress, logged only
     )
 
     def needs_creds(self, vpn):

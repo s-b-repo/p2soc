@@ -10,7 +10,8 @@ Detection, in order of reliability:
   1. vpn.ready_probe (a host:port reachable only once the VPN is up) — a TCP
      connect. This is the accurate, type-agnostic signal; set it.
   2. otherwise, the presence of the expected tunnel interface in
-     /sys/class/net (wg<n> / tun0 / ppp0) — best-effort, no privileges.
+     /sys/class/net (wg<n> / tun0 / ppp0, or vpn.interface when the backend
+     uses a non-default name) — best-effort, no privileges.
 """
 from __future__ import annotations
 
@@ -36,6 +37,11 @@ def _tcp_ok(hostport: str, timeout: float = 2.0) -> bool:
 
 
 def _expected_iface(vpn: dict) -> str:
+    # An explicit vpn.interface override wins for every type — it is the only
+    # signal that survives a non-default ppp_name / `dev tunN` / renamed wg link.
+    override = cfg.vpn_interface(vpn)
+    if override:
+        return override
     kind = cfg.vpn_kind(vpn)
     if kind == "wireguard":
         from . import vpndrivers

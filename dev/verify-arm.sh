@@ -183,6 +183,55 @@ PYEOF
   fi
 fi
 
+# (i) VPN runtime deps must be DECLARED so a package install / installer run pulls
+#     the right client per vpn.type on aarch64 (these are distro packages, not
+#     compiled here — the whole point is the Pi never builds them). Assert every
+#     VPN client is named in BOTH the nfpm per-packager depends (deb/rpm/apk) AND
+#     install.sh's package sets. wireguard-tools is the wg-quick CLI; openfortivpn
+#     + ppp drive Fortinet; openvpn covers vpn.type: openvpn.
+for client in openfortivpn openvpn wireguard-tools; do
+  if grep -qE "^[[:space:]]*-[[:space:]]+${client}[[:space:]]*$" nfpm.yaml; then
+    ok "nfpm.yaml declares VPN client dep: $client"
+  else
+    bad "nfpm.yaml is missing VPN client dep '$client' (package install won't pull it on aarch64)"
+  fi
+  # install.sh names it in a PK_ set (required) or a pm_try/pm_install line (optional).
+  if grep -qE "(^|[^a-z-])${client}([^a-z-]|$)" install.sh; then
+    ok "install.sh installs VPN client: $client"
+  else
+    bad "install.sh never installs VPN client '$client' (no aarch64 install path)"
+  fi
+done
+# tesseract OCR (iNode SSL-VPN login CAPTCHA): pkg name varies (tesseract-ocr on
+# deb/apk, tesseract on rpm). Assert at least one spelling is in nfpm + install.sh.
+if grep -qE '^[[:space:]]*-[[:space:]]+tesseract(-ocr)?[[:space:]]*$' nfpm.yaml; then
+  ok "nfpm.yaml declares tesseract OCR (iNode CAPTCHA) dep"
+else
+  bad "nfpm.yaml is missing tesseract/tesseract-ocr (iNode SSL-VPN CAPTCHA path)"
+fi
+if grep -qE '(^|[^a-z-])tesseract(-ocr)?([^a-z-]|$)' install.sh; then
+  ok "install.sh installs tesseract OCR (iNode CAPTCHA)"
+else
+  bad "install.sh never installs tesseract/tesseract-ocr (iNode SSL-VPN CAPTCHA path)"
+fi
+
+# (j) The bundled iNode SSL-VPN helper must be a portable TEXT script, NOT an
+#     arch-specific ELF binary — that is what makes iNode "pure-Python/shell" and
+#     runnable on aarch64 without a vendor build. If someone ever drops an x86
+#     ELF here, `file` would say 'ELF ... executable' and the Pi would fail with
+#     'exec format error'. Assert it is a text script.
+inode_helper="vendor/iNode-VPN-Client/scripts/inode-svpn-helper"
+if [ -f "$inode_helper" ]; then
+  ftype="$(file -b "$inode_helper" 2>/dev/null || echo unknown)"
+  case "$ftype" in
+    *ELF*) bad "iNode helper is an ELF binary ('$ftype') — arch-specific, breaks on aarch64" ;;
+    *text*|*script*) ok "iNode helper is a TEXT script ($ftype) — arch-portable" ;;
+    *) bad "iNode helper is not a recognizable text script ('$ftype')" ;;
+  esac
+else
+  bad "iNode helper missing: $inode_helper (bundled SSL-VPN client incomplete)"
+fi
+
 echo
 if [ "$fail" -ne 0 ]; then
   echo "verify-arm: FAILED — a compile-on-Pi / wrong-arch regression was introduced."

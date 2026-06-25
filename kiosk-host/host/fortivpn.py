@@ -45,6 +45,7 @@ EVENT_UP = "up"
 EVENT_AUTH = "auth"
 EVENT_CERT = "cert"
 EVENT_DOWN = "down"
+EVENT_CONNECTING = "connecting"     # progress only — never drives backoff/reconnect
 
 _PATTERNS = (
     ("Tunnel is up and running", EVENT_UP),
@@ -55,6 +56,7 @@ _PATTERNS = (
     ("Bad certificate sha256 digest", EVENT_CERT),
     ("Closed connection to gateway", EVENT_DOWN),
     ("Could not start tunnel", EVENT_DOWN),
+    ("Connecting to gateway", EVENT_CONNECTING),             # progress, logged only
 )
 
 
@@ -235,6 +237,10 @@ class Supervisor:
                 self._up_since = time.monotonic()   # reset backoff later, only if it stays up
                 self.log("tunnel established")
                 sd_notify("STATUS=connected: tunnel is up")
+            elif event == EVENT_CONNECTING:
+                # Progress feedback for the wall only — must NOT land in _saw, so
+                # it can never be mistaken for a drop and perturb the backoff.
+                sd_notify("STATUS=connecting to gateway")
             elif event:
                 self._saw.add(event)
         try:

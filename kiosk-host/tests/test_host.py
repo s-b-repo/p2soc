@@ -103,6 +103,16 @@ def test_openfortivpn_args_empty_without_gateway():
     assert config.openfortivpn_args({"port": 443, "enabled": True}) == []
 
 
+def test_openfortivpn_persistent_is_opt_in():
+    # --persistent is NOT emitted by default (the supervisor owns reconnect) ...
+    base = {"gateway": "gw", "port": 443}
+    assert not any("--persistent" in a for a in config.openfortivpn_args(base))
+    assert not any("--persistent" in a
+                   for a in config.openfortivpn_args({**base, "persistent": 0}))
+    # ... but is honoured verbatim when the operator sets it explicitly
+    assert "--persistent=30" in config.openfortivpn_args({**base, "persistent": 30})
+
+
 def test_inject_substitution_and_escaping():
     conf = _load()
     p1 = conf.panels[0]
@@ -310,6 +320,89 @@ vpn:
 """, "health_check_interval is set but vpn.ready_probe is empty")
 
 
+# --- trusted_cert: accept both sha256 (64-hex) and sha1 (40-hex) pins ---------
+_SHA256 = "deadbeefcafedeadbeefcafedeadbeefcafedeadbeefcafedeadbeefcafe0123"  # 64
+_SHA1 = "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"                            # 40, upper
+
+
+def _forti_yaml(cert):
+    return f"""
+panels: [{{id: a, grid: [0,0], url: "http://x/"}}]
+vpn: {{enabled: true, type: fortinet, gateway: gw.example, vault_item: VPN,
+       trusted_cert: "{cert}"}}
+"""
+
+
+def test_trusted_cert_accepts_sha256_and_sha1():
+    # sha256 (64 hex) — the preferred pin
+    c = _load_yaml_text(_forti_yaml(_SHA256))
+    assert c.vpn["trusted_cert"] == _SHA256
+    # sha1 (40 hex, case-insensitive) — openfortivpn accepts it, so do we
+    assert config._is_cert_pin(_SHA1)
+    assert config._is_cert_pin(_SHA1.lower())
+    c = _load_yaml_text(_forti_yaml(_SHA1))
+    assert c.vpn["trusted_cert"] == _SHA1
+
+
+def test_trusted_cert_rejects_bad_pin():
+    # wrong length (48), non-hex, and the sha256-only message is now sha1+sha256
+    _expect_error(_forti_yaml("deadbeef" * 6), "sha256", "sha1")
+    _expect_error(_forti_yaml("z" * 64), "sha256", "sha1")   # 64 chars but non-hex
+    assert not config._is_cert_pin("")
+    assert not config._is_cert_pin("AA:BB:CC")               # colon form is iNode's
+
+
+# --- gateway validation: accept real gateways, reject garbage -----------------
+def test_gateway_validation_accepts_real_hosts():
+    for host in ("vpn.example.net", "fw01", "10.50.0.1", "2001:db8::1",
+                 "[2001:db8::1]", "vpn-gw.corp.example.com", "fe80::1%eth0"):
+        assert config._is_gateway_host(host), host
+        c = _load_yaml_text(f"""
+panels: [{{id: a, grid: [0,0], url: "http://x/"}}]
+vpn: {{enabled: true, type: fortinet, gateway: "{host}", vault_item: VPN}}
+""")
+        assert c.vpn["gateway"] == host
+
+
+def test_gateway_validation_rejects_garbage():
+    for bad in ("a b", "gw;rm -rf", "http://gw/", "gw$(id)", "gw|nc", "-leadingdash",
+                "tooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong"
+                + ".x", ""):
+        assert not config._is_gateway_host(bad), bad
+    _expect_error("""
+panels: [{id: a, grid: [0,0], url: "http://x/"}]
+vpn: {enabled: true, type: fortinet, gateway: "gw with space", vault_item: VPN}
+""", "not a valid hostname or IP")
+    # iNode gateway is validated the same way (also passed as argv)
+    _expect_error("""
+panels: [{id: a, grid: [0,0], url: "http://x/"}]
+vpn: {enabled: true, type: inode, gateway: "bad;host", vault_item: VPN}
+""", "not a valid hostname or IP")
+
+
+# --- vpn.interface override for status detection ------------------------------
+def test_vpn_interface_override():
+    from host import vpnstatus
+    # default (unset): per-type interface — behaviour unchanged
+    assert config.vpn_interface({}) == ""
+    assert vpnstatus._expected_iface({"type": "fortinet"}) == "ppp0"
+    assert vpnstatus._expected_iface({"type": "openvpn"}) == "tun0"
+    # explicit override wins for every type
+    assert config.vpn_interface({"interface": " ppp1 "}) == "ppp1"
+    assert vpnstatus._expected_iface({"type": "fortinet", "interface": "ppp7"}) == "ppp7"
+    assert vpnstatus._expected_iface({"type": "openvpn", "interface": "tun9"}) == "tun9"
+    assert vpnstatus._expected_iface(
+        {"type": "wireguard", "config": "wg0", "interface": "wgcorp"}) == "wgcorp"
+    # the override is a known key (no 'unknown key' warning)
+    conf = _load_yaml_text("""
+panels: [{id: a, grid: [0,0], url: "http://x/"}]
+vpn: {enabled: true, type: fortinet, gateway: gw.example, vault_item: VPN,
+      interface: ppp1}
+""")
+    assert conf.vpn["interface"] == "ppp1"
+    assert not any("interface" in w for w in conf.warnings)
+
+
 def test_validation_warnings_for_unknown_keys():
     conf = _load_yaml_text("""
 display: {cols: 2, rows: 2}
@@ -370,6 +463,33 @@ def test_fortivpn_classify_real_strings():
     assert fortivpn.classify("INFO:   Closed connection to gateway.") == "down"
     assert fortivpn.classify("ERROR:  Could not start tunnel (xx).") == "down"
     assert fortivpn.classify("DEBUG:  something uninteresting") is None
+    # progress line -> 'connecting' (logged only; must not be auth/cert/down)
+    assert fortivpn.classify("INFO:   Connecting to gateway...") == "connecting"
+
+
+def test_fortivpn_connecting_does_not_perturb_backoff():
+    # EVENT_CONNECTING is progress feedback only: it must never land in _saw, so
+    # it can't be misread as a drop and trigger reconnect/backoff. The driver
+    # classifies it, and the supervisor's reader keeps it out of _saw.
+    from host import vpndrivers
+    assert vpndrivers.FortinetDriver().classify(
+        "INFO:   Connecting to gateway...") == vpndrivers.EVENT_CONNECTING
+    sup = fortivpn.Supervisor(
+        {"enabled": True, "type": "fortinet", "vault_item": "VPN"},
+        "", log=lambda m: None)
+    sup._saw = set()
+
+    class _Pipe:
+        def __init__(self, lines):
+            self._it = iter(lines)
+        def readline(self):
+            return next(self._it, "")
+        def close(self):
+            pass
+
+    sup._reader(_Pipe(["INFO:   Connecting to gateway...\n", ""]))
+    assert sup._saw == set()                       # progress did not pollute _saw
+    assert fortivpn.EVENT_AUTH not in sup._saw and fortivpn.EVENT_DOWN not in sup._saw
 
 
 def test_fortivpn_backoff():
