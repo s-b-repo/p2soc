@@ -163,7 +163,7 @@ fi
 # --------------------------------------------------------------------------- #
 # 1) systemd units — disable + remove
 # --------------------------------------------------------------------------- #
-UNITS=(soc-wall.service forti-vpn.service autossh-tunnel.service vaultwarden.service)
+UNITS=(soc-wall.service forti-vpn.service autossh-tunnel.service soc-tarpit.service vaultwarden.service)
 if [ "$HAS_SYSTEMD" = "1" ]; then
   log "Disabling + removing systemd units"
   for u in "${UNITS[@]}"; do
@@ -224,6 +224,9 @@ rm_path(){   # remove a file/dir/symlink if present, and record it
 
 rm_path "$SOC_ROOT"
 rm_path /usr/local/bin/litebw
+# sudoers drop-in (soc -> systemctl restart vpn/tunnel/tarpit). Removing it is
+# safe: it only ever GRANTED the kiosk user the live-restart capability.
+rm_path /etc/sudoers.d/soc-wall-restart
 rm_path /usr/share/applications/soc-wall.desktop
 rm_path /usr/share/applications/soc-wall-setup.desktop
 rm_path /usr/share/icons/hicolor/scalable/apps/soc-wall.svg
@@ -292,6 +295,11 @@ fi
 if [ "$PURGE" != "1" ]; then
   rm_path "$ETC/.installed"
   rm_path "$ETC/.install-manifest"
+  # deploy SHA-256 manifest + tarpit arm-flag are install metadata, not operator
+  # data — drop them on keep-data too (a stale manifest.json would make a fresh
+  # wall flag spurious drift). (On --purge the whole $ETC goes anyway, below.)
+  rm_path "$ETC/manifest.json"
+  rm_path "$ETC/tarpit.env"
 fi
 
 # --------------------------------------------------------------------------- #

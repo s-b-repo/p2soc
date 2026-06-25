@@ -49,6 +49,13 @@ Environment=SOC_CRED_TTL=30
 Environment=SOC_VPN_DRY_RUN=0
 Environment=SOC_SESSION=auto
 
+# Ensure soc's XDG_RUNTIME_DIR exists BEFORE the session starts. The wall is
+# launched via PAMName=login which usually sets this up — but on Wayland-only
+# hosts (no full PAM session manager) the dir may be missing on cold boot, and
+# litebw / pulseaudio / WebKit then fail with confusing "create dir / permission
+# denied" errors. `+` runs the prep as root regardless of User=.
+ExecStartPre=+/bin/sh -c '/usr/bin/install -d -m 0700 -o soc -g soc /run/user/$(id -u soc)'
+
 ExecStart=/opt/soc-display/scripts/start-session.sh
 Restart=always
 RestartSec=3
@@ -61,6 +68,13 @@ MemoryMax=92%
 # multi-hundred-MB cores onto the 40 GB SD card (also enforced distro-wide by
 # security/coredump-soc.conf). You don't debug cores in-place on a kiosk.
 LimitCORE=0
+# SEC-11: defense-in-depth (safe for the browser sandbox — does not restrict the
+# SUID/devices the compositor + Chromium need).
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+LockPersonality=yes
+RestrictRealtime=yes
 
 [Install]
 WantedBy=graphical.target

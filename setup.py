@@ -1293,6 +1293,57 @@ def cmd_doctor(args) -> int:
                 subprocess.run(["systemctl", "is-active", u], capture_output=True,
                                text=True).stdout.strip() or "unknown")))
 
+    # Reconnect path: the sudoers drop-in is what lets the unprivileged kiosk
+    # user restart forti-vpn / autossh-tunnel / soc-tarpit live (the ⚙ Settings
+    # "Save"/reconnect button) and read their journal. Report whether the rule
+    # is present AND, when we can test it, whether `sudo -n systemctl restart`
+    # actually resolves for the kiosk user. install.sh drops it in via a
+    # visudo-validated temp-file move; a missing/invalid file just degrades the
+    # button to a "PENDING restart" message (no functional break).
+    if _have("sudo"):
+        dropin = "/etc/sudoers.d/soc-wall-restart"
+        kiosk_user = soc_env.get("SOC_KIOSK_USER") or os.environ.get("SOC_KIOSK_USER") or "soc"
+
+        def _sudoers_reconnect():
+            if not os.path.exists(dropin):
+                return ("WARN", f"{dropin} not present",
+                        "install.sh installs it (visudo-validated); the reconnect "
+                        "button falls back to a PENDING-restart message without it")
+            # File present. Try a non-interactive dry probe of the granted command
+            # so we report whether the rule actually RESOLVES for the kiosk user.
+            #   * running AS the kiosk user (or dev): probe directly.
+            #   * running as root: probe via `sudo -u <kiosk> -n` so we test the
+            #     rule, not root's blanket privileges.
+            probe = ["sudo", "-n", "-l", "/usr/bin/systemctl", "restart",
+                     "forti-vpn.service"]
+            import getpass
+            try:
+                cur = getpass.getuser()
+            except Exception:  # noqa: BLE001
+                cur = ""
+            if env.is_root and cur != kiosk_user:
+                # Only test through the kiosk user if it exists.
+                user_ok = subprocess.run(["id", "-u", kiosk_user],
+                                         capture_output=True, text=True).returncode == 0
+                if user_ok:
+                    probe = ["sudo", "-u", kiosk_user, "-n", "-l",
+                             "/usr/bin/systemctl", "restart", "forti-vpn.service"]
+                else:
+                    return ("OK", f"{dropin} present (kiosk user "
+                            f"'{kiosk_user}' not created yet)", "")
+            try:
+                r = subprocess.run(probe, capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as e:
+                return ("WARN", f"present but probe failed ({e})", "")
+            if r.returncode == 0:
+                return ("OK", f"{dropin} present; sudo -n systemctl restart works", "")
+            return ("WARN",
+                    f"{dropin} present but `sudo -n systemctl restart` denied for "
+                    f"'{kiosk_user}'",
+                    "visudo -c /etc/sudoers.d/soc-wall-restart; check the user field "
+                    "matches your kiosk user")
+        d.check("reconnect sudoers rule", _sudoers_reconnect)
+
     print()
     if d.fails:
         print(red(f"   {d.fails} problem(s), {d.warns} warning(s) — run: setup.py repair"))

@@ -35,6 +35,7 @@
 #                             kiosk   = dedicated appliance: enable tty1 autologin +
 #                             `systemctl set-default multi-user.target`.
 #   VW_MODE=docker|native     how to run Vaultwarden           (default: docker)
+#   SSH_ADMIN_CIDR=<cidr>      admin subnet baked into nftables (HARDEN=1; fail-closed)
 #   HARDEN=1                  apply nftables + sshd hardening  (default: off)
 #   KIOSK_USER=soc            kiosk login user                 (default: soc)
 #   SVC_USER=socsvc           service user (autossh)           (default: socsvc)
@@ -52,6 +53,7 @@ SESSION_WAS_SET="${SESSION+yes}"
 SESSION="${SESSION:-auto}"
 VW_MODE="${VW_MODE:-docker}"
 HARDEN="${HARDEN:-0}"
+SSH_ADMIN_CIDR="${SSH_ADMIN_CIDR:-}"
 KIOSK_USER="${KIOSK_USER:-soc}"
 SVC_USER="${SVC_USER:-socsvc}"
 COMPOSITOR="${COMPOSITOR:-labwc}"
@@ -60,6 +62,8 @@ COMPOSITOR="${COMPOSITOR:-labwc}"
 # `systemctl start soc-wall`. kiosk: the tty1 takeover (autologin + multi-user
 # default target) for a dedicated SOC-wall appliance.
 INSTALL_MODE="${INSTALL_MODE:-desktop}"
+# scanner-deception tarpit on :80 — installed always, ENABLED only when opted in.
+SOC_TARPIT_ENABLE="${SOC_TARPIT_ENABLE:-0}"
 SKIP_PACKAGES="${SOC_SKIP_PACKAGES:-0}"
 DEPS_ONLY=0
 FRESH="${SOC_FRESH:-0}"
@@ -402,6 +406,35 @@ chmod +x "$SOC_ROOT"/vendor/iNode-VPN-Client/svpn-connect.sh \
 install -d -m 0755 /usr/local/bin
 install -m 0755 "$SOC_ROOT/scripts/litebw" /usr/local/bin/litebw
 
+# Deploy-time manifest: record every shipped file's sha256 + the source commit.
+# The wall reads /etc/soc-display/manifest.json at boot and warns in the top bar
+# if anything has drifted (tampered install, ad-hoc edit on the Pi). We hash
+# SOC_ROOT (the deployed tree) AND write a `.commit` sentinel into SOC_ROOT so
+# the manifest CLI can refresh it later (after a manual `rsync … /opt/soc-display/`)
+# without losing the source-commit anchor. Best-effort: if python3 / git aren't
+# available yet, skip and the wall just won't show the drift warning.
+log "Recording deploy manifest (file hashes + source commit)"
+if command -v python3 >/dev/null 2>&1; then
+  install -d -m 0755 "$ETC"
+  # Capture the source commit from SRC_DIR (it has the .git checkout).
+  src_commit="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [ -n "$src_commit" ]; then
+    printf '%s\n' "$src_commit" > "$SOC_ROOT/.commit"
+    chmod 0644 "$SOC_ROOT/.commit"
+  fi
+  # Write the manifest from SOC_ROOT (the deployed tree). _current_commit falls
+  # back to SOC_ROOT/.commit when SOC_ROOT itself has no .git.
+  PYTHONPATH="$SOC_ROOT/kiosk-host" python3 -c "
+from host import manifest
+import sys
+try:
+    p = manifest.write_manifest('$SOC_ROOT', dest='$ETC/manifest.json')
+    print(f'manifest: wrote {p}')
+except Exception as e:
+    sys.stderr.write(f'manifest: skipped ({e})\n')
+" || warn "could not write deploy manifest (drift detection disabled)"
+fi
+
 log "Creating Python venv"
 if [ ! -x "$SOC_ROOT/.venv/bin/python" ]; then
   python3 -m venv --system-site-packages "$SOC_ROOT/.venv" || \
@@ -562,9 +595,13 @@ want_tunnel(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$S
 want_vpn(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;v=config.load('$ETC/panels.yaml').vpn or {};k=config.vpn_kind(v);ok=bool(v.get('enabled')) and ((k=='fortinet' and v.get('gateway')) or (k in ('openvpn','wireguard') and v.get('config')));sys.exit(0 if ok else 1)"; }
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
-  log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall)"
+  log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall, soc-tarpit)"
   cp "$SOC_ROOT/systemd/autossh-tunnel.service" /etc/systemd/system/
   cp "$SOC_ROOT/systemd/forti-vpn.service" /etc/systemd/system/
+  # Scanner-deception tarpit on port 80. Installed but NEVER auto-enabled —
+  # opt-in with: SOC_TARPIT_ENABLE=1 in $ETC/tarpit.env, then
+  # `systemctl enable --now soc-tarpit`. See docs/SECURITY.md.
+  cp "$SOC_ROOT/systemd/soc-tarpit.service" /etc/systemd/system/
   # Supervised kiosk session (env baked in, no soc.env) — setup.py regenerates it
   # with the wizard's values. Installed but NOT enabled: switching the boot from
   # getty-autologin to this service must be validated on the target display (see
@@ -587,6 +624,22 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
     systemctl disable forti-vpn.service 2>/dev/null || true
     warn "no vpn in panels.yaml — VPN service left disabled"
   fi
+  # Tarpit: installed above, enabled ONLY on explicit opt-in. It also self-guards
+  # at runtime (refuses to start unless SOC_TARPIT_ENABLE=1 in tarpit.env), so we
+  # seed that env when enabling here. Without opt-in it stays disabled + dormant.
+  if [ "$SOC_TARPIT_ENABLE" = "1" ]; then
+    install -m 0644 /dev/stdin "$ETC/tarpit.env" <<'EOF'
+# Scanner-deception tarpit (port 80). Set to 1 to arm it; the unit refuses to
+# start otherwise. Installed by ./install.sh with SOC_TARPIT_ENABLE=1.
+SOC_TARPIT_ENABLE=1
+EOF
+    systemctl enable soc-tarpit.service 2>/dev/null \
+      && log "soc-tarpit enabled (SOC_TARPIT_ENABLE=1) — scanner-deception on :80" \
+      || warn "could not enable soc-tarpit.service"
+  else
+    systemctl disable soc-tarpit.service 2>/dev/null || true
+    log "soc-tarpit installed but disabled (opt-in: SOC_TARPIT_ENABLE=1 + tarpit.env)"
+  fi
 else
   warn "no systemd — skipping service installation. Supervise these by hand"
   warn "with your init (OpenRC/runit/sysvinit), all simple long-running commands:"
@@ -594,6 +647,41 @@ else
   warn "  autossh     : $SOC_ROOT/scripts/launcher.sh-style restart loop around autossh"
   warn "  forti-vpn   : $SOC_ROOT/.venv/bin/python $SOC_ROOT/scripts/forti-vpn-connect.py"
   warn "                (self-supervising: reconnect/backoff built in; run as root)"
+fi
+
+# --------------------------------------------------------------------------- #
+# sudoers drop-in: lets the soc user restart ONLY the VPN/tunnel/tarpit units
+# without a password, so ⚙ Settings → Save applies VPN edits LIVE (no "PENDING
+# restart" message) and the on-screen reconnect button + journalctl pane work
+# for the unprivileged kiosk user. This deploy line uses the SINGLE-VPN model
+# (forti-vpn.service); the sudoers file lists no @-instances. visudo -cf
+# validates a TEMP copy before we move it into /etc/sudoers.d, so a syntax
+# error can NEVER break the system-wide sudoers stack.
+SUDOERS_INSTALLED=0
+log "Installing sudoers drop-in (soc -> systemctl restart forti-vpn/tunnel/tarpit)"
+SUDOERS_SRC="$SOC_ROOT/security/soc-wall-restart.sudoers"
+SUDOERS_TMP="/etc/sudoers.d/.soc-wall-restart.tmp"
+SUDOERS_DST="/etc/sudoers.d/soc-wall-restart"
+if command -v visudo >/dev/null 2>&1 && [ -f "$SUDOERS_SRC" ]; then
+  # The sudoers file names the user literally as `soc`; when KIOSK_USER differs,
+  # rewrite the leading user field so the rule applies to the real kiosk user.
+  if [ "$KIOSK_USER" != "soc" ]; then
+    sed "s/^soc ALL=/$KIOSK_USER ALL=/" "$SUDOERS_SRC" > "$SUDOERS_TMP"
+    chmod 0440 "$SUDOERS_TMP"; chown root:root "$SUDOERS_TMP"
+  else
+    install -m 0440 -o root -g root "$SUDOERS_SRC" "$SUDOERS_TMP"
+  fi
+  if visudo -cf "$SUDOERS_TMP" >/dev/null 2>&1; then
+    mv -f "$SUDOERS_TMP" "$SUDOERS_DST"
+    SUDOERS_INSTALLED=1
+    log "  sudoers OK -> $SUDOERS_DST"
+  else
+    warn "  visudo rejected $SUDOERS_SRC — NOT installing; VPN/tunnel"
+    warn "  edits will continue to surface PENDING restart messages."
+    rm -f "$SUDOERS_TMP"
+  fi
+else
+  warn "  visudo not found OR sudoers source missing — skipping drop-in"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -780,9 +868,24 @@ fi
 if [ "$HARDEN" = "1" ]; then
   log "Applying hardening (nftables + sshd)"
   cp "$SOC_ROOT/security/nftables.conf" /etc/nftables.conf
+
+  # Optionally bake the admin subnet in from SSH_ADMIN_CIDR= (e.g. 192.168.1.0/24).
+  if [ -n "$SSH_ADMIN_CIDR" ]; then
+    sed -i "s|^define ssh_admin_cidr =.*|define ssh_admin_cidr = $SSH_ADMIN_CIDR    # set by installer|" \
+      /etc/nftables.conf
+  fi
+
+  # FAIL-CLOSED (SEC-1): never enable a ruleset that accepts SSH from the whole
+  # internet. Default is loopback-only; the operator must pick a real subnet.
+  eff_cidr="$(awk '/^define ssh_admin_cidr =/{print $4}' /etc/nftables.conf)"
+  if [ "$eff_cidr" = "0.0.0.0/0" ]; then
+    die "refusing to enable nftables: ssh_admin_cidr is 0.0.0.0/0 (SSH open to the world). Set a real admin subnet: SSH_ADMIN_CIDR=192.168.1.0/24 ./install.sh  (or edit /etc/nftables.conf)."
+  fi
+
   [ "$HAS_SYSTEMD" = "1" ] && systemctl enable nftables.service || \
     warn "no systemd — enable nftables with your init (e.g. rc-update add nftables)"
-  warn "review /etc/nftables.conf (set ssh_admin_cidr) before 'systemctl start nftables'"
+  log "nftables admin SSH source: $eff_cidr (egress is allowlisted — set vpn_gateways/jump_hosts in /etc/nftables.conf)"
+  warn "review /etc/nftables.conf egress sets (vpn_gateways, jump_hosts, dns_servers) before 'systemctl start nftables'"
   install -d /etc/ssh/sshd_config.d
   cp "$SOC_ROOT/security/sshd_hardening.conf" /etc/ssh/sshd_config.d/10-soc-hardening.conf
   warn "sshd hardening installed (key-only). Ensure you have an authorized key before reboot!"
@@ -823,6 +926,15 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
 
   # files on PATH / shared trees
   printf 'FILE|/usr/local/bin/litebw|litebw launcher (remove on uninstall)\n'
+  # deploy-time SHA-256 manifest (drift detection) lives under $ETC but is install
+  # metadata, not operator data -> always remove on uninstall (even keep-data).
+  printf 'FILE|%s/manifest.json|deploy file-hash manifest (remove on uninstall)\n' "$ETC"
+  # sudoers drop-in: only listed when actually installed (visudo-validated).
+  [ "$SUDOERS_INSTALLED" = "1" ] && \
+    printf 'FILE|/etc/sudoers.d/soc-wall-restart|soc -> systemctl restart vpn/tunnel/tarpit (remove on uninstall)\n'
+  # tarpit.env is install metadata (the arm-flag), seeded only with SOC_TARPIT_ENABLE=1.
+  [ "$SOC_TARPIT_ENABLE" = "1" ] && \
+    printf 'FILE|%s/tarpit.env|tarpit arm-flag (remove on uninstall)\n' "$ETC"
   [ -n "$DESKTOP_FILE" ] && printf 'FILE|%s|XDG desktop launcher (rebrand-generated; remove on uninstall)\n' "$DESKTOP_FILE"
   [ -n "$SETUP_DESKTOP_FILE" ] && printf 'FILE|%s|XDG setup launcher (remove on uninstall)\n' "$SETUP_DESKTOP_FILE"
   [ -n "$ICON_FILE" ]    && printf 'FILE|%s|app icon (remove on uninstall)\n' "$ICON_FILE"
@@ -835,6 +947,7 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
     printf 'UNIT|vaultwarden.service|%s\n' "$([ "$VW_MODE" = native ] && echo "/etc/systemd/system/vaultwarden.service" || echo "docker-run unit")"
     printf 'UNIT|autossh-tunnel.service|/etc/systemd/system/autossh-tunnel.service\n'
     printf 'UNIT|forti-vpn.service|/etc/systemd/system/forti-vpn.service\n'
+    printf 'UNIT|soc-tarpit.service|/etc/systemd/system/soc-tarpit.service\n'
     printf 'UNIT|soc-wall.service|/etc/systemd/system/soc-wall.service\n'
     [ "$INSTALL_MODE" = "kiosk" ] && \
       printf 'FILE|/etc/systemd/system/getty@tty1.service.d/override.conf|tty1 autologin drop-in (kiosk)\n'

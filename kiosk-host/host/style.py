@@ -79,6 +79,22 @@ window, grid, stack { background-color: #0b1020; }
 }
 .soc-gear:hover { background-color: rgba(47,79,208,0.85); color: #ffffff; }
 
+/* toolbar action buttons (Lock, VPN log) -- share the gear's look */
+.soc-toolbar-action {
+  background-color: rgba(20,28,54,0.72);
+  border: 1px solid rgba(126,150,255,0.35);
+  border-radius: 8px; padding: 3px 12px; margin: 0 2px;
+  color: #aeb9e6; font-size: 13px; font-weight: bold;
+}
+.soc-toolbar-action:hover { background-color: rgba(47,79,208,0.85); color: #ffffff; }
+
+/* boot-time file-integrity drift banner (above the toolbar) */
+.soc-warn-bar {
+  background-color: rgba(120,70,12,0.92);
+  border-bottom: 1px solid rgba(255,180,80,0.5);
+}
+.soc-warn-bar label { color: #ffe6c2; font-weight: bold; }
+
 /* top toolbar (always-visible controls; webviews can't paint over it) */
 .soc-toolbar {
   background-color: #0a0f1f;

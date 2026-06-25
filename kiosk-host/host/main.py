@@ -135,6 +135,17 @@ class KioskHost:
         self.panels_view = []          # live panel objects (WebKit/Chromium)
         self.wall = None               # WallWindow in single-window layout
         self._config_win = None        # the on-screen config window, when open
+        self._vpn_log_viewer = None    # live VPN-log viewer window, when open
+        # Kiosk locker: PIN/TOTP-gated transparent overlay. State files live
+        # under configwin.state_dir(). Built lazily so a missing module never
+        # blocks boot.
+        try:
+            from . import locker as _locker
+            from . import configwin as _cw
+            self._locker = _locker.KioskLocker(_cw.state_dir())
+        except Exception as e:         # noqa: BLE001
+            self._locker = None
+            log(f"kiosk locker unavailable: {e}")
 
     # creds callback handed to each panel
     def need_login(self, panel):
@@ -234,7 +245,10 @@ class KioskHost:
         if layout == "single":
             from .wall import WallWindow
             self.wall = WallWindow(self.conf, log, on_destroy=self.shutdown,
-                                   on_config=config_cb, on_vpn=self.vpn_action)
+                                   on_config=config_cb, on_vpn=self.vpn_action,
+                                   on_lock=(self._lock_wall
+                                            if self._locker is not None else None),
+                                   on_show_vpn_log=self.open_vpn_log_viewer)
 
         stagger = cfg.env_float("SOC_LAUNCH_STAGGER", 1.5, lo=0.0, hi=60.0)
         cdp_base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
@@ -264,6 +278,9 @@ class KioskHost:
         if self.wall is not None:
             self.wall.show()
             self._start_vpn_monitor()
+            # boot-time file-integrity check: warn on the top bar if the
+            # deployed tree has drifted from the install-time manifest.
+            self._check_deploy_drift()
         self._start_mem_watch()
 
     # ---- memory watchdog ---------------------------------------------------
@@ -361,21 +378,111 @@ class KioskHost:
             self.wall.set_vpn_status(css, label)
         return False
 
-    def _restart_vpn_service(self, ok_msg, fail_msg, on_done=None):
-        """Best-effort `systemctl restart forti-vpn` off the GTK thread (needs
-        privilege; the single unit supervises Fortinet/OpenVPN/WireGuard). Logs
-        ok_msg/fail_msg and, if given, schedules on_done() on the GTK loop."""
+    # ---- kiosk lock + VPN-log viewer --------------------------------------
+    def _lock_wall(self):
+        """Show the kiosk-lock overlay (toolbar 🔒 / Ctrl+Alt+L). Panels keep
+        rendering underneath; keyboard + mouse are inert until the operator
+        enters the PIN/TOTP (or the sealed setup PIN as an admin override)."""
+        if self._locker is None:
+            log("lock requested but the kiosk locker is unavailable")
+            return
+        try:
+            self._locker.lock(on_unlock=None)
+        except Exception as e:  # noqa: BLE001
+            log(f"lock failed: {e}")
+
+    def open_vpn_log_viewer(self):
+        """Open (or present) the live VPN log viewer — streams
+        `journalctl -u forti-vpn.service` so the operator sees every supervisor
+        step + error as it lands. Single-instance; SEPARATE from the reconnect
+        pill (this only observes, it never restarts the VPN)."""
+        try:
+            from . import vpn_log_viewer as _vlv
+        except Exception as e:                          # noqa: BLE001
+            log(f"vpn-log-viewer module unavailable: {e}")
+            return
+        if self._vpn_log_viewer is None:
+            self._vpn_log_viewer = _vlv.VpnLogViewer(
+                on_reconnect=self.vpn_action,
+                on_close=lambda: setattr(self, "_vpn_log_viewer", None))
+        self._vpn_log_viewer.show()
+
+    # ---- privileged systemctl ---------------------------------------------
+    def _can_systemctl_restart(self) -> bool:
+        """True iff this process can `systemctl restart` the wall's managed
+        units WITHOUT a password prompt. Three paths:
+
+          1. euid 0 — running as root (dev), trivially yes.
+          2. `sudo -n systemctl status forti-vpn.service` exits 0/3/4 —
+             /etc/sudoers.d/soc-wall-restart granted `soc` NOPASSWD systemctl
+             on a minimal allowlist (forti-vpn, autossh-tunnel). systemctl
+             status returns 0 (active), 3 (dead but loaded) or 4 (no such
+             unit) once it's run — any of those means we cleared sudo's auth
+             gate; sudo with no NOPASSWD rule returns 1 without ever running
+             systemctl.
+          3. Otherwise False.
+
+        Cached after the first probe so the apply path stays fast."""
+        import os as _os
+        if _os.geteuid() == 0:
+            return True
+        cached = getattr(self, "_sudo_systemctl_ok", None)
+        if cached is not None:
+            return cached
         import subprocess
+        ok = False
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "/usr/bin/systemctl", "status",
+                 "forti-vpn.service"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=4,
+            )
+            ok = r.returncode in (0, 3, 4)
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+        self._sudo_systemctl_ok = ok
+        return ok
+
+    def _privileged_systemctl(self, *args) -> "tuple[bool, str]":
+        """Run `systemctl <args>` with the minimum privilege needed: bare if
+        we're root, `sudo -n` if we have NOPASSWD coverage, else refuse
+        (returning False) so the caller can surface a clean message. Returns
+        (ok, stdout-or-stderr)."""
+        import os as _os
+        import subprocess
+        if _os.geteuid() != 0 and not self._can_systemctl_restart():
+            return False, "no NOPASSWD sudo for systemctl"
+        cmd = ["/usr/bin/systemctl", *args] if _os.geteuid() == 0 \
+            else ["sudo", "-n", "/usr/bin/systemctl", *args]
+        try:
+            r = subprocess.run(cmd, timeout=15,
+                               stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               text=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"systemctl invocation failed: {e}"
+        if r.returncode == 0:
+            return True, (r.stdout or "ok").strip()
+        return False, (r.stderr or r.stdout or "").strip()
+
+    def _restart_vpn_service(self, ok_msg, fail_msg, on_done=None):
+        """Restart `forti-vpn.service` off the GTK thread via the privileged
+        path (root, or the NOPASSWD sudoers drop-in install.sh writes). The
+        single unit supervises Fortinet/OpenVPN/WireGuard. On failure the
+        systemctl stderr is surfaced (no longer swallowed) so the operator
+        knows why the reconnect didn't take. Schedules on_done() if given."""
         import threading
 
         def work():
-            try:
-                subprocess.run(["systemctl", "restart", "forti-vpn"],
-                               timeout=10, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ok, info = self._privileged_systemctl("restart", "forti-vpn.service")
+            if ok:
                 log(ok_msg)
-            except Exception as e:  # noqa: BLE001
-                log(f"{fail_msg} ({e})")
+            else:
+                log(f"{fail_msg} ({info})")
             if on_done is not None:
                 on_done()
         threading.Thread(target=work, daemon=True).start()
@@ -412,6 +519,41 @@ class KioskHost:
         except Exception as e:  # noqa: BLE001 — never let the config UI kill the wall
             self._config_win = None
             log(f"config window failed to open: {e}")
+
+    def _check_deploy_drift(self):
+        """Compare on-disk file hashes against the deploy-time manifest and
+        paint a top-bar warning if anything has drifted. Best-effort +
+        non-fatal: a missing/unreadable manifest, or any other error, is logged
+        and skipped — the warning only appears when we positively find drift."""
+        if self.wall is None:
+            return
+        try:
+            from . import manifest as _mf
+        except Exception as e:                         # noqa: BLE001
+            log(f"manifest check skipped: import failed ({e})")
+            return
+        deploy_root = os.environ.get("SOC_DEPLOY_ROOT", "/opt/soc-display")
+        try:
+            drift = _mf.check_drift(deploy_root)
+        except FileNotFoundError:
+            log(f"manifest check skipped: no manifest at "
+                f"{_mf.MANIFEST_PATH} (re-run install.sh to enable)")
+            return
+        except (OSError, ValueError, KeyError) as e:
+            log(f"manifest check skipped: {e}")
+            return
+        msg = _mf.format_drift_summary(drift)
+        if msg:
+            # Pass the full drift dict so wall.py can open a detail modal
+            # listing changed / missing / extras + a link to the deployed
+            # commit on GitHub.
+            self.wall.show_top_bar_warning(msg, detail=drift)
+            log(f"file drift detected: {len(drift['changed'])} changed, "
+                f"{len(drift['missing'])} missing, "
+                f"{len(drift['extras'])} extras (commit "
+                f"{(drift.get('commit') or 'unknown')[:12]})")
+        else:
+            log("manifest check ok — no drift")
 
     def _config_closed(self):
         self._config_win = None
@@ -667,4 +809,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Ctrl+C during boot (or any point before/after Gtk.main) should exit
+    # cleanly (rc 0) so the launcher loop respawns without printing a
+    # noisy KeyboardInterrupt traceback. Inside Gtk.main, SIGINT is
+    # handled by the GLib.unix_signal_add hook + host.shutdown.
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\n[soc-kiosk] interrupted (Ctrl+C); exiting cleanly\n")
+        sys.exit(0)

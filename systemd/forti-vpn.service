@@ -50,6 +50,18 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PPPOX AF_PACKET
 # /dev/net/tun.)
 RestrictRealtime=yes
 LockPersonality=yes
+# SEC-5: defense-in-depth that does NOT touch the routing/device/netlink access
+# the backends rely on. (Kept conservative on purpose: ProtectSystem stays
+# `true` not `strict`, no SystemCallFilter, so openfortivpn/openvpn/wg-quick all
+# keep working. Validate any tighter setting against all three on real hardware.)
+SystemCallArchitectures=native
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+RemoveIPC=yes
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

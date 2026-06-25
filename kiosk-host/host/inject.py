@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 _DEFAULT_TMPL = os.path.join(os.path.dirname(__file__), "..", "..", "inject", "login.js.tmpl")
 
@@ -23,6 +24,26 @@ def _template() -> str:
     path = os.environ.get("SOC_INJECT_TMPL", _DEFAULT_TMPL)
     with open(os.path.abspath(path), "r", encoding="utf-8") as fh:
         return fh.read()
+
+
+def panel_origin(url: str) -> str:
+    """Browser-style origin (scheme://host[:port], default ports omitted) for a
+    panel's effective_url — matches JS `location.origin`. Returns '' if not
+    derivable (non-http(s) / no host), which leaves the autofill origin gate
+    unset (legacy fill-anywhere behaviour). Used to gate credential injection
+    to the panel's configured origin (see inject/login.js.tmpl)."""
+    try:
+        u = urlsplit(url or "")
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return ""
+        host = u.hostname
+        default = 443 if u.scheme == "https" else 80
+        port = u.port
+        if port and port != default:
+            return f"{u.scheme}://{host}:{port}"
+        return f"{u.scheme}://{host}"
+    except ValueError:
+        return ""
 
 
 def bootstrap_js(panel, mode: str) -> str:
@@ -36,15 +57,21 @@ def bootstrap_js(panel, mode: str) -> str:
     if panel.keepalive.target:
         ka["target"] = panel.keepalive.target
 
+    # Origin gate: socLogin refuses to fill creds on any origin other than the
+    # panel's configured one (defends against open redirects / a compromised
+    # dashboard navigating off-site). '' (non-http(s) url) = legacy no-gate.
+    origin = panel_origin(getattr(panel, "effective_url", "") or "")
+
     # token (including surrounding quotes where present) -> replacement literal
     repl = {
-        '"{{PANEL_ID}}"':     json.dumps(panel.id),
-        '"{{MODE}}"':         json.dumps(mode),
-        '"{{USER_SEL}}"':     json.dumps(sel.get("user", "")),
-        '"{{PASS_SEL}}"':     json.dumps(sel.get("pass", "")),
-        '"{{SUBMIT_SEL}}"':   json.dumps(sel.get("submit", "")),
-        '"{{LOGIN_MARKER}}"': json.dumps(panel.login_marker),
-        "{{KEEPALIVE_JSON}}": json.dumps(ka),
+        '"{{PANEL_ID}}"':       json.dumps(panel.id),
+        '"{{MODE}}"':           json.dumps(mode),
+        '"{{USER_SEL}}"':       json.dumps(sel.get("user", "")),
+        '"{{PASS_SEL}}"':       json.dumps(sel.get("pass", "")),
+        '"{{SUBMIT_SEL}}"':     json.dumps(sel.get("submit", "")),
+        '"{{LOGIN_MARKER}}"':   json.dumps(panel.login_marker),
+        '"{{ALLOWED_ORIGIN}}"': json.dumps(origin),
+        "{{KEEPALIVE_JSON}}":   json.dumps(ka),
     }
     js = _template()
     for token, value in repl.items():

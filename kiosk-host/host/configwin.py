@@ -29,6 +29,9 @@ from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
 from . import config as cfg  # noqa: E402
 from . import style  # noqa: E402
+from . import complexity as _cx  # noqa: E402
+from . import locker as _lk  # noqa: E402
+from . import totp as _totp  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -602,10 +605,21 @@ class ConfigWindow(Gtk.Window):
         return box
 
     def _build_security(self):
-        exp = Gtk.Expander(label="Security — lock PIN")
+        exp = Gtk.Expander(label="Security — lock PIN / panel lock")
         exp.get_style_context().add_class("soc-config-sec")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.set_border_width(8)
+        note = Gtk.Label(label=(
+            "'Settings PIN' gates THIS window so a passer-by can't repoint the "
+            "wall. 'Panel lock' is the 🔒 button / Ctrl+Alt+L input firewall — "
+            "enrol a PIN and/or TOTP here or that lock is decorative."))
+        note.get_style_context().add_class("soc-config-sub")
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        box.pack_start(note, False, False, 0)
+
+        # --- Settings-gate PIN (config.pin — opens this window) ----------- #
+        sgate = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         state = ("A PIN is set — it is required to open this window."
                  if pin_is_set() else
                  "No PIN set — anyone can open this window. Set one to lock it.")
@@ -613,14 +627,19 @@ class ConfigWindow(Gtk.Window):
         self._sec_state.get_style_context().add_class("soc-config-sub")
         self._sec_state.set_xalign(0.0)
         self._sec_state.set_line_wrap(True)
-        box.pack_start(self._sec_state, False, False, 0)
+        sgate.pack_start(self._sec_state, False, False, 0)
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._newpin = Gtk.Entry()
         self._newpin.set_visibility(False)
         self._newpin.set_input_purpose(Gtk.InputPurpose.DIGITS)
-        self._newpin.set_placeholder_text("new PIN")
+        self._newpin.set_placeholder_text("new Settings PIN")
         self._newpin.set_hexpand(True)
+        self._sgate_cx = Gtk.Label(label="")
+        self._sgate_cx.set_xalign(0.0)
+        self._sgate_cx.set_line_wrap(True)
+        self._newpin.connect(
+            "changed", lambda e: self._cx_hint(e, self._sgate_cx))
         set_b = Gtk.Button(label="Set / change PIN")
         set_b.connect("clicked", lambda *_: self._set_pin())
         clr_b = Gtk.Button(label="Remove PIN")
@@ -628,14 +647,41 @@ class ConfigWindow(Gtk.Window):
         row.pack_start(self._newpin, True, True, 0)
         row.pack_start(set_b, False, False, 0)
         row.pack_start(clr_b, False, False, 0)
-        box.pack_start(row, False, False, 0)
+        sgate.pack_start(row, False, False, 0)
+        sgate.pack_start(self._sgate_cx, False, False, 0)
+        box.pack_start(self._frame("Settings access (this window)", sgate),
+                       False, False, 0)
+
+        # --- Panel-lock PIN + TOTP (the 🔒 input firewall over the wall) -- #
+        box.pack_start(self._build_panel_lock_section(), False, False, 0)
         exp.add(box)
         return exp
 
+    @staticmethod
+    def _frame(title, child):
+        f = Gtk.Frame(label=f"  {title}  ")
+        f.add(child)
+        return f
+
+    def _cx_hint(self, entry, label):
+        """Live PIN-complexity feedback on `label` for the text in `entry`."""
+        v = entry.get_text()
+        ctx = label.get_style_context()
+        ctx.remove_class("soc-config-ok")
+        ctx.remove_class("soc-config-error")
+        if not v:
+            label.set_text("")
+            return
+        r = _cx.check(v, kind="pin")
+        ctx.add_class("soc-config-ok" if r.ok else "soc-config-error")
+        label.set_text("✓ meets PIN policy" if r.ok
+                       else "✗ " + "; ".join(r.issues))
+
     def _set_pin(self):
         pin = self._newpin.get_text().strip()
-        if len(pin) < 4:
-            self._sec_state.set_text("PIN must be at least 4 digits.")
+        r = _cx.check(pin, kind="pin")
+        if not r.ok:
+            self._sec_state.set_text("PIN rejected — " + "; ".join(r.issues))
             return
         set_pin(pin)
         self._newpin.set_text("")
@@ -645,6 +691,92 @@ class ConfigWindow(Gtk.Window):
         clear_pin()
         self._newpin.set_text("")
         self._sec_state.set_text("PIN removed — the window now opens without one.")
+
+    # --- panel-lock (locker.py) enrollment ---------------------------------- #
+    def _panel_lock_status_text(self) -> str:
+        sd = state_dir()
+        bits = ["PIN: SET ✓" if _lk.pin_is_set(sd) else "PIN: (none)",
+                "TOTP: SET ✓" if _lk.totp_is_set(sd) else "TOTP: (none)"]
+        return "  ·  ".join(bits)
+
+    def _build_panel_lock_section(self):
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        inner.set_border_width(6)
+        self._pl_state = Gtk.Label(label=self._panel_lock_status_text())
+        self._pl_state.get_style_context().add_class("soc-config-sub")
+        self._pl_state.set_xalign(0.0)
+        self._pl_state.set_line_wrap(True)
+        inner.pack_start(self._pl_state, False, False, 0)
+
+        # PIN row + live complexity hint
+        prow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._pl_pin = Gtk.Entry()
+        self._pl_pin.set_visibility(False)
+        self._pl_pin.set_input_purpose(Gtk.InputPurpose.PIN)
+        self._pl_pin.set_placeholder_text("new panel-lock PIN")
+        self._pl_pin.set_hexpand(True)
+        self._pl_cx = Gtk.Label(label="")
+        self._pl_cx.set_xalign(0.0)
+        self._pl_cx.set_line_wrap(True)
+        self._pl_pin.connect("changed", lambda e: self._cx_hint(e, self._pl_cx))
+        pset = Gtk.Button(label="Set PIN")
+        pset.connect("clicked", lambda *_: self._pl_set_pin())
+        pclr = Gtk.Button(label="Remove PIN")
+        pclr.connect("clicked", lambda *_: self._pl_clear_pin())
+        prow.pack_start(self._pl_pin, True, True, 0)
+        prow.pack_start(pset, False, False, 0)
+        prow.pack_start(pclr, False, False, 0)
+        inner.pack_start(prow, False, False, 0)
+        inner.pack_start(self._pl_cx, False, False, 0)
+
+        # TOTP row — Enroll mints a fresh secret + shows the otpauth:// URI the
+        # operator pastes into their authenticator (no qrencode dep pulled in).
+        trow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._pl_uri = Gtk.Entry()
+        self._pl_uri.set_editable(False)
+        self._pl_uri.set_hexpand(True)
+        self._pl_uri.set_placeholder_text("otpauth://… (appears after Enroll)")
+        tset = Gtk.Button(label="Enroll TOTP")
+        tset.connect("clicked", lambda *_: self._pl_enroll_totp())
+        tclr = Gtk.Button(label="Remove TOTP")
+        tclr.connect("clicked", lambda *_: self._pl_clear_totp())
+        trow.pack_start(self._pl_uri, True, True, 0)
+        trow.pack_start(tset, False, False, 0)
+        trow.pack_start(tclr, False, False, 0)
+        inner.pack_start(trow, False, False, 0)
+        return self._frame("Panel lock (input firewall over the wall)", inner)
+
+    def _pl_set_pin(self):
+        pin = self._pl_pin.get_text().strip()
+        r = _cx.check(pin, kind="pin")
+        if not r.ok:
+            self._pl_state.set_text("PIN rejected — " + "; ".join(r.issues))
+            return
+        _lk.set_pin(state_dir(), pin)
+        self._pl_pin.set_text("")
+        self._pl_state.set_text(self._panel_lock_status_text())
+
+    def _pl_clear_pin(self):
+        _lk.clear_pin(state_dir())
+        self._pl_pin.set_text("")
+        self._pl_state.set_text(self._panel_lock_status_text())
+
+    def _pl_enroll_totp(self):
+        try:
+            s = _totp.generate_secret()
+            _totp.save(_lk._totp_path(state_dir()), s)
+            self._pl_uri.set_text(_totp.provision_uri(
+                s, "kiosk@soc.local", issuer="SOC Wall — Panel lock"))
+            self._pl_state.set_text(
+                "TOTP enrolled — paste the URI into your authenticator app "
+                "(or scan via `qrencode -t ANSIUTF8 '<uri>'`).")
+        except Exception as e:                              # noqa: BLE001
+            self._pl_state.set_text(f"could not enrol TOTP: {e}")
+
+    def _pl_clear_totp(self):
+        _totp.clear(_lk._totp_path(state_dir()))
+        self._pl_uri.set_text("")
+        self._pl_state.set_text(self._panel_lock_status_text())
 
     # ---- apply -------------------------------------------------------------
     def _msg(self, text, error=False):

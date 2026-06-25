@@ -118,12 +118,38 @@ def test_inject_substitution_and_escaping():
     p1 = conf.panels[0]
     js = inject.bootstrap_js(p1, mode="webkit")
     for tok in ("{{PANEL_ID}}", "{{USER_SEL}}", "{{PASS_SEL}}", "{{SUBMIT_SEL}}",
-                "{{LOGIN_MARKER}}", "{{MODE}}", "{{KEEPALIVE_JSON}}"):
+                "{{LOGIN_MARKER}}", "{{MODE}}", "{{KEEPALIVE_JSON}}",
+                "{{ALLOWED_ORIGIN}}"):
         assert tok not in js                          # every placeholder filled
     assert '"p1"' in js
     assert '"reload"' in js and "42" in js
     # a selector containing a double quote must be JSON-escaped, not raw
     assert 'input[name=\\"pw\\"]' in js
+    # autofill origin gate: filled from the panel's effective_url origin
+    # (default ports omitted; non-default port kept) — matches location.origin.
+    assert '"http://10.0.0.1:3000"' in js
+
+
+def test_inject_panel_origin():
+    # http(s) origins: scheme + host, default ports omitted, others kept.
+    assert inject.panel_origin("http://10.0.0.1:3000/login") == "http://10.0.0.1:3000"
+    assert inject.panel_origin("https://soc.example/path?q=1") == "https://soc.example"
+    assert inject.panel_origin("http://host:80/x") == "http://host"
+    assert inject.panel_origin("https://host:443/x") == "https://host"
+    # non-http(s) / unparseable -> '' (gate stays unset = legacy fill-anywhere).
+    assert inject.panel_origin("") == ""
+    assert inject.panel_origin("file:///etc/passwd") == ""
+    assert inject.panel_origin("data:text/html,x") == ""
+
+
+def test_inject_origin_gate_unset_for_tunnel_without_port():
+    # A tunnel panel whose local_port isn't resolved yet has no effective_url,
+    # so the gate stays unset ('') rather than blocking all autofill.
+    conf = _load()
+    p2 = conf.panels[1]
+    p2.tunnel = {}                                    # drop local_port
+    js = inject.bootstrap_js(p2, mode="chromium")
+    assert 'allowedOrigin: ""' in js
 
     call = inject.login_call({"user": 'a"b', "pass": "p\\x"})
     assert '\\"' in call                               # quote escaped
@@ -955,15 +981,26 @@ def test_heaviest_panel_picks_max_rss():
 
 def _run_restart_vpn_service(hostmain, monkeypatch, *, fail):
     """Drive KioskHost._restart_vpn_service synchronously: stub the worker thread
-    to run inline, capture log lines, and record the subprocess.run call."""
+    to run inline, capture log lines, and record the subprocess.run call.
+
+    Forces euid 0 so the privileged path takes the bare `/usr/bin/systemctl`
+    form (no `sudo -n` prefix) — the helper restarts forti-vpn.service through
+    _privileged_systemctl and surfaces stderr on failure."""
     calls = {}
     logs = []
+
+    class _Res:
+        def __init__(self, rc, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
 
     def fake_run(argv, **kw):
         calls["argv"] = argv
         calls["kw"] = kw
         if fail:
-            raise PermissionError("nope")
+            return _Res(1, "", "Failed to restart forti-vpn.service: access denied")
+        return _Res(0, "ok", "")
 
     class InlineThread:
         def __init__(self, target, daemon=None):
@@ -972,8 +1009,10 @@ def _run_restart_vpn_service(hostmain, monkeypatch, *, fail):
         def start(self):
             self._target()
 
+    import os as _os
     import subprocess as _sub
     import threading as _thr
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)   # root path: bare systemctl
     monkeypatch.setattr(_sub, "run", fake_run)
     monkeypatch.setattr(_thr, "Thread", InlineThread)
     monkeypatch.setattr(hostmain, "log", logs.append)
@@ -988,24 +1027,72 @@ def test_restart_vpn_service_shape_and_on_done(monkeypatch):
     from host import main as hostmain
 
     calls, logs, done = _run_restart_vpn_service(hostmain, monkeypatch, fail=False)
-    # exact subprocess shape: argv, timeout, all three streams to DEVNULL
-    assert calls["argv"] == ["systemctl", "restart", "forti-vpn"]
-    assert calls["kw"]["timeout"] == 10
+    # privileged path (euid 0): bare /usr/bin/systemctl, full unit name, PIPE
+    # streams (so stderr can be surfaced), 15s timeout.
+    assert calls["argv"] == ["/usr/bin/systemctl", "restart", "forti-vpn.service"]
+    assert calls["kw"]["timeout"] == 15
     import subprocess
     assert calls["kw"]["stdin"] == subprocess.DEVNULL
-    assert calls["kw"]["stdout"] == subprocess.DEVNULL
-    assert calls["kw"]["stderr"] == subprocess.DEVNULL
+    assert calls["kw"]["stdout"] == subprocess.PIPE
+    assert calls["kw"]["stderr"] == subprocess.PIPE
     assert logs == ["ok!"]                           # success message
     assert done == [True]                            # on_done ran
 
 
-def test_restart_vpn_service_failure_still_runs_on_done(monkeypatch):
+def test_restart_vpn_service_failure_surfaces_stderr_and_runs_on_done(monkeypatch):
     from host import main as hostmain
 
     calls, logs, done = _run_restart_vpn_service(hostmain, monkeypatch, fail=True)
-    assert calls["argv"] == ["systemctl", "restart", "forti-vpn"]
-    assert len(logs) == 1 and logs[0].startswith("bad!")   # fail message + (exc)
-    assert done == [True]                                  # on_done runs after except
+    assert calls["argv"] == ["/usr/bin/systemctl", "restart", "forti-vpn.service"]
+    # fail message now carries the systemctl stderr (no longer swallowed)
+    assert len(logs) == 1 and logs[0].startswith("bad!")
+    assert "access denied" in logs[0]
+    assert done == [True]                                  # on_done still runs
+
+
+def test_can_systemctl_restart_root_is_true(monkeypatch):
+    from host import main as hostmain
+    import os as _os
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    app = object.__new__(hostmain.KioskHost)
+    assert app._can_systemctl_restart() is True
+
+
+def test_can_systemctl_restart_probe_shape_and_rc(monkeypatch):
+    """Non-root: probes `sudo -n systemctl status forti-vpn.service`. rc 0/3/4
+    means we cleared sudo's auth gate (NOPASSWD present); rc 1 means no rule.
+    Result is cached so repeat calls don't re-probe."""
+    from host import main as hostmain
+    import os as _os
+    import subprocess as _sub
+    monkeypatch.setattr(_os, "geteuid", lambda: 1000)
+    seen = {}
+
+    class _Res:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    def make_run(rc):
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            seen["n"] = seen.get("n", 0) + 1
+            return _Res(rc)
+        return fake_run
+
+    # rc 4 (no such unit) still means the sudoers gate passed -> True
+    monkeypatch.setattr(_sub, "run", make_run(4))
+    app = object.__new__(hostmain.KioskHost)
+    assert app._can_systemctl_restart() is True
+    assert seen["argv"] == ["sudo", "-n", "/usr/bin/systemctl", "status",
+                            "forti-vpn.service"]
+    # cached: a second call must NOT re-probe
+    app._can_systemctl_restart()
+    assert seen["n"] == 1
+
+    # rc 1 (sudo: a password is required) -> no NOPASSWD rule -> False
+    monkeypatch.setattr(_sub, "run", make_run(1))
+    app2 = object.__new__(hostmain.KioskHost)
+    assert app2._can_systemctl_restart() is False
 
 
 # --------------------------------------------------------------------------- #
