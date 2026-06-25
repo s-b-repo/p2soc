@@ -43,6 +43,18 @@ import time
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
+
+def _configpaths():
+    """The shared read/write-location resolver (host.configpaths). Imported lazily
+    via the same kiosk-host sys.path shim the rest of setup.py uses for host.* —
+    it is pure stdlib, so this works before the venv exists. The writer and the
+    reader resolve through this ONE module so they cannot disagree."""
+    if os.path.join(REPO, "kiosk-host") not in sys.path:
+        sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
+    from host import configpaths  # type: ignore
+    return configpaths
+
+
 # --------------------------------------------------------------------------- #
 # Terminal helpers
 # --------------------------------------------------------------------------- #
@@ -1133,11 +1145,24 @@ def _alive(url):
 
 def cmd_doctor(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
-    soc_env = load_env_file(paths["soc_env"])
+    # Doctor must diagnose the file the WALL ACTUALLY READS (the shared resolver),
+    # not just where the wizard would write — so a write/read mismatch surfaces
+    # instead of being masked. Fall back to the write target if nothing is resolved.
+    cp = _configpaths()
+    read_env, env_label = cp.resolve_read("env")
+    read_panels, panels_label = cp.resolve_read("panels")
+    soc_env_path = read_env or paths["soc_env"]
+    panels_path = read_panels or paths["panels_installed"]
+    soc_env = load_env_file(soc_env_path)
     banner("SOC video-wall · doctor")
-    print(f"   target {bold(target)}   soc.env {paths['soc_env']}")
+    print(f"   target {bold(target)}   soc.env {soc_env_path} ({env_label})")
+    print(f"   panels {panels_path} ({panels_label})")
+    # If the wizard's write target differs from what the wall reads, say so loudly.
+    if (read_panels and os.path.abspath(read_panels) != os.path.abspath(paths["panels_installed"])):
+        warn(f"the wall reads {read_panels} but the wizard would write "
+             f"{paths['panels_installed']} — run `python3 -m host.configpaths --explain`")
     d = _Doc()
 
     d.check("venv + Python deps", lambda: _probe_venv(paths.get("soc_root", REPO) + "/.venv/bin/python")
@@ -1174,7 +1199,7 @@ def cmd_doctor(args) -> int:
     try:
         sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
         from host import config as hostcfg  # type: ignore
-        conf = hostcfg.load(paths["panels_installed"])
+        conf = hostcfg.load(panels_path)
         d.check("panels.yaml parses", lambda: (
             "OK", f"{len(conf.panels)} panels"
             + (f", {len(conf.warnings)} warning(s)" if conf.warnings else ""), ""))
@@ -1354,7 +1379,7 @@ def cmd_doctor(args) -> int:
 
 def cmd_repair(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
     root = paths.get("soc_root", REPO)
     banner("SOC video-wall · repair")
@@ -1490,7 +1515,7 @@ def cmd_wizard_gui(args) -> int:
 def cmd_menu(args) -> int:
     """Interactive launcher — the default when run with no subcommand on a TTY."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     banner("SOC video-wall · setup")
     print(f"   target   : {bold(target)}  "
           f"({'Raspberry Pi / root' if target == 'pi' else 'dev workstation'})")
@@ -1684,7 +1709,7 @@ def cmd_firstrun(args) -> int:
     Gathers inputs interactively, then delegates the mechanical seal/store to
     ``seal_master`` (shared verbatim with the GUI wizard)."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
     soc_env = load_env_file(paths["soc_env"])
     banner("SOC video-wall · first-time setup (PIN + seal)")
@@ -1859,6 +1884,16 @@ def clean_state(paths, args) -> None:
         else os.path.join(REPO, "dev", "run", "state"))
     targets = [paths["panels_out"], paths["soc_env"],
                paths["secret_dir"], state]
+    # Removing the per-user `active` marker hands control back to /etc on a
+    # redeploy (else a lingering marker would shadow the re-deployed system config —
+    # the inverse of the bug this resolver fixes). Always clear it, even when the
+    # current write target is /etc, so a prior user fallback can't linger.
+    try:
+        marker = paths.get("marker") or _configpaths().active_marker()
+        if marker:
+            targets.append(marker)
+    except Exception:  # noqa: BLE001 — resolver optional during clean
+        pass
     if paths["mode"] == "dev":
         targets.append(os.path.join(REPO, "dev", "run"))
     note("will remove (files are backed up first):")
@@ -1889,7 +1924,7 @@ def cmd_deploy(args) -> int:
     seal PIN -> push config + creds -> health check. Each step asks first, so it
     is safe to run (and re-run) interactively."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
     banner("SOC video-wall · deploy (end to end)")
     if getattr(args, "clean", False):
@@ -1994,12 +2029,17 @@ def cmd_deploy(args) -> int:
 
 def cmd_creds(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
-    soc_env = load_env_file(paths["soc_env"])
-    cfg = load_yaml(paths["panels_installed"]) or {}
+    # Store logins against the config the WALL ACTUALLY READS (shared resolver),
+    # not just the wizard's write target — they agree on a deployed box, but the
+    # resolver is the single source of truth so creds can never target a dead file.
+    cp = _configpaths()
+    soc_env = load_env_file(cp.resolve_env() or paths["soc_env"])
+    panels_path = cp.resolve_panels() or paths["panels_installed"]
+    cfg = load_yaml(panels_path) or {}
     if not cfg.get("panels"):
-        err(f"no config found at {paths['panels_installed']} — run the wizard first")
+        err(f"no config found at {panels_path} — run the wizard first")
         return 1
     store_credentials(soc_env, cfg, args.dry_run)
     return 0
@@ -2008,36 +2048,141 @@ def cmd_creds(args) -> int:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def resolve_paths(target: str) -> dict:
-    if target == "pi":
+def resolve_paths(target: str, *, can_escalate: bool = False) -> dict:
+    """Where the wizard WRITES — derived from the SHARED resolver (host.configpaths)
+    so what we write is exactly what the wall (resolving with the same logic) reads.
+
+    target:
+      'dev'   -> force the repo checkout (config/panels.local.yaml, .env). Explicit,
+                 deterministic — tests and `--target dev` rely on this verbatim.
+      'pi' / 'auto' -> the highest-precedence location THIS euid can write:
+                 /etc/soc-display when root (or escalated), else the per-user
+                 ~/.config/soc-display + an `active` marker so the wall picks it up.
+
+    The dict shape (keys) is unchanged so doctor/creds/deploy/wizard/setupgui keep
+    working. New keys: 'via' (env|etc|user|repo), 'marker' (path or None),
+    'needs_privilege' (pkexec required)."""
+    if target == "dev":
         return dict(
-            mode="pi",
-            panels_out="/etc/soc-display/panels.yaml",
-            panels_installed="/etc/soc-display/panels.yaml",
-            soc_env="/etc/soc-display/soc.env",
-            wall_unit="/etc/systemd/system/soc-wall.service",
-            soc_root="/opt/soc-display",
-            pinentry="/opt/soc-display/scripts/pinentry-vault.py",
-            secret_dir="/etc/soc-display/secret",
+            mode="dev", via="repo", marker=None, needs_privilege=False,
+            panels_out=os.path.join(REPO, "config", "panels.local.yaml"),
+            panels_installed=os.path.join(REPO, "config", "panels.local.yaml"),
+            soc_env=os.path.join(REPO, ".env"),
+            wall_unit=os.path.join(REPO, "dev", "run", "soc-wall.service"),
+            soc_root=REPO,
+            pinentry=os.path.join(REPO, "scripts", "pinentry-vault.py"),
+            secret_dir=os.path.join(REPO, "dev", "run", "secret"),
             config_vault_item="SOC Wall Config",
-            inject_tmpl="/opt/soc-display/inject/login.js.tmpl",
-            default_backend="litebw",
-            panels_mode=0o644, env_mode=0o640,
+            inject_tmpl=os.path.join(REPO, "inject", "login.js.tmpl"),
+            default_backend="dev",
+            panels_mode=0o644, env_mode=0o600,
         )
+
+    # 'pi'/'auto': ask the shared resolver where this user can actually write.
+    cp = _configpaths()
+    pw = cp.resolve_write("panels", want_etc=True, can_escalate=can_escalate)
+    ew = cp.resolve_write("env", want_etc=True, can_escalate=can_escalate)
+    via = pw["via"]
+    if via in ("etc", "env"):
+        # Canonical deployed (or an explicit override pointing at the system tree).
+        soc_root = "/opt/soc-display"
+        secret_dir = "/etc/soc-display/secret"
+        wall_unit = "/etc/systemd/system/soc-wall.service"
+        inject_tmpl = "/opt/soc-display/inject/login.js.tmpl"
+    else:
+        # Per-user fallback: the sealed master must live where THIS user can read it,
+        # so secret_dir rides alongside the user-dir panels.yaml. No systemd unit
+        # (a per-user desktop wall is launched from the menu, not via root systemd).
+        soc_root = "/opt/soc-display" if os.path.isdir("/opt/soc-display") else REPO
+        secret_dir = os.path.join(cp.user_dir(), "secret")
+        wall_unit = None
+        inject_tmpl = os.path.join(soc_root, "inject", "login.js.tmpl")
     return dict(
-        mode="dev",
-        panels_out=os.path.join(REPO, "config", "panels.local.yaml"),
-        panels_installed=os.path.join(REPO, "config", "panels.local.yaml"),
-        soc_env=os.path.join(REPO, ".env"),
-        wall_unit=os.path.join(REPO, "dev", "run", "soc-wall.service"),
-        soc_root=REPO,
-        pinentry=os.path.join(REPO, "scripts", "pinentry-vault.py"),
-        secret_dir=os.path.join(REPO, "dev", "run", "secret"),
+        mode="pi", via=via, marker=pw.get("marker"),
+        needs_privilege=pw.get("needs_privilege", False),
+        panels_out=pw["path"],
+        panels_installed=pw["path"],
+        soc_env=ew["path"],
+        wall_unit=wall_unit,
+        soc_root=soc_root,
+        pinentry=os.path.join(soc_root, "scripts", "pinentry-vault.py"),
+        secret_dir=secret_dir,
         config_vault_item="SOC Wall Config",
-        inject_tmpl=os.path.join(REPO, "inject", "login.js.tmpl"),
-        default_backend="dev",
-        panels_mode=0o644, env_mode=0o600,
+        inject_tmpl=inject_tmpl,
+        default_backend="litebw",
+        panels_mode=pw["mode"], env_mode=ew["mode"],
     )
+
+
+def _drop_marker(paths: dict, dry: bool):
+    """When the wizard fell back to the per-user config dir, write the `active`
+    marker so the reader's marker-gated user tier picks THIS file up over a stale
+    /etc. The marker records the path it claims + a timestamp + the writer euid so
+    doctor --explain can show 'user config active since … (uid N)'."""
+    marker = paths.get("marker")
+    if not marker:
+        return
+    if dry:
+        print(yellow(f"   [dry-run] would activate per-user config: {marker}"))
+        return
+    os.makedirs(os.path.dirname(marker), 0o700, exist_ok=True)
+    body = (f"{paths['panels_out']}\n"
+            f"# activated {time.strftime('%Y-%m-%dT%H:%M:%S%z')} by uid {os.geteuid()}\n")
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    note(f"activated per-user config for this login (marker: {marker})")
+
+
+def _confirm_reaches_wall(paths: dict, soc_env: "dict | None", cfg: "dict | None",
+                          dry: bool) -> bool:
+    """FAIL-SAFE: after writing, assert that the file the wall will READ is exactly
+    what we just WROTE — resolving with the SAME shared logic. Prints the cause
+    VISIBLY (never silent) when they disagree, and returns True iff they agree.
+
+    Catches: a stale higher-precedence file shadowing our write, an $SOC_PANELS_FILE
+    pinning a third path, and the litebw/rbw vault-note-is-source-of-truth case
+    (a YAML-only write won't reach the wall until the note is updated)."""
+    if dry:
+        return True
+    cp = _configpaths()
+    wrote = paths["panels_out"]
+    read_path, label = cp.resolve_read("panels")
+    if read_path and os.path.abspath(read_path) == os.path.abspath(wrote):
+        if paths.get("via") == "user":
+            ok(f"Saved to {wrote} and activated for YOUR user. Launch the wall from "
+               f"THIS login and it uses the new panels. For system-wide, re-run as "
+               f"root (or allow the password prompt).")
+        else:
+            ok(f"Config written to {wrote} — the wall will read it. Launch Desktop/Kiosk mode.")
+        reached = True
+    else:
+        err(f"Saved to {wrote} but the wall will read {read_path or '(nothing)'} "
+            f"because: {label}. Unset SOC_PANELS_FILE / remove the shadowing file / "
+            f"re-run as root so the config reaches the wall.")
+        reached = False
+
+    # litebw/rbw: the vault note is the source of truth unless SOC_CONFIG_FROM_VAULT=0.
+    env = soc_env or {}
+    backend = env.get("SOC_VAULT_BACKEND", "")
+    if backend in ("litebw", "rbw") and env.get("SOC_CONFIG_FROM_VAULT", "1") != "0":
+        warn(f"Backend={backend} reads the '{env.get('SOC_CONFIG_VAULT_ITEM', 'SOC Wall Config')}' "
+             f"vault note FIRST; your file change won't show until that note is "
+             f"updated — push it (setup.py deploy pushes config), or set "
+             f"SOC_CONFIG_FROM_VAULT=0 to force the file.")
+    return reached
+
+
+def _default_target(env: "Env") -> str:
+    """The write target when --target is not given. In a bare dev checkout (no
+    deployed /etc/soc-display and no /opt/soc-display) keep today's 'dev' behaviour
+    so `make dev` / tests write the repo. On a DEPLOYED box, use 'pi' even for a
+    non-root desktop user: resolve_paths('pi') then lands the config where the wall
+    reads it (the per-user fallback + marker), instead of silently writing a repo
+    file the wall never sees — the bug this whole change fixes."""
+    deployed = os.path.isdir("/etc/soc-display") or os.path.isdir("/opt/soc-display")
+    if env.is_root:
+        return "pi"
+    return "pi" if deployed else "dev"
 
 
 def main():
@@ -2084,7 +2229,7 @@ def main():
 
 def cmd_wizard(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
 
     banner("SOC video-wall · interactive setup")
@@ -2094,8 +2239,10 @@ def cmd_wizard(args) -> int:
     print(f"   detected : root={env.is_root} apt={env.has_apt} pi={env.is_pi} venv={env.has_venv}")
     if args.dry_run:
         print(yellow("   mode     : DRY RUN — no files will be written"))
-    if target == "pi" and not env.is_root:
-        warn("writing to /etc/soc-display needs root; re-run with sudo, or use --target dev")
+    if paths.get("via") == "user":
+        warn("/etc/soc-display is not writable here — saving to your per-user config "
+             f"({os.path.dirname(paths['panels_out'])}) and activating it for THIS login. "
+             "Re-run as root for a system-wide install.")
 
     prev = load_yaml(paths["panels_out"])
     if prev:
@@ -2128,6 +2275,19 @@ def cmd_wizard(args) -> int:
         err("nothing written")
         return 1
 
+    # FAIL-SAFE pre-flight: if even the chosen fallback dir is unwritable (locked-down
+    # / quota'd / immutable ~/.config), say WHY now — never die with a raw
+    # PermissionError traceback half-way through the write.
+    if not args.dry_run:
+        wdir = os.path.dirname(paths["panels_out"]) or "."
+        cp = _configpaths()
+        if not cp._dir_writable(wdir):
+            err(f"cannot write the config: {wdir} is not writable by this user "
+                f"(uid {os.geteuid()}).")
+            note("Fix the directory permissions, free up space, or re-run as root "
+                 "(writes /etc/soc-display). Nothing was written.")
+            return 1
+
     # Write
     banner("Writing files")
     write_file(paths["panels_out"], render_panels_yaml(cfg), paths["panels_mode"], args.dry_run)
@@ -2140,6 +2300,9 @@ def cmd_wizard(args) -> int:
                        render_wall_unit(soc_env, soc_root=paths["soc_root"]),
                        0o644, args.dry_run)
 
+    # Per-user fallback: activate this config for the reader (marker-gated tier).
+    _drop_marker(paths, args.dry_run)
+
     if not args.dry_run:
         validate_panels(paths["panels_out"])
 
@@ -2151,6 +2314,9 @@ def cmd_wizard(args) -> int:
 
     if not getattr(args, "_in_deploy", False):
         post_actions(env, cfg, target, args.dry_run)
+
+    # FAIL-SAFE: confirm the wall will actually read what we just wrote.
+    _confirm_reaches_wall(paths, _LAST_SOC_ENV, cfg, args.dry_run)
 
     banner("Done")
     print("   Guide: docs/SETUP.md   ·   Re-run anytime: python3 setup.py")

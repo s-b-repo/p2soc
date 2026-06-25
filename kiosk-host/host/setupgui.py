@@ -36,6 +36,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 
 
@@ -1314,16 +1316,59 @@ class SetupAssistant:
         paths = self.model.paths
         cfg = self.model.cfg()
         env = self.model.soc_env()
-
-        setup.write_file(paths["panels_out"], setup.render_panels_yaml(cfg),
-                         paths["panels_mode"], dry=False)
+        panels_text = setup.render_panels_yaml(cfg)
         env_text = setup.render_soc_env(env)
-        assert "SOC_VAULT_PASSWORD" not in env_text
-        setup.write_file(paths["soc_env"], env_text, paths["env_mode"], dry=False)
-        if paths.get("wall_unit"):
-            setup.write_file(paths["wall_unit"],
-                             setup.render_wall_unit(env, soc_root=paths["soc_root"]),
-                             0o644, dry=False)
+        assert "SOC_VAULT_PASSWORD" not in env_text  # no-plaintext-master guarantee
+
+        # FAIL-SAFE pre-flight: when we're NOT escalating, the chosen dir must be
+        # writable. A locked-down ~/.config would otherwise PermissionError mid-write;
+        # surface the specific cause (status + dialog) instead and stop.
+        if not paths.get("needs_privilege"):
+            from host import configpaths  # type: ignore
+            wdir = os.path.dirname(paths["panels_out"]) or "."
+            if not configpaths._dir_writable(wdir):
+                msg = (f"Cannot write the config: {wdir} is not writable by this user. "
+                       f"Fix its permissions or re-run as root.")
+                self._set_status(msg, bad=True)
+                try:
+                    from host import guierror  # type: ignore
+                    guierror.show("Config directory not writable", msg)
+                except Exception:  # noqa: BLE001 — status line already shows it
+                    pass
+                return
+
+        if paths.get("needs_privilege"):
+            # The resolver chose /etc but this user can't write it. Escalate via the
+            # FIXED pkexec helper: rendered content goes over STDIN (never argv, so
+            # panel URLs/emails don't hit the process table), and SOC_VAULT_PASSWORD
+            # is never passed (sealing stays in the user flow below).
+            if not self._install_etc_via_pkexec(panels_text, env_text):
+                # Escalation declined/failed -> fall back to the per-user dir so the
+                # config STILL reaches the wall (for this login), visibly.
+                from host import configpaths  # type: ignore
+                pw = configpaths.resolve_write("panels", want_etc=False)
+                ew = configpaths.resolve_write("env", want_etc=False)
+                paths = dict(paths)
+                paths.update(panels_out=pw["path"], panels_installed=pw["path"],
+                             soc_env=ew["path"], wall_unit=None,
+                             panels_mode=pw["mode"], env_mode=ew["mode"],
+                             via=pw["via"], marker=pw.get("marker"),
+                             needs_privilege=False,
+                             secret_dir=os.path.join(configpaths.user_dir(), "secret"))
+                self.model.paths = paths
+                setup.write_file(paths["panels_out"], panels_text, paths["panels_mode"], dry=False)
+                setup.write_file(paths["soc_env"], env_text, paths["env_mode"], dry=False)
+        else:
+            setup.write_file(paths["panels_out"], panels_text, paths["panels_mode"], dry=False)
+            setup.write_file(paths["soc_env"], env_text, paths["env_mode"], dry=False)
+            if paths.get("wall_unit"):
+                setup.write_file(paths["wall_unit"],
+                                 setup.render_wall_unit(env, soc_root=paths["soc_root"]),
+                                 0o644, dry=False)
+
+        # Per-user fallback: drop the `active` marker so the reader's marker-gated
+        # tier picks THIS file up over a stale /etc.
+        setup._drop_marker(paths, dry=False)
 
         # Seal / store the master per the chosen source. NEVER write it to a file.
         # Delegate the whole seal/store/verify/rewrite/client-config orchestration
@@ -1359,6 +1404,66 @@ class SetupAssistant:
             except Exception as e:  # noqa: BLE001
                 self._set_status(f"config-to-vault skipped: {e}", bad=True)
 
+        # FAIL-SAFE: confirm the wall will read what we just wrote; surface the exact
+        # cause on the status line (and a fatal dialog) when it won't — never silent.
+        self._confirm_reaches_wall(paths, env)
+
+    def _install_etc_via_pkexec(self, panels_text: str, env_text: str) -> bool:
+        """Write /etc via the fixed pkexec helper. Content over STDIN (not argv) so
+        no values/secrets hit the process table; never passes SOC_VAULT_PASSWORD.
+        Returns True on success, False if pkexec is absent/declined/fails (caller
+        then falls back to the per-user dir, visibly)."""
+        if not shutil.which("pkexec"):
+            return False
+        root = _repo_root()
+        kiosk = os.path.join(root, "kiosk-host")
+        py = shutil.which("python3") or sys.executable
+        payload = f"---PANELS---\n{panels_text}\n---ENV---\n{env_text}"
+        env = dict(os.environ)
+        env["PYTHONPATH"] = kiosk + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        try:
+            p = subprocess.run(
+                ["pkexec", py, "-m", "host.configpaths", "--install-etc"],
+                input=payload, text=True, env=env,
+                capture_output=True, timeout=120)
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"pkexec escalation failed: {e}", bad=True)
+            return False
+        if p.returncode != 0:
+            self._set_status(
+                f"pkexec declined or failed ({p.stderr.strip() or p.returncode}); "
+                f"falling back to your per-user config", bad=True)
+            return False
+        return True
+
+    def _confirm_reaches_wall(self, paths: dict, env: dict):
+        """Assert write_path == reader-resolved path via setup._confirm_reaches_wall;
+        on disagreement raise a visible guierror dialog AND a red status line."""
+        try:
+            reached = self.setup._confirm_reaches_wall(paths, env, self.model.cfg(), dry=False)
+        except Exception as e:  # noqa: BLE001 — never let the check mask a real write
+            self._set_status(f"could not verify the wall will see the config: {e}", bad=True)
+            return
+        if reached:
+            if paths.get("via") == "user":
+                self._set_status(
+                    "Saved for YOUR login (per-user config activated). Launch the wall "
+                    "from this desktop and it uses the new panels.")
+            else:
+                self._set_status("Config saved where the wall reads it. Launch Desktop/Kiosk mode.")
+        else:
+            from host import configpaths  # type: ignore
+            read_path = configpaths.resolve_panels()
+            msg = (f"Saved to {paths['panels_out']} but the wall will read "
+                   f"{read_path or '(nothing)'}. Unset SOC_PANELS_FILE / remove the "
+                   f"shadowing file / re-run as root.")
+            self._set_status(msg, bad=True)
+            try:
+                from host import guierror  # type: ignore
+                guierror.show("Config will not reach the wall", msg)
+            except Exception:  # noqa: BLE001 — status line already shows it
+                pass
+
 
 def _set(d: dict, k, v):
     d[k] = v
@@ -1377,8 +1482,15 @@ def run_gui() -> int:
     from host import branding  # type: ignore
 
     env = setup.Env()
-    target = "pi" if env.is_root else "dev"
-    paths = setup.resolve_paths(target)
+    # Same write-target logic as the TTY wizard: on a deployed box even a non-root
+    # desktop user targets 'pi' so resolve_paths lands the config where the wall
+    # reads it (per-user fallback + marker), never a dead repo file.
+    target = setup._default_target(env)
+    # pkexec escalation is offered only when both pkexec and a polkit-capable GUI
+    # session are present; the dialog (in _maybe_escalate) gets the user's consent.
+    can_escalate = bool(shutil.which("pkexec")) and bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    paths = setup.resolve_paths(target, can_escalate=can_escalate)
 
     provider = Gtk.CssProvider()
     provider.load_from_data(_css(branding))
