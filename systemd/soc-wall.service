@@ -1,0 +1,66 @@
+# Supervised SOC video-wall kiosk session.
+#
+# This replaces the old "getty autologin -> login shell sources soc.env" boot:
+# the session runs as a systemd service so (a) the non-secret config is baked in
+# as Environment= lines below — there is NO soc.env to read — and (b) Restart=always
+# brings the whole session (compositor + panels) back if it ever dies, instead of
+# leaving a black screen.
+#
+# setup.py generates the real unit (filling in the Environment= values from the
+# wizard) at /etc/systemd/system/soc-wall.service; this checked-in copy is the
+# reference template. The vault master is NOT here — it stays host-sealed under
+# $SOC_SECRET_DIR and is fed to litebw (or rbw) by pinentry-vault.py.
+#
+# NOTE: a graphical session from a system service needs the seat/VT directives
+# below (TTYPath/StandardInput=tty/PAMName); validate on the actual Pi.
+[Unit]
+Description=SOC video-wall kiosk session
+After=systemd-user-sessions.service network-online.target vaultwarden.service
+Wants=network-online.target vaultwarden.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+Type=simple
+User=soc
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+UtmpIdentifier=tty1
+UtmpMode=user
+
+# --- non-secret config baked in (no soc.env) --------------------------------
+Environment=SOC_VAULT_BACKEND=litebw
+Environment=SOC_VAULT_EMAIL=
+Environment=SOC_VAULT_URL=http://127.0.0.1:8222
+Environment=SOC_SECRET_DIR=/etc/soc-display/secret
+Environment=SOC_CONFIG_VAULT_ITEM=SOC Wall Config
+Environment=SOC_ROOT=/opt/soc-display
+Environment=SOC_PANELS_FILE=/etc/soc-display/panels.yaml
+Environment=SOC_INJECT_TMPL=/opt/soc-display/inject/login.js.tmpl
+Environment=SOC_LAUNCH_STAGGER=1.5
+Environment=SOC_READY_TIMEOUT=120
+Environment=SOC_CDP_BASE_PORT=9222
+Environment=SOC_CRED_TTL=30
+Environment=SOC_VPN_DRY_RUN=0
+Environment=SOC_SESSION=auto
+
+ExecStart=/opt/soc-display/scripts/start-session.sh
+Restart=always
+RestartSec=3
+# Cap memory so a leaking dashboard throttles (and, worst case, the whole
+# session restarts) instead of OOM-killing an arbitrary process on the Pi.
+MemoryAccounting=yes
+MemoryHigh=80%
+MemoryMax=92%
+# Renderers crash/OOM-restart by design on the 1 GB Pi; never let them dump
+# multi-hundred-MB cores onto the 40 GB SD card (also enforced distro-wide by
+# security/coredump-soc.conf). You don't debug cores in-place on a kiosk.
+LimitCORE=0
+
+[Install]
+WantedBy=graphical.target

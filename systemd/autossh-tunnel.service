@@ -1,0 +1,29 @@
+[Unit]
+Description=autossh persistent SSH jump-host tunnel for the SOC wall
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=socsvc
+Group=socsvc
+Environment=SOC_ROOT=/opt/soc-display
+Environment=SOC_ENV_FILE=/etc/soc-display/soc.env
+Environment=SOC_PANELS_FILE=/etc/soc-display/panels.yaml
+ExecStart=/opt/soc-display/scripts/autossh-tunnel.sh
+Restart=always
+RestartSec=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+# read-only access to the restricted tunnel key
+ReadOnlyPaths=/etc/soc-display/keys
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+[Unit]
+Description=SOC wall VPN (Fortinet / OpenVPN / WireGuard) — supervised, auto-reconnect
+Documentation=https://github.com/adrienverge/openfortivpn
+After=network-online.target vaultwarden.service
+Wants=network-online.target
+# Best-effort: bring the VPN process up before the kiosk session starts so
+# routes to VPN-side panels exist when the windows load. The real readiness
+# gate is the kiosk host's vpn.ready_probe (best-effort, in main.py).
+Before=getty@tty1.service
+# Never stop retrying: the supervisor owns backoff (incl. long auth/cert
+# holds); this only covers supervisor crashes.
+StartLimitIntervalSec=0
+
+[Service]
+# The supervisor (host/fortivpn.py) sends READY=1 immediately and surfaces
+# tunnel state via STATUS= (`systemctl status forti-vpn`). WATCHDOG heartbeats
+# restart it if it ever wedges.
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
+TimeoutStartSec=30
+Environment=SOC_ROOT=/opt/soc-display
+Environment=SOC_ENV_FILE=/etc/soc-display/soc.env
+Environment=SOC_PANELS_FILE=/etc/soc-display/panels.yaml
+ExecStart=/opt/soc-display/scripts/forti-vpn.sh
+Restart=always
+RestartSec=5
+# SIGTERM goes to the supervisor only; it forwards to openfortivpn so pppd
+# tears down routes/resolv.conf cleanly before exiting.
+KillMode=mixed
+TimeoutStopSec=30
+
+# --- privilege & hardening -------------------------------------------------
+# This unit runs as root: every VPN backend rewrites the routing table and
+# needs a tunnel device. Hardening is kept deliberately light so all three work:
+#   * Fortinet (openfortivpn) -> pppd needs /dev/ppp + AF_PPPOX
+#   * OpenVPN                 -> needs /dev/net/tun
+#   * WireGuard (wg-quick)    -> needs /dev/net/tun + the wireguard module + `ip`
+# All need AF_NETLINK (route/addr changes) and write access to /etc/resolv.conf.
+# The vault master password is read by the script from soc.env (sourced, not
+# exported here) so it never appears in `systemctl show`.
+NoNewPrivileges=no
+ProtectSystem=true
+ProtectHome=no
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PPPOX AF_PACKET
+# (no DeviceAllow on purpose — that would switch to device-whitelist mode and
+# could starve a backend of a node it needs; /dev stays open for /dev/ppp and
+# /dev/net/tun.)
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

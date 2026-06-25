@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# =============================================================================
+# litebw — drop-in launcher for the lightweight Vaultwarden client.
+#
+# A thin wrapper so call-sites can run `litebw <subcommand>` exactly like they
+# ran `rbw`. It execs the project's venv Python (falling back to python3) on
+# `python -m host.litebw`, with PYTHONPATH set so the `host` package imports
+# both from a checkout (.venv) and a prod install (SOC_ROOT/kiosk-host).
+#
+# No secrets here: argv is passed straight through and the Python exit code is
+# propagated unchanged (no `set -e` to swallow a non-zero `get`/`code`).
+# =============================================================================
+set -u
+
+# ROOT = dirname(dirname(realpath $0)) — mirrors launch.sh / launcher.sh.
+SELF="$0"
+if command -v realpath >/dev/null 2>&1; then
+  SELF="$(realpath "$0")"
+fi
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+# Pick the venv python if present, else system python3.
+PYBIN="$ROOT/.venv/bin/python"
+[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+
+# Make the `host` package importable: the checkout's kiosk-host, plus the prod
+# install layout under $SOC_ROOT/kiosk-host when set.
+PP="$ROOT/kiosk-host"
+if [ -n "${SOC_ROOT:-}" ] && [ "${SOC_ROOT}/kiosk-host" != "$PP" ]; then
+  PP="${SOC_ROOT}/kiosk-host:$PP"
+fi
+export PYTHONPATH="$PP${PYTHONPATH:+:$PYTHONPATH}"
+
+exec "$PYBIN" -m host.litebw "$@"

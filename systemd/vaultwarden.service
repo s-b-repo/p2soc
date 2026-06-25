@@ -1,0 +1,49 @@
+[Unit]
+Description=Vaultwarden (Bitwarden-compatible) secrets vault for the SOC wall
+Documentation=https://github.com/dani-garcia/vaultwarden
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vaultwarden
+Group=vaultwarden
+# Config is INLINE here — no .env file. All of it is non-secret: bound to
+# localhost, signups off, websockets off. The /admin page is DISABLED (no
+# ADMIN_TOKEN) because the kiosk does not need it.
+#
+# First account: temporarily allow signups with a root-only drop-in, then revert:
+#   sudo systemctl edit vaultwarden   ->   [Service]
+#                                          Environment=SIGNUPS_ALLOWED=true
+#   sudo systemctl restart vaultwarden ; create the account ; remove the drop-in.
+# Enable /admin later the same way:  Environment=ADMIN_TOKEN=<vaultwarden hash>
+Environment=DATA_FOLDER=/var/lib/vaultwarden
+Environment=ROCKET_ADDRESS=127.0.0.1
+Environment=ROCKET_PORT=8222
+Environment=SIGNUPS_ALLOWED=false
+Environment=SIGNUPS_VERIFY=false
+Environment=WEBSOCKET_ENABLED=false
+ExecStart=/usr/local/bin/vaultwarden
+WorkingDirectory=/var/lib/vaultwarden
+StateDirectory=vaultwarden
+Restart=always
+RestartSec=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/vaultwarden
+# Vaultwarden listens on localhost only (ROCKET_ADDRESS=127.0.0.1 above).
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,209 @@
+# =============================================================================
+# nfpm v2 packaging config for p2soc — the SOC video-wall kiosk.
+#
+# One YAML builds deb + rpm + apk via nfpm (https://nfpm.goreleaser.com).
+# The payload is pure Python + shell (interpreted) — nothing is compiled — so
+# the *arch* is parameterized and CI loops it; there is no cross-compile step.
+#
+#   PKG_ARCH      target arch in nfpm/Go form (amd64, arm64, ...). CI sets this.
+#   PKG_VERSION   release version WITHOUT a leading 'v' (e.g. 1.4.0). From the tag.
+#
+# Build (per arch, per packager):
+#   PKG_ARCH=arm64 PKG_VERSION=1.4.0 nfpm package -f nfpm.yaml -p deb -t dist/
+#   PKG_ARCH=arm64 PKG_VERSION=1.4.0 nfpm package -f nfpm.yaml -p rpm -t dist/
+#   PKG_ARCH=arm64 PKG_VERSION=1.4.0 nfpm package -f nfpm.yaml -p apk -t dist/
+#
+# Package layout (PROD files ONLY — dev/, tests/, .github/, .claude/, .venv/,
+# secrets are excluded; see the `contents` globs + `overrides.*` below):
+#   /opt/soc-display/...                the prod tree (manifest.package_includes)
+#   /usr/local/bin/litebw               the litebw launcher (0755)
+#   /usr/lib/systemd/system/*.service   the systemd units
+#
+# postinstall reuses install.sh with SOC_SKIP_PACKAGES=1 (the declared per-
+# packager Depends already pulled the OS packages); preremove stops+disables
+# the services and leaves /etc/soc-display + vault data in place.
+# =============================================================================
+
+name: p2soc
+arch: ${PKG_ARCH}
+version: ${PKG_VERSION}
+version_schema: semver
+release: "1"
+section: admin
+priority: optional
+maintainer: s-b-repo <stephanbotes0@gmail.com>
+vendor: s-b-repo
+homepage: https://github.com/s-b-repo/p2soc
+license: GPL-3.0-or-later
+description: |
+  SOC video-wall kiosk for the Raspberry Pi 5.
+  Boots into a 2x2 grid of browser panels (Wazuh, Zabbix, ...), auto-logs in
+  from a local Vaultwarden, self-heals crashed panels and reconnects VPN/tunnels.
+  Pure Python + shell on PyGObject/WebKitGTK; secrets stay in Vaultwarden and the
+  master password is sealed host-bound (never in .env).
+
+# --------------------------------------------------------------------------- #
+# Payload. Source globs are relative to the repo root (run nfpm from there).
+#
+# `contents` lays down the prod tree under /opt/soc-display; the trailing
+# `manifest.package_excludes` globs are mirrored into the `*.src` exclusion
+# patterns below so dev/, tests/, .github/, .claude/, .venv/ and secrets never
+# enter the package even though the repo keeps them for CI.
+# --------------------------------------------------------------------------- #
+contents:
+  # ---- prod tree -> /opt/soc-display (manifest.package_includes) ----
+  - src: ./install.sh
+    dst: /opt/soc-display/install.sh
+    file_info: { mode: 0755 }
+  - src: ./launch.sh
+    dst: /opt/soc-display/launch.sh
+    file_info: { mode: 0755 }
+  - src: ./setup.py
+    dst: /opt/soc-display/setup.py
+  - src: ./Makefile
+    dst: /opt/soc-display/Makefile
+  - src: ./README.md
+    dst: /opt/soc-display/README.md
+  - src: ./CHANGELOG.md
+    dst: /opt/soc-display/CHANGELOG.md
+  - src: ./LICENSE
+    dst: /opt/soc-display/LICENSE
+  - src: ./CLAUDE.md
+    dst: /opt/soc-display/CLAUDE.md
+
+  - src: ./kiosk-host/host/**
+    dst: /opt/soc-display/kiosk-host/host
+  - src: ./kiosk-host/pyproject.toml
+    dst: /opt/soc-display/kiosk-host/pyproject.toml
+
+  - src: ./config/**
+    dst: /opt/soc-display/config
+  - src: ./scripts/**
+    dst: /opt/soc-display/scripts
+  - src: ./systemd/**
+    dst: /opt/soc-display/systemd
+  - src: ./security/**
+    dst: /opt/soc-display/security
+  - src: ./openbox/**
+    dst: /opt/soc-display/openbox
+  - src: ./labwc/**
+    dst: /opt/soc-display/labwc
+  - src: ./inject/**
+    dst: /opt/soc-display/inject
+  - src: ./vendor/**
+    dst: /opt/soc-display/vendor
+  - src: ./docs/**
+    dst: /opt/soc-display/docs
+
+  # ---- litebw launcher -> /usr/local/bin (0755) ----
+  - src: ./scripts/litebw
+    dst: /usr/local/bin/litebw
+    file_info: { mode: 0755 }
+
+  # ---- systemd units -> /usr/lib/systemd/system ----
+  # postinstall (install.sh) copies the active copies into /etc/systemd/system
+  # and selectively enables them; these are the packaged read-only originals.
+  - src: ./systemd/autossh-tunnel.service
+    dst: /usr/lib/systemd/system/autossh-tunnel.service
+  - src: ./systemd/forti-vpn.service
+    dst: /usr/lib/systemd/system/forti-vpn.service
+  - src: ./systemd/soc-wall.service
+    dst: /usr/lib/systemd/system/soc-wall.service
+  - src: ./systemd/vaultwarden.service
+    dst: /usr/lib/systemd/system/vaultwarden.service
+  - src: ./systemd/vaultwarden-docker.service
+    dst: /usr/lib/systemd/system/vaultwarden-docker.service
+
+  # ---- config / state directory the operator owns (kept on uninstall) ----
+  - dst: /etc/soc-display
+    type: dir
+    file_info: { mode: 0755 }
+
+# manifest.package_excludes — enforced two ways:
+#  1. The explicit `contents` globs above only reference the prod include paths,
+#     so whole trees (dev/, kiosk-host/tests/, .github/, .claude/, .git/, .venv/,
+#     secrets/, keys/, .rbw/, top-level *.env / vaultwarden.env / panels.local.yaml)
+#     are never referenced and cannot enter the package.
+#  2. The recursive `**/*` globs (config/, scripts/, kiosk-host/host/, ...) could
+#     still sweep up build cruft (__pycache__/, *.pyc, *.egg-info/), so CI MUST run
+#     `make package-clean` (or `git archive` from a clean tree) before nfpm. nfpm
+#     v2 has no per-entry exclude key, so the clean step is the contract.
+# See packaging/README note in CHANGELOG; the source-of-truth list lives in the
+# task manifest.package_excludes.
+
+# Maintainer scripts (reuse install.sh; never delete operator data).
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh
+
+# --------------------------------------------------------------------------- #
+# Per-packager Depends (manifest.depends). nfpm core `depends` is left empty so
+# each packager gets exactly its own native package names + version syntax
+# (deb supports the "a | b" alternative for the webkit2 4.1/4.0 split).
+# --------------------------------------------------------------------------- #
+overrides:
+  deb:
+    depends:
+      - python3
+      - python3-venv
+      - python3-gi
+      - gir1.2-gtk-3.0
+      - gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0
+      - python3-cryptography
+      - autossh
+      - openfortivpn
+      - ppp
+      - openvpn
+      - wireguard-tools
+      - openbox
+      - xinit
+      - x11-xserver-utils
+      - xserver-xorg
+      - cage
+      - labwc
+      - pinentry-tty
+      - jq
+      - curl
+      - ca-certificates
+  rpm:
+    depends:
+      - python3
+      - python3-gobject
+      - gtk3
+      - webkit2gtk4.1
+      - python3-cryptography
+      - autossh
+      - openfortivpn
+      - ppp
+      - openvpn
+      - wireguard-tools
+      - openbox
+      - xorg-x11-xinit
+      - xorg-x11-server-Xorg
+      - cage
+      - labwc
+      - pinentry
+      - jq
+      - curl
+      - ca-certificates
+  apk:
+    depends:
+      - python3
+      - py3-gobject3
+      - gtk+3.0
+      - webkit2gtk-4.1
+      - py3-cryptography
+      - autossh
+      - openfortivpn
+      - ppp
+      - openvpn
+      - wireguard-tools
+      - openbox
+      - xinit
+      - xorg-server
+      - cage
+      - labwc
+      - pinentry
+      - jq
+      - curl
+      - ca-certificates

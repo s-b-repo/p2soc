@@ -1,0 +1,14 @@
+# Openbox autostart for the SOC video wall (sourced by openbox-session).
+# No panel/taskbar is started — this is a bare wall.
+
+# Disable all screen blanking / power management / cursor.
+xset s off
+xset -dpms
+xset s noblank
+xsetroot -solid '#0b1020' &
+# hide the mouse pointer when idle (root + all windows)
+command -v unclutter >/dev/null 2>&1 && unclutter -idle 0 -root &
+
+# Launch (and keep alive) the kiosk host. Backgrounded so autostart returns and
+# Openbox keeps running even if the host restarts.
+"${SOC_ROOT:-/opt/soc-display}/scripts/launcher.sh" &
