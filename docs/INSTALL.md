@@ -95,6 +95,21 @@ stop the wall; it leaves your desktop session as it was.
 > `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
 > the config interactively (Vaultwarden's own config is in its systemd unit).
 
+### Rebranding
+
+The whole product — the launcher menu, the installed desktop entry and the setup
+wizard — reskins from one file, `branding/branding.yaml` (packaged to
+`/opt/soc-display/branding/branding.yaml`). Edit its `name`, `short_name`,
+`tagline`, `icon` and `colors` (a partial file is fine — anything omitted falls
+back to the built-in defaults). The app icon is `share/icons/soc-wall.svg`;
+replace that file (or repoint `icon:`) to change it.
+
+On a deployed box, override without touching `/opt` by dropping a
+`branding.yaml` at `/etc/soc-display/branding.yaml`, or point
+`SOC_BRANDING_FILE=/path/to/branding.yaml` at any file. Re-run the installer (or
+`python -m host.branding desktop …`) to re-render the desktop entry with the new
+name/icon.
+
 ## 3. Configure (the installer prints this list)
 
 1. **`/etc/soc-display/panels.yaml`** — your 4 panels: IPs/ports, **selectors**,

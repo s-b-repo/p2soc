@@ -192,6 +192,17 @@ Then finish setup (the installer prints this):
 5. Tunnel key: see `security/tunnel_key.note` (restricted `permitopen` key).
 6. `systemctl reboot` → the wall comes up logged-in, hands-free.
 
+### Rebranding
+
+Reskin the whole product — the launcher menu, the installed desktop entry and
+the setup wizard — from one file: `branding/branding.yaml`. Edit its `name`,
+`short_name`, `tagline`, `icon` and accent `colors` (partial files are fine;
+omitted keys fall back to defaults). The app icon is `share/icons/soc-wall.svg`
+— swap that file (or repoint `icon:`) to change it. On a deployed box, override
+without editing `/opt` by dropping a `branding.yaml` at
+`/etc/soc-display/branding.yaml` or setting `SOC_BRANDING_FILE`. See
+[docs/INSTALL.md](docs/INSTALL.md#rebranding).
+
 ### Finding selectors for a panel
 Open the panel's login page in a browser, right-click the username field →
 Inspect, and copy a CSS selector for the username input, password input, and the

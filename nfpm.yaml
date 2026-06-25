@@ -97,6 +97,11 @@ contents:
     dst: /opt/soc-display/vendor
   - src: ./docs/**
     dst: /opt/soc-display/docs
+  # ---- branding source (rebrand via branding/branding.yaml) ----
+  # Reskins the launcher, the desktop entry and the setup wizard. Operators
+  # override per-box with /etc/soc-display/branding.yaml or SOC_BRANDING_FILE.
+  - src: ./branding/**
+    dst: /opt/soc-display/branding
 
   # ---- clickable launcher: XDG .desktop entry + icon ----
   # The .desktop file (and its icon under share/) ship inside the prod tree;

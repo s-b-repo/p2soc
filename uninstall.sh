@@ -71,34 +71,79 @@ VW_USER="vaultwarden"
 VW_DATA="/var/lib/vaultwarden"
 INSTALL_MODE="desktop"
 VW_MODE="docker"
+HARDEN=0                   # installer applied nftables + sshd hardening
 PREV_DEFAULT_TARGET=""     # saved original systemd default target (kiosk takeover)
 SET_DEFAULT_CHANGED=0      # installer flipped the boot target
 GETTY_OVERRIDE=0           # installer wrote the getty@tty1 autologin override
 CONSOLEBLANK_ADDED=0       # installer appended consoleblank=0 to cmdline.txt
+CMDLINE_PATH=""            # cmdline.txt path the installer touched
+# Extra files/units the manifest lists for removal (collected generically so new
+# install-created artifacts are reversed without editing this script every time).
+MANIFEST_FILES=()
+MANIFEST_UNITS=()
 
 # --------------------------------------------------------------------------- #
-# Load the manifest (key=value; only known keys are honoured)
+# Load the manifest. install.sh writes pipe-delimited rows:
+#   TYPE|VALUE|NOTE   where TYPE is META|DIR|FILE|UNIT|USER|SYSCHANGE|REVERT
+# META/REVERT rows carry key|value pairs (VALUE=key, NOTE=value); the rest carry
+# a path/name in VALUE. Parse them into the vars the steps below already use. The
+# function is round-trip tested in kiosk-host/tests/test_uninstall_manifest.py.
 # --------------------------------------------------------------------------- #
+parse_manifest(){   # parse_manifest <manifest-path>
+  local typ val note
+  while IFS='|' read -r typ val note; do
+    case "$typ" in ''|\#*) continue ;; esac
+    case "$typ" in
+      META)
+        case "$val" in
+          install_mode) INSTALL_MODE="$note" ;;
+          vw_mode)      VW_MODE="$note" ;;
+          kiosk_user)   KIOSK_USER="$note" ;;
+          svc_user)     SVC_USER="$note" ;;
+          harden)       HARDEN="$note" ;;
+        esac ;;
+      REVERT)
+        case "$val" in
+          orig_default_target) PREV_DEFAULT_TARGET="$note" ;;
+          did_set_default)     SET_DEFAULT_CHANGED="$note" ;;
+          did_consoleblank)    CONSOLEBLANK_ADDED="$note" ;;
+          cmdline_path)        CMDLINE_PATH="$note" ;;
+        esac ;;
+      DIR)
+        # the project root is the only DIR we remove wholesale; $ETC + vault data
+        # are operator data handled by the keep-data / --purge logic below.
+        case "$val" in
+          /var/lib/vaultwarden) VW_DATA="$val" ;;
+          *)
+            if [ "$val" != "$ETC" ]; then SOC_ROOT="$val"; fi ;;
+        esac ;;
+      FILE)
+        MANIFEST_FILES+=("$val")
+        # the getty autologin drop-in is the kiosk-takeover marker
+        case "$val" in
+          */getty@tty1.service.d/override.conf) GETTY_OVERRIDE=1 ;;
+        esac ;;
+      UNIT)
+        MANIFEST_UNITS+=("$val") ;;
+      USER)
+        case "$note" in
+          *vaultwarden*) VW_USER="$val" ;;
+        esac ;;
+    esac
+  done < "$1"
+}
+
 if [ -f "$MANIFEST" ]; then
   log "Reading install manifest: $MANIFEST"
-  while IFS='=' read -r k v; do
-    case "$k" in ''|\#*) continue ;; esac
-    v="${v%\"}"; v="${v#\"}"     # tolerate quoted values
-    case "$k" in
-      SOC_ROOT)            SOC_ROOT="$v" ;;
-      ETC)                 ETC="$v" ;;
-      KIOSK_USER)          KIOSK_USER="$v" ;;
-      SVC_USER)            SVC_USER="$v" ;;
-      VW_USER)             VW_USER="$v" ;;
-      VW_DATA)             VW_DATA="$v" ;;
-      INSTALL_MODE)        INSTALL_MODE="$v" ;;
-      VW_MODE)             VW_MODE="$v" ;;
-      PREV_DEFAULT_TARGET) PREV_DEFAULT_TARGET="$v" ;;
-      SET_DEFAULT_CHANGED) SET_DEFAULT_CHANGED="$v" ;;
-      GETTY_OVERRIDE)      GETTY_OVERRIDE="$v" ;;
-      CONSOLEBLANK_ADDED)  CONSOLEBLANK_ADDED="$v" ;;
-    esac
-  done < "$MANIFEST"
+  parse_manifest "$MANIFEST"
+  # Belt-and-suspenders: even with a present-but-stale manifest, derive the
+  # kiosk-takeover reversals from on-disk reality so the boot is always restored.
+  [ -f "/etc/systemd/system/getty@tty1.service.d/override.conf" ] && GETTY_OVERRIDE=1
+  if [ "$HAS_SYSTEMD" = "1" ] && [ "$SET_DEFAULT_CHANGED" != "1" ] \
+     && [ "$(systemctl get-default 2>/dev/null || echo '')" = "multi-user.target" ] \
+     && [ "$INSTALL_MODE" = "kiosk" ]; then
+    SET_DEFAULT_CHANGED=1
+  fi
 else
   warn "no manifest at $MANIFEST — falling back to default paths."
   warn "  (an install before the manifest existed, or already partly removed.)"
@@ -161,7 +206,7 @@ fi
 # --------------------------------------------------------------------------- #
 # 3) cmdline.txt — remove the consoleblank=0 the installer appended
 # --------------------------------------------------------------------------- #
-CMDLINE="/boot/firmware/cmdline.txt"
+CMDLINE="${CMDLINE_PATH:-/boot/firmware/cmdline.txt}"
 if [ "$CONSOLEBLANK_ADDED" = "1" ] && [ -f "$CMDLINE" ] && grep -q 'consoleblank=0' "$CMDLINE"; then
   log "Removing consoleblank=0 from $CMDLINE"
   sed -i 's/ \{0,1\}consoleblank=0//g' "$CMDLINE"; did "reverted $CMDLINE (consoleblank)"
@@ -185,9 +230,38 @@ rm_path /etc/sysctl.d/99-soc.conf
 rm_path /etc/systemd/zram-generator.conf
 rm_path /etc/systemd/journald.conf.d/10-soc.conf
 rm_path /etc/systemd/coredump.conf.d/10-soc.conf
+# native Vaultwarden binary (install.sh extracts it to /usr/local/bin in VW_MODE=native)
+[ "$VW_MODE" = "native" ] && rm_path /usr/local/bin/vaultwarden
 # refresh the desktop database / icon cache if the tooling is around (best effort)
 command -v update-desktop-database >/dev/null 2>&1 && \
   update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+
+# --------------------------------------------------------------------------- #
+# 4a) HARDEN=1 reversal — nftables service/config + sshd hardening drop-in.
+# These survive a normal uninstall otherwise; a key-only sshd drop-in left behind
+# can lock an operator out. Gated on the manifest's harden flag.
+# --------------------------------------------------------------------------- #
+if [ "$HARDEN" = "1" ]; then
+  log "Reverting HARDEN=1 artifacts (nftables + sshd hardening)"
+  if [ "$HAS_SYSTEMD" = "1" ]; then
+    systemctl disable --now nftables.service >/dev/null 2>&1 \
+      && did "disabled nftables.service" || true
+  fi
+  # /etc/nftables.conf is a shared file the installer overwrote — don't silently
+  # delete it; warn loudly that the SOC firewall ruleset remains in place.
+  if [ -f /etc/nftables.conf ] && grep -qi 'soc wall firewall' /etc/nftables.conf 2>/dev/null; then
+    warn "left /etc/nftables.conf in place (SOC firewall ruleset). Remove or replace"
+    warn "  it by hand if you want stock firewalling back; nftables.service is disabled."
+  fi
+  if [ -f /etc/ssh/sshd_config.d/10-soc-hardening.conf ]; then
+    rm_path /etc/ssh/sshd_config.d/10-soc-hardening.conf
+    did "removed sshd hardening drop-in (sshd reverts to defaults on reload)"
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+      systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+    fi
+    warn "sshd hardening removed — reloaded sshd (key-only login no longer forced)."
+  fi
+fi
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
   systemctl daemon-reload || true
@@ -205,6 +279,18 @@ if [ -n "$KHOME" ] && [ -d "$KHOME" ]; then
   for f in .config/openbox .xinitrc .bash_profile; do
     rm_path "$KHOME/$f"
   done
+fi
+
+# --------------------------------------------------------------------------- #
+# 5a) install bookkeeping — the .installed stamp + .install-manifest live inside
+# $ETC (preserved data dir) but are install metadata, not operator secrets. On a
+# keep-data uninstall remove them so a later reinstall doesn't fast-path the
+# package step off a stale stamp and so no stale manifest lingers. (On --purge the
+# whole $ETC goes anyway, below — and we've already parsed the manifest into vars.)
+# --------------------------------------------------------------------------- #
+if [ "$PURGE" != "1" ]; then
+  rm_path "$ETC/.installed"
+  rm_path "$ETC/.install-manifest"
 fi
 
 # --------------------------------------------------------------------------- #

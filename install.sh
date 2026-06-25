@@ -686,24 +686,76 @@ fi
 # demand against the current display (no tty1 required). Installed in BOTH modes
 # — it's the primary entry point in desktop mode. Guarded so a repo that hasn't
 # shipped the asset yet (or a trimmed deploy) degrades gracefully.
+#
+# Rebrand-aware: the .desktop entry is GENERATED from branding (host.branding) so
+# an operator's name/tagline/icon flow into the launcher, and the branding source
+# is installed under $ETC for in-place editing. Falls back to the static asset
+# when branding/python isn't available (trimmed deploy / pre-venv).
 DESKTOP_FILE=""
 ICON_FILE=""
-if [ -f "$SOC_ROOT/soc-wall.desktop" ]; then
-  log "Installing desktop launcher (SOC Video Wall app icon)"
-  install -Dm0644 "$SOC_ROOT/soc-wall.desktop" /usr/share/applications/soc-wall.desktop
-  DESKTOP_FILE="/usr/share/applications/soc-wall.desktop"
-  if [ -f "$SOC_ROOT/share/icons/soc-wall.svg" ]; then
-    install -Dm0644 "$SOC_ROOT/share/icons/soc-wall.svg" \
-      /usr/share/icons/hicolor/scalable/apps/soc-wall.svg
-    ICON_FILE="/usr/share/icons/hicolor/scalable/apps/soc-wall.svg"
+BRANDING_FILE=""
+VENV_PY="$SOC_ROOT/.venv/bin/python"
+DESKTOP_DST="/usr/share/applications/soc-wall.desktop"
+
+# Install the branding source so operators can rebrand in place — but NEVER
+# clobber an edited branding.yaml on re-install (idempotent).
+if [ -f "$SOC_ROOT/branding/branding.yaml" ]; then
+  if [ -f "$ETC/branding.yaml" ]; then
+    warn "keep existing $ETC/branding.yaml (operator branding preserved)"
+    BRANDING_FILE="$ETC/branding.yaml"
+  else
+    install -Dm0644 "$SOC_ROOT/branding/branding.yaml" "$ETC/branding.yaml"
+    log "installed branding source -> $ETC/branding.yaml (edit to rebrand)"
+    BRANDING_FILE="$ETC/branding.yaml"
   fi
+fi
+
+if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
+  log "Installing desktop launcher (rebrand-aware app entry + icon)"
+  install -d -m 0755 /usr/share/applications
+  # GENERATE the entry from branding (run from kiosk-host so `host` is importable;
+  # SOC_BRANDING_FILE points at the just-installed source so operator edits win).
+  if [ -x "$VENV_PY" ] && SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
+       PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -m host.branding desktop \
+       /opt/soc-display/scripts/soc-wall-menu soc-wall > "$DESKTOP_DST" 2>/dev/null \
+     && [ -s "$DESKTOP_DST" ]; then
+    log "generated $DESKTOP_DST from branding"
+    DESKTOP_FILE="$DESKTOP_DST"
+  elif [ -f "$SOC_ROOT/soc-wall.desktop" ]; then
+    warn "branding render unavailable — copying the static soc-wall.desktop"
+    install -Dm0644 "$SOC_ROOT/soc-wall.desktop" "$DESKTOP_DST"
+    DESKTOP_FILE="$DESKTOP_DST"
+  else
+    warn "no branding/python and no static soc-wall.desktop — skipping desktop entry"
+  fi
+
+  # Icon: a custom branding icon (if it resolves to a real file) wins; otherwise
+  # the packaged share/icons/soc-wall.svg. Installed as the hicolor 'soc-wall'
+  # name the generated entry references.
+  if [ -n "$DESKTOP_FILE" ]; then
+    BRAND_ICON=""
+    [ -x "$VENV_PY" ] && BRAND_ICON="$(SOC_ROOT="$SOC_ROOT" \
+      SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
+      PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -c \
+      'from host import branding; print(branding.icon_path())' 2>/dev/null || true)"
+    if [ -z "$BRAND_ICON" ] || [ ! -f "$BRAND_ICON" ]; then
+      BRAND_ICON="$SOC_ROOT/share/icons/soc-wall.svg"
+    fi
+    if [ -f "$BRAND_ICON" ]; then
+      install -Dm0644 "$BRAND_ICON" \
+        /usr/share/icons/hicolor/scalable/apps/soc-wall.svg
+      ICON_FILE="/usr/share/icons/hicolor/scalable/apps/soc-wall.svg"
+      log "installed app icon -> $ICON_FILE (from ${BRAND_ICON#"$SOC_ROOT/"})"
+    fi
+  fi
+
   # refresh the desktop + icon caches best-effort (absent on headless/minimal)
   command -v update-desktop-database >/dev/null 2>&1 && \
     update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
   command -v gtk-update-icon-cache >/dev/null 2>&1 && \
     gtk-update-icon-cache -qtf /usr/share/icons/hicolor >/dev/null 2>&1 || true
 else
-  warn "no $SOC_ROOT/soc-wall.desktop — skipping desktop launcher install"
+  warn "no $SOC_ROOT/soc-wall.desktop and no venv python — skipping desktop launcher"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -753,8 +805,10 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
 
   # files on PATH / shared trees
   printf 'FILE|/usr/local/bin/litebw|litebw launcher (remove on uninstall)\n'
-  [ -n "$DESKTOP_FILE" ] && printf 'FILE|%s|XDG desktop launcher (remove on uninstall)\n' "$DESKTOP_FILE"
+  [ -n "$DESKTOP_FILE" ] && printf 'FILE|%s|XDG desktop launcher (rebrand-generated; remove on uninstall)\n' "$DESKTOP_FILE"
   [ -n "$ICON_FILE" ]    && printf 'FILE|%s|app icon (remove on uninstall)\n' "$ICON_FILE"
+  # branding source lives under $ETC -> operator data, preserved unless --purge
+  [ -n "$BRANDING_FILE" ] && printf 'FILE|%s|branding source (preserve unless --purge; edit to rebrand)\n' "$BRANDING_FILE"
 
   # systemd units (and any drop-ins/configs we dropped). Listed regardless of
   # enabled-state; uninstall.sh disables+removes them.
