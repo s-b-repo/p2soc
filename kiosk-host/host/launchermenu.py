@@ -48,6 +48,21 @@ def launch_wall(mode: str) -> bool:
     env = dict(os.environ)
     env["SOC_WINDOW_MODE"] = "fullscreen" if mode == "--fullscreen" else "window"
     env["PYTHONPATH"] = kiosk + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    # Pin the resolved config in the child env so this fallback wall reads exactly
+    # what the wizard wrote (per-user marker > /etc > repo) — same resolver as the
+    # shell launchers, so menu-spawned and script-spawned walls never disagree.
+    try:
+        from host import configpaths  # type: ignore
+        if not env.get("SOC_PANELS_FILE"):
+            p = configpaths.resolve_panels()
+            if p:
+                env["SOC_PANELS_FILE"] = p
+        if not env.get("SOC_ENV_FILE"):
+            e = configpaths.resolve_env()
+            if e:
+                env["SOC_ENV_FILE"] = e
+    except Exception:  # noqa: BLE001 — resolver best-effort; host.main self-resolves too
+        pass
     return _spawn([sys.executable, "-m", "host.main"], cwd=kiosk, env=env)
 
 

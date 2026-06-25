@@ -30,6 +30,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
 from . import config as cfg  # noqa: E402
+from . import configpaths  # noqa: E402  (shared read/write-location resolver)
 from . import perf  # noqa: E402
 from .vault import Vault, VaultError  # noqa: E402
 
@@ -37,6 +38,14 @@ from .vault import Vault, VaultError  # noqa: E402
 def log(msg: str):
     t = time.strftime("%H:%M:%S")
     print(f"{t} [soc-kiosk] {msg}", flush=True)
+
+
+def _resolved_panels() -> str:
+    """The panels.yaml the wall reads when $SOC_PANELS_FILE is unset — via the SAME
+    resolver the wizard writes through, so a bare `python -m host.main` self-resolves
+    to exactly what was just configured (per-user marker > /etc > repo). The literal
+    'config/panels.yaml' is only the last-ditch fallback if nothing resolves."""
+    return configpaths.resolve_panels() or "config/panels.yaml"
 
 
 def detect_backend() -> str:
@@ -704,7 +713,7 @@ def load_config(vault: Vault) -> cfg.Config:
             except cfg.ConfigError:
                 pass
         log(f"config note '{item}' empty/absent; using the local file")
-    panels_file = os.environ.get("SOC_PANELS_FILE", "config/panels.yaml")
+    panels_file = os.environ.get("SOC_PANELS_FILE") or _resolved_panels()
     log(f"config source: {panels_file}")
     return cfg.load(panels_file)
 
@@ -796,7 +805,7 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
 def main():
     # Geometry preview (no display, no vault needed) — read the local file.
     if os.environ.get("SOC_DRY_RUN") == "1":
-        panels_file = os.environ.get("SOC_PANELS_FILE", "config/panels.yaml")
+        panels_file = os.environ.get("SOC_PANELS_FILE") or _resolved_panels()
         try:
             conf = cfg.load(panels_file)
         except cfg.ConfigError as e:

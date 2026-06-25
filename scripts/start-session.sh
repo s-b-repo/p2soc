@@ -16,7 +16,19 @@
 # Wayland compositor), SOC_XSERVER (explicit X server binary/command).
 
 ROOT="${SOC_ROOT:-/opt/soc-display}"
-ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
+
+# Resolve SOC_ENV_FILE via the SHARED resolver (host.configpaths) so this kiosk
+# path agrees with the wizard + the in-session launcher. Running as the root kiosk
+# user there is no per-user marker, so /etc wins here as before; the literal
+# fallback (== read tier #3) keeps the pre-install/non-systemd path working.
+RESOLVE_PY="$ROOT/.venv/bin/python"
+[ -x "$RESOLVE_PY" ] || RESOLVE_PY="$(command -v python3 2>/dev/null || true)"
+if [ -n "$RESOLVE_PY" ]; then
+  : "${SOC_ENV_FILE:=$(PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}" \
+        "$RESOLVE_PY" -m host.configpaths --env 2>/dev/null || true)}"
+fi
+: "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
+ENV_FILE="$SOC_ENV_FILE"
 if [ -f "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090

@@ -15,8 +15,16 @@ set -euo pipefail
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
 ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)}"
 [ -d "$ROOT/kiosk-host" ] || ROOT="/opt/soc-display"
-ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 MODE="fullscreen"
+
+# Resolve which soc.env the wall reads via the SAME resolver the wizard writes
+# with (host.configpaths), so shell + Python never drift. Needs PYTHONPATH/PYBIN.
+export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
+RESOLVE_PY="$ROOT/.venv/bin/python"
+[ -x "$RESOLVE_PY" ] || RESOLVE_PY="$(command -v python3)"
+: "${SOC_ENV_FILE:=$("$RESOLVE_PY" -m host.configpaths --env 2>/dev/null || true)}"
+: "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
+ENV_FILE="$SOC_ENV_FILE"
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -65,13 +73,15 @@ if [ -x "$ROOT/scripts/launcher.sh" ]; then
   exec "$ROOT/scripts/launcher.sh"
 fi
 
-export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
-export SOC_PANELS_FILE="${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}"
-export SOC_INJECT_TMPL="${SOC_INJECT_TMPL:-$ROOT/inject/login.js.tmpl}"
-export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
-
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+
+# Resolve SOC_PANELS_FILE AFTER sourcing soc.env so an explicit one in the env wins.
+: "${SOC_PANELS_FILE:=$("$PYBIN" -m host.configpaths --panels 2>/dev/null || true)}"
+: "${SOC_PANELS_FILE:=/etc/soc-display/panels.yaml}"
+export SOC_PANELS_FILE SOC_ENV_FILE
+export SOC_INJECT_TMPL="${SOC_INJECT_TMPL:-$ROOT/inject/login.js.tmpl}"
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
 cd "$ROOT" 2>/dev/null || true
 exec "$PYBIN" -m host.main

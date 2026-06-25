@@ -721,7 +721,13 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
 
 # --------------------------------------------------------------------------- #
 def load(path: Optional[str] = None) -> Config:
-    path = path or os.environ.get("SOC_PANELS_FILE", "config/panels.yaml")
+    if path is None:
+        path = os.environ.get("SOC_PANELS_FILE")
+    if path is None:
+        # No explicit path / override: resolve through the SHARED resolver so a bare
+        # cfg.load() reads exactly what the wizard wrote (per-user marker > /etc > repo).
+        from . import configpaths
+        path = configpaths.resolve_panels() or "config/panels.yaml"
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh)
