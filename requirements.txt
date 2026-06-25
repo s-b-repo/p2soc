@@ -1,0 +1,11 @@
+# Runtime Python dependencies for the SOC video-wall host.
+#
+# The INSTALLERS are the source of truth for HOW these land on a box: install.sh
+# prefers distro packages (python3-cryptography etc.) and the Makefile/venv path
+# pip-installs them with --only-binary (cryptography is a Rust extension — a source
+# build reliably OOM-kills the 1GB Pi 5). This file is the TRACKED MANIFEST so the
+# free dependency bot (Dependabot) can flag upstream updates + security fixes and
+# CI can verify nothing breaks. Keep it in sync with install.sh's pip line.
+cryptography>=3.5
+PyYAML>=5.1
+websocket-client>=1.0
