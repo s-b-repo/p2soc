@@ -63,13 +63,13 @@ desktop-dev: .venv  ## install user-level app icons pointing at THIS checkout (n
 	  "$(CURDIR)/scripts/soc-wall-menu" soc-wall > $(HOME)/.local/share/applications/soc-wall.desktop
 	@printf '%s\n' '[Desktop Entry]' 'Name=SOC Wall Setup' 'Comment=Configure the SOC video wall' \
 	  'Exec=$(CURDIR)/scripts/soc-wall-setup-gui.sh' 'Icon=soc-wall' 'Terminal=false' \
-	  'Type=Application' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-setup.desktop
+	  'Type=Application' 'NoDisplay=true' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-setup.desktop
 	@printf '%s\n' '[Desktop Entry]' 'Name=SOC Wall Appearance' 'Comment=Theme colours and presets' \
 	  'Exec=$(CURDIR)/scripts/soc-wall-appearance.sh' 'Icon=soc-wall' 'Terminal=false' \
-	  'Type=Application' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-appearance.desktop
+	  'Type=Application' 'NoDisplay=true' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-appearance.desktop
 	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
 	@command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
-	@echo "dev app icons installed -> $(HOME)/.local/share/applications (SOC Video Wall + SOC Wall Setup + SOC Wall Appearance)"
+	@echo "dev app icons installed -> $(HOME)/.local/share/applications (only 'SOC Video Wall' is advertised; Setup + Appearance are NoDisplay, reached via the control center)"
 
 .PHONY: verify
 verify: .venv dev-vault  ## headless end-to-end check (Xvfb) — asserts logins + tunnel + screenshot
@@ -118,9 +118,11 @@ lint: .venv verify-arm  ## syntax-check shell + python + run the aarch64 gate
 	@bash -n install.sh && echo "install.sh: ok"
 	@for s in scripts/*.sh dev/*.sh; do bash -n "$$s" && echo "$$s: ok"; done
 	@$(PY) -m py_compile setup.py kiosk-host/host/*.py scripts/*.py dev/*.py && echo "python: ok"
-	@# headless wiring smokes (no GTK / no display): config resolver, launcher, health dot.
+	@# headless wiring smokes (no GTK / no display): config resolver, launcher,
+	@# health dot, the privileged sysaction runner.
 	@PYTHONPATH=kiosk-host $(PY) -m host.configpaths --check
 	@PYTHONPATH=kiosk-host $(PY) -m host.health --check
+	@PYTHONPATH=kiosk-host $(PY) -m host.sysaction --check
 	@PYTHONPATH=kiosk-host $(PY) -m host.launchermenu --check
 
 .PHONY: install

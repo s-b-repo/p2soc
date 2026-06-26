@@ -1,15 +1,24 @@
 """
-GTK launcher menu for the SOC video-wall — shown when the desktop icon
-(soc-wall.desktop) is clicked. It does NOT take over the machine; it offers:
+The SOC video-wall CONTROL CENTER — the single window behind soc-wall.desktop. It
+does NOT take over the machine; it is the one place to run, configure and manage
+the wall, grouped under quiet '// ' section eyebrows:
 
-  * Setup / Configure        -> the setup wizard (GUI if available, else TTY)
-  * Desktop mode             -> the wall windowed on the current display
-  * Kiosk mode               -> the wall fullscreen on the current display
+  // run        Desktop mode (windowed)        Kiosk mode (fullscreen)
+  // configure  Setup / Configure (wizard)     Appearance (theme editor)
+  // system     Install / Update               Uninstall
 
-Each choice spawns the matching helper (detached) and the menu closes. The name,
-tagline, icon and accent colours come from host.branding (edit branding/branding
-.yaml to rebrand). Styled via a Gtk.CssProvider; the window sizes to its content
-and is resizable. Pure PyGObject/GTK3 + stdlib.
+The layout is ADAPTIVE to install state (host.health.is_installed()): on a box
+that isn't installed yet, Install is the hero and the Run tiles dim with an
+'install first' hint; once installed, Run is the hero, Install reads 'Reinstall /
+Update' and Uninstall sits in the quiet // system group. Spawned flows (Run/Setup/
+Appearance) hand off / detach; IN-PROCESS flows (Install, Uninstall, Validate)
+refresh the control center in place so the operator always lands back on 'start'.
+
+Privileged actions (Install/Uninstall) never silently sudo — they go through
+host.sysaction (graphical pkexec, terminal fallback, else an honest manual hint)
+and stream live into a themed progress window. The name, tagline, icon and accent
+colours come from host.branding (edit branding/branding.yaml to rebrand); every
+surface is branding-driven so a rebrand reskins it. Pure PyGObject/GTK3 + stdlib.
 
 `--check` validates wiring without importing GTK / needing a display (for CI).
 """
@@ -100,21 +109,35 @@ def launch_appearance() -> bool:
     return _spawn([sys.executable, "-m", "host.appearance"], cwd=kiosk, env=env)
 
 
-# (glyph, title, subtitle, tag, css_class, colour_key, action). `glyph` names the
-# per-tile mode icon (a themed inline-SVG, see _GLYPHS / _glyph_image) — these are
-# PARALLEL choices, so an action-describing glyph beats a numeral that would imply a
-# sequence. colour_key indexes host.branding colours so a rebrand recolours the
-# cards AND their glyphs. (The wizard's '// step NN' IS a sequence — left numbered.)
+# (section, glyph, title, subtitle, tag, css_class, colour_key, action). `section`
+# is the '// ' eyebrow this tile lives under (run/configure/system); the build loop
+# emits the eyebrow when the section changes. `glyph` names the per-tile mode icon
+# (a themed inline-SVG, see _GLYPHS / _glyph_image) — these are PARALLEL choices, so
+# an action-describing glyph beats a numeral that would imply a sequence. colour_key
+# indexes host.branding colours so a rebrand recolours the cards AND their glyphs.
+# `action` is either a plain callable (spawn + close) or a sentinel string the build
+# loop binds to an in-process handler needing the window (install/uninstall).
+_ACT_INSTALL = "install"      # sentinel -> _on_install(win) (in-process; needs win)
+_ACT_UNINSTALL = "uninstall"  # sentinel -> _on_uninstall(win) (in-process; needs win)
+
 _ENTRIES = (
-    ("gear", "Setup / Configure", "Panels, vault and VPN", "", "soc-setup", "setup",
-     launch_setup),
-    ("window", "Desktop mode", "Run the wall in a window", "windowed", "soc-desktop", "desktop",
-     lambda: launch_wall("--window")),
-    ("expand", "Kiosk mode", "Fill this display, no desktop", "fullscreen", "soc-kiosk", "kiosk",
-     lambda: launch_wall("--fullscreen")),
-    ("swatch", "Appearance", "Theme colours & presets", "", "soc-appearance", "primary",
-     launch_appearance),
+    ("run", "window", "Desktop mode", "Run the wall in a window", "windowed",
+     "soc-desktop", "desktop", lambda: launch_wall("--window")),
+    ("run", "expand", "Kiosk mode", "Fill this display, no desktop", "fullscreen",
+     "soc-kiosk", "kiosk", lambda: launch_wall("--fullscreen")),
+    ("configure", "gear", "Setup / Configure", "Panels, vault and VPN", "",
+     "soc-setup", "setup", launch_setup),
+    ("configure", "swatch", "Appearance", "Theme colours & presets", "",
+     "soc-appearance", "primary", launch_appearance),
+    ("system", "download", "Install / Update", "Deploy or update the wall", "",
+     "soc-install", "accent_strong", _ACT_INSTALL),
+    ("system", "trash", "Uninstall", "Remove the deployed wall", "",
+     "soc-uninstall", "bad", _ACT_UNINSTALL),
 )
+
+# Ordered section eyebrows, with a human label for the '// ' line. Drives both the
+# build loop's grouping and the --check assertion that every entry's section is known.
+_SECTIONS = ("run", "configure", "system")
 
 
 def _esc(s: str) -> str:
@@ -206,11 +229,31 @@ def _svg_swatch(ac: str) -> str:
             f'<rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.3"/></g>')
 
 
+def _svg_download(ac: str) -> str:
+    # tray + down-arrow into it — "box-in / install / deploy onto this box".
+    return (f'<g fill="none" stroke="{ac}" stroke-width="1.8" '
+            f'stroke-linecap="round" stroke-linejoin="round">'
+            f'<path d="M12 3 V13"/><path d="M8 9.5 L12 13.5 L16 9.5"/>'
+            f'<path d="M4.5 16 V19.5 H19.5 V16"/></g>')
+
+
+def _svg_trash(ac: str) -> str:
+    # lid + can with two bars — "box-out / remove / uninstall".
+    return (f'<g fill="none" stroke="{ac}" stroke-width="1.7" '
+            f'stroke-linecap="round" stroke-linejoin="round">'
+            f'<path d="M4.5 6.5 H19.5"/><path d="M9.5 6.5 V4.5 H14.5 V6.5"/>'
+            f'<path d="M6.5 6.5 L7.4 19.5 H16.6 L17.5 6.5"/>'
+            f'<line x1="10" y1="9.5" x2="10" y2="16.5"/>'
+            f'<line x1="14" y1="9.5" x2="14" y2="16.5"/></g>')
+
+
 _GLYPHS = {"gear": _svg_gear, "window": _svg_window,
-           "expand": _svg_expand, "swatch": _svg_swatch}
+           "expand": _svg_expand, "swatch": _svg_swatch,
+           "download": _svg_download, "trash": _svg_trash}
 # Unicode fallback per glyph (themed Pango) if the SVG loader is unavailable.
 _GLYPH_FALLBACK = {"gear": "⚙", "window": "▢",
-                   "expand": "⤢", "swatch": "▦"}
+                   "expand": "⤢", "swatch": "▦",
+                   "download": "⤓", "trash": "✕"}
 
 
 def _glyph_image(glyph: str, accent: str, px: int = 22):
@@ -253,12 +296,14 @@ def _css() -> bytes:
     border = col("border", "#CFE0D4")
     accent = col("primary", "#1FA463")
     accent_strong = col("accent_strong", "#157A49")
+    bad = col("bad", "#C0341D")
     text_dim = col("text_dim", "#5B7567")
     setup, desktop, kiosk = (col("setup", "#1FA463"), col("desktop", "#1FA463"),
                              col("kiosk", "#0E7C7B"))
     appearance = col("primary", "#1FA463")  # the Appearance tile uses the brand accent
     glow = _rgba(accent, 0.28)
     emph_glow = _rgba(accent, 0.22)
+    bad_glow = _rgba(bad, 0.26)
 
     def card(cls, ac):
         # flat fill at rest; on hover the accent left-border, an inset accent ring
@@ -295,14 +340,24 @@ window.soc-launcher {{ background-color: {bg}; }}
 {card("soc-desktop", desktop)}
 {card("soc-kiosk", kiosk)}
 {card("soc-appearance", appearance)}
+{card("soc-install", accent_strong)}
 .soc-tag {{ background-color: {s_bot}; border: 1px solid {border};
   border-radius: 4px; padding: 2px 9px; color: {text_dim}; }}
-/* first-run empty state: dim tiles that would only fail, emphasise Setup. */
+/* first-run / not-installed empty state: dim tiles that would only fail,
+   emphasise the hero (Setup when unconfigured, Install when not installed). */
 .soc-disabled {{ opacity: 0.45; }}
 .soc-emphasis {{ border-left-width: 4px; border-left-color: {accent};
   box-shadow: inset 0 0 0 1px {accent}, 0 4px 14px {emph_glow}; }}
 .soc-validate {{ padding: 1px 6px; border-radius: 4px; }}
 .soc-validate:hover {{ background-color: {s_bot}; }}
+/* Uninstall is the only destructive action — bad-coloured left border + a
+   bad-tinted hover ring. Danger styling lives ONLY here (and its confirm flow). */
+.soc-uninstall {{ border-left-color: {bad}; }}
+.soc-danger {{ border-left-color: {bad}; }}
+.soc-danger:hover {{ border-color: {bad};
+  box-shadow: inset 0 0 0 1px {bad}, 0 6px 18px {bad_glow}; }}
+/* danger eyebrow / heading colour for the uninstall confirm surfaces. */
+.soc-danger-head {{ color: {bad}; }}
 """.encode()
 
 
@@ -313,6 +368,10 @@ class _Launcher:
     provider = None
     Gtk = None
     Gdk = None
+    # True only during an in-place control-center refresh (Install/Uninstall done):
+    # the old window's destroy must NOT Gtk.main_quit when we're swapping in a fresh
+    # one in the same loop. Reset by the new window's destroy handler.
+    refreshing = False
 
 
 def _reapply():
@@ -452,6 +511,251 @@ def _show_result_window(parent, cols, cause: str, result: dict):
     w.show_all()
 
 
+# --------------------------------------------------------------------------- #
+# Privileged system actions (Install / Uninstall) — themed confirm dialogs, then
+# host.sysaction runs the script in a live progress window and _refresh lands the
+# operator back on the control center. Every surface here reuses the launcher's
+# CssProvider (.soc-launcher) so a rebrand reskins it; danger styling appears ONLY
+# in the uninstall flow. GTK on the main thread only; no nested Gtk.main.
+# --------------------------------------------------------------------------- #
+def _child_window(parent, title, danger=False):
+    """A themed transient modal child reusing the launcher provider. `danger` flips
+    the top accent to the bad colour (uninstall only)."""
+    Gtk = _Launcher.Gtk
+    w = Gtk.Window(title=title)
+    w.set_transient_for(parent)
+    w.set_modal(True)
+    w.set_resizable(True)
+    w.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+    w.get_style_context().add_class("soc-launcher")
+    if danger:
+        w.get_style_context().add_class("soc-danger")
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    box.set_margin_top(18)
+    box.set_margin_bottom(18)
+    box.set_margin_start(20)
+    box.set_margin_end(20)
+    box.set_size_request(420, -1)
+    w.add(box)
+    return w, box
+
+
+def _eyebrow(text: str, colour: str):
+    """A '// '-style mono eyebrow label (the kept console signature)."""
+    Gtk = _Launcher.Gtk
+    lbl = Gtk.Label(xalign=0)
+    lbl.set_markup(f'<span font_family="monospace" foreground="{colour}" '
+                   f'size="9500" weight="bold" letter_spacing="800">{_esc(text)}</span>')
+    return lbl
+
+
+def _manual_window(parent, cols, action, line):
+    """No pkexec AND no terminal — show the exact shell line in a themed child
+    (selectable) instead of failing silently or nesting guierror's own Gtk.main."""
+    Gtk = _Launcher.Gtk
+    dim = cols.get("text_dim", "#5B7567")
+    text = cols.get("text", "#0B1F14")
+    primary = cols.get("primary", "#1FA463")
+    w, box = _child_window(parent, "Run in a shell")
+    box.pack_start(_eyebrow("// manual", dim), False, False, 0)
+    msg = Gtk.Label(xalign=0)
+    msg.set_line_wrap(True)
+    msg.set_markup(f'<span foreground="{text}" size="11000">No graphical sudo '
+                   f'(pkexec) or terminal was found. Run this in a shell to '
+                   f'{_esc(action)}:</span>')
+    box.pack_start(msg, False, False, 0)
+    code = Gtk.Label(xalign=0)
+    code.set_selectable(True)
+    code.set_line_wrap(True)
+    code.set_markup(f'<span font_family="monospace" foreground="{primary}" '
+                    f'size="10500">{_esc(line)}</span>')
+    box.pack_start(code, False, False, 0)
+    close = Gtk.Button(label="Close")
+    close.set_relief(Gtk.ReliefStyle.NONE)
+    close.get_style_context().add_class("soc-validate")
+    close.set_halign(Gtk.Align.END)
+    if isinstance(close.get_child(), Gtk.Label):
+        close.get_child().set_markup(f'<span font_family="monospace" '
+                                     f'foreground="{primary}" size="9000" '
+                                     f'letter_spacing="600">close</span>')
+    close.connect("clicked", lambda _b: w.destroy())
+    box.pack_start(close, False, False, 0)
+    w.show_all()
+
+
+def _run_privileged(win, cols, action, *, mode=None, purge=False, on_done=None):
+    """Build the elevation argv via host.sysaction and either run it in the live
+    progress window or, when neither pkexec nor a terminal exists, show the manual
+    shell line. NEVER fails silently."""
+    from host import sysaction
+    argv, how = sysaction.build_argv(action, mode=mode, purge=purge)
+    if how == "manual":
+        line = sysaction.manual_hint(action, mode=mode, purge=purge)
+        verb = "install / update the wall" if action == "install" else "uninstall the wall"
+        _manual_window(win, cols, verb, line)
+        return
+    title = "Install / Update" if action == "install" else "Uninstall"
+    sysaction.run_streamed(win, title, argv, on_done=on_done)
+
+
+def _on_install(win, cols, installed, on_done):
+    """Themed mode-picker BEFORE running install.sh — Desktop (default) vs Kiosk
+    appliance, each with its consequence stated inline. On Install -> run_streamed."""
+    Gtk = _Launcher.Gtk
+    dim = cols.get("text_dim", "#5B7567")
+    text = cols.get("text", "#0B1F14")
+    accent = cols.get("primary", "#1FA463")
+    warn = cols.get("warn", "#B8860B")
+    w, box = _child_window(win, "Install / Update")
+
+    verb = "Reinstall / Update" if installed else "Install"
+    box.pack_start(_eyebrow(f"// {verb.lower()}", dim), False, False, 0)
+
+    # Two radio cards sharing state. Desktop pre-selected (the safe default).
+    rb_desktop = Gtk.RadioButton.new_with_label_from_widget(
+        None, "Desktop (keep my boot/DE)")
+    rb_kiosk = Gtk.RadioButton.new_with_label_from_widget(
+        rb_desktop, "Kiosk appliance")
+    rb_desktop.set_active(True)
+
+    def _consequence(parent_rb, markup):
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_line_wrap(True)
+        lbl.set_markup(markup)
+        lbl.set_margin_start(24)
+        lbl.set_margin_bottom(4)
+        return lbl
+
+    box.pack_start(rb_desktop, False, False, 0)
+    box.pack_start(_consequence(
+        rb_desktop,
+        f'<span font_family="monospace" foreground="{dim}" size="9000">'
+        f'deploys everything; your login manager/desktop stays — launch the '
+        f'wall from this app or <tt>systemctl start soc-wall</tt>.</span>'),
+        False, False, 0)
+    box.pack_start(rb_kiosk, False, False, 0)
+    box.pack_start(_consequence(
+        rb_kiosk,
+        f'<span foreground="{warn}" size="9000">this box <b>BOOTS</b> into the '
+        f'wall — autologin on tty1, no desktop. For a dedicated screen.</span>'),
+        False, False, 0)
+
+    if installed:
+        note = Gtk.Label(xalign=0)
+        note.set_line_wrap(True)
+        note.set_markup(f'<span font_family="monospace" foreground="{dim}" '
+                        f'size="9000">safe to re-run; packages are skipped unless '
+                        f'<tt>--fresh</tt>.</span>')
+        box.pack_start(note, False, False, 0)
+
+    btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    btns.set_halign(Gtk.Align.END)
+    cancel = Gtk.Button(label="Cancel")
+    cancel.connect("clicked", lambda _b: w.destroy())
+    primary_btn = Gtk.Button(label=verb)
+    primary_btn.get_style_context().add_class("suggested-action")
+
+    def _go(_b):
+        mode = "kiosk" if rb_kiosk.get_active() else "desktop"
+        w.destroy()
+        _run_privileged(win, cols, "install", mode=mode, on_done=on_done)
+    primary_btn.connect("clicked", _go)
+    btns.pack_start(cancel, False, False, 0)
+    btns.pack_start(primary_btn, False, False, 0)
+    box.pack_start(btns, False, False, 0)
+    w.show_all()
+    cancel.grab_focus()  # safe default focus
+
+
+def _on_uninstall(win, cols, on_done):
+    """DOUBLE-confirm danger flow (only reachable when installed). Step 1 lists what
+    gets removed + an optional purge checkbox; step 2 is a final explicit confirm.
+    Only then does uninstall.sh run (always --force; +--purge if checked)."""
+    Gtk = _Launcher.Gtk
+    dim = cols.get("text_dim", "#5B7567")
+    text = cols.get("text", "#0B1F14")
+    bad = cols.get("bad", "#C0341D")
+    w, box = _child_window(win, "Uninstall", danger=True)
+    box.pack_start(_eyebrow("// REMOVE", bad), False, False, 0)
+
+    intro = Gtk.Label(xalign=0)
+    intro.set_line_wrap(True)
+    intro.set_markup(f'<span foreground="{text}" size="11000" weight="bold">'
+                     f'This removes the deployed SOC wall.</span>')
+    box.pack_start(intro, False, False, 0)
+
+    # EXACTLY what uninstall.sh removes on the keep-data path (kept in sync with
+    # uninstall.sh: /opt tree, the 5 units, the desktop entries + icon, litebw,
+    # sudoers + hardening drop-ins, the tty1 autologin override on kiosk).
+    removed = Gtk.Label(xalign=0)
+    removed.set_line_wrap(True)
+    removed.set_markup(
+        f'<span font_family="monospace" foreground="{text}" size="9500">'
+        f'• /opt/soc-display (deployed tree)\n'
+        f'• units: soc-wall, forti-vpn, autossh-tunnel, soc-tarpit, vaultwarden\n'
+        f'• desktop entries + icon, /usr/local/bin/litebw\n'
+        f'• sudoers drop-in + hardening drop-ins\n'
+        f'• (kiosk) the tty1 autologin override</span>')
+    box.pack_start(removed, False, False, 0)
+
+    kept = Gtk.Label(xalign=0)
+    kept.set_line_wrap(True)
+    kept.set_markup(
+        f'<span font_family="monospace" foreground="{dim}" size="9000">'
+        f'KEPT unless Purge: /etc/soc-display config + sealed secrets, the '
+        f'soc/socsvc/vaultwarden users + homes, the Vaultwarden vault.</span>')
+    box.pack_start(kept, False, False, 0)
+
+    purge = Gtk.CheckButton.new_with_label(
+        "Also purge config, secrets & users (irreversible)")
+    box.pack_start(purge, False, False, 0)
+
+    btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    btns.set_halign(Gtk.Align.END)
+    cancel = Gtk.Button(label="Cancel")
+    cancel.connect("clicked", lambda _b: w.destroy())
+    cont = Gtk.Button(label="Continue…")
+    cont.get_style_context().add_class("destructive-action")
+
+    def _step2(_b):
+        do_purge = purge.get_active()
+        w.destroy()
+        w2, box2 = _child_window(win, "Confirm uninstall", danger=True)
+        box2.pack_start(_eyebrow("// CONFIRM", bad), False, False, 0)
+        msg = Gtk.Label(xalign=0)
+        msg.set_line_wrap(True)
+        if do_purge:
+            txt = ("This permanently removes the deployed wall AND your config, "
+                   "secrets and users — this cannot be undone.")
+        else:
+            txt = "This permanently removes the deployed wall."
+        msg.set_markup(f'<span foreground="{text}" size="11000" weight="bold">'
+                       f'{_esc(txt)}</span>')
+        box2.pack_start(msg, False, False, 0)
+        b2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        b2.set_halign(Gtk.Align.END)
+        c2 = Gtk.Button(label="Cancel")
+        c2.connect("clicked", lambda _x: w2.destroy())
+        go = Gtk.Button(label="Uninstall")
+        go.get_style_context().add_class("destructive-action")
+
+        def _do(_x):
+            w2.destroy()
+            _run_privileged(win, cols, "uninstall", purge=do_purge, on_done=on_done)
+        go.connect("clicked", _do)
+        b2.pack_start(c2, False, False, 0)
+        b2.pack_start(go, False, False, 0)
+        box2.pack_start(b2, False, False, 0)
+        w2.show_all()
+        c2.grab_focus()
+    cont.connect("clicked", _step2)
+    btns.pack_start(cancel, False, False, 0)
+    btns.pack_start(cont, False, False, 0)
+    box.pack_start(btns, False, False, 0)
+    w.show_all()
+    cancel.grab_focus()
+
+
 def _build_window():
     import gi
     gi.require_version("Gtk", "3.0")
@@ -467,11 +771,16 @@ def _build_window():
     # runs later on a thread.
     try:
         sync = health.sync_state()
+        # is_installed() is SYNC-class (cheap os.path.exists / pwd) — drives the
+        # adaptive // system group (Install hero vs Reinstall + Uninstall). Same
+        # guard as sync_state: install-state probing must never block the open.
+        inst = health.is_installed()
     except Exception:  # noqa: BLE001 — health must never block the launcher opening
         sync = {"overall_sync": "unconfigured", "panels_path": None,
                 "panels_tier": "none", "panels_count": None, "panels_valid": None,
                 "config_error": None, "vault_note": None, "vault_url_hostport": None,
                 "vpn_configured": False, "configured": False}
+        inst = {"installed": False, "reason": "health unavailable"}
 
     provider = Gtk.CssProvider()
     _Launcher.Gtk, _Launcher.Gdk = Gtk, Gdk   # set BEFORE _css() so the motion gate reads Settings
@@ -495,7 +804,8 @@ def _build_window():
             pass
 
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-    root.set_size_request(360, -1)
+    # min width bumped for the three grouped sections so they never clip.
+    root.set_size_request(380, -1)
     win.add(root)
 
     # --- header --------------------------------------------------------------
@@ -649,56 +959,84 @@ def _build_window():
         GLib.idle_add(_recolour_dot, level, label)
     threading.Thread(target=_probe_run, daemon=True).start()
 
-    # --- body: the action cards ----------------------------------------------
-    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=11)
+    # --- body: the grouped action cards --------------------------------------
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     body.get_style_context().add_class("soc-body")
     root.pack_start(body, True, True, 0)
 
-    # '//'-section header above the action tiles (mono, dim).
-    comment = Gtk.Label(xalign=0)
-    comment.set_markup(f'<span font_family="monospace" foreground="{dim}" '
-                       f'size="8200" letter_spacing="800">// actions</span>')
-    comment.set_margin_bottom(2)
-    body.pack_start(comment, False, False, 0)
-
     text = cols.get("text", "#0B1F14")
+
+    # IN-PLACE REFRESH (item 4): after an in-process action completes (Install,
+    # Uninstall) re-read health + rebuild the control center so the operator lands
+    # back on a fresh 'start'. Implemented by destroying THIS window and building a
+    # new one in the SAME Gtk.main loop — _Launcher.refreshing suppresses the
+    # destroy->main_quit so the loop survives the swap.
+    def _refresh(_rc=None):
+        _Launcher.refreshing = True
+        win.destroy()
+        new_win, _ = _build_window()
+        new_win.show_all()
+        return False  # idle_add one-shot if ever scheduled
 
     def on(action):
         def _cb(_btn):
             # Appearance opens IN-PROCESS as a child window (so a live colour change
-            # recolours THIS launcher) and the menu stays open. Every other tile
-            # spawns its detached helper and closes the menu.
+            # recolours THIS launcher) and the menu stays open. Install/Uninstall run
+            # IN-PROCESS too (confirm dialog -> progress window -> _refresh in place).
+            # Every other tile spawns its detached helper and closes the menu.
             if action is launch_appearance:
                 _open_appearance(win)
+                return
+            if action == _ACT_INSTALL:
+                _on_install(win, cols, inst.get("installed", False), _refresh)
+                return
+            if action == _ACT_UNINSTALL:
+                _on_uninstall(win, cols, _refresh)
                 return
             action()
             win.destroy()
         return _cb
 
-    # FIRST-RUN / EMPTY STATE (item 5): when NOTHING is configured, Desktop+Kiosk
-    # would only fail — dim + disable them with a 'configure first' hint and put a
-    # branded emphasis on Setup so the eye goes there. A configured (or merely
-    # invalid-but-present) box looks UNCHANGED. We key off 'unconfigured' only:
-    # 'invalid' is a configured-but-broken RED state, not an empty state.
+    # ADAPTIVE STATE (item 2): the install state tells a story.
+    #  * NOT installed -> Install is the HERO (emphasised); the Run tiles dim with an
+    #    'install first' hint (nothing to run yet). Uninstall is hidden (nothing to
+    #    remove). Install reads "Install".
+    #  * installed -> Run is the hero; Install reads "Reinstall / Update" (not
+    #    emphasised); Uninstall sits enabled in the quiet // system group (.soc-danger).
+    # When installed-but-unconfigured, Setup also gets the emphasis + Run still dims
+    # (it would only fail) — generalising the old first-run steering to BOTH signals.
+    installed = bool(inst.get("installed"))
     unconfigured = sync.get("overall_sync") == "unconfigured"
-    _DIM_TILES = {"soc-desktop", "soc-kiosk"}
+    _RUN_TILES = {"soc-desktop", "soc-kiosk"}
+    # Run dims when there's nothing to run yet (not installed) OR nothing configured.
+    dim_run = (not installed) or unconfigured
 
-    for glyph, title, subtitle, tag, css_class, colour_key, action in _ENTRIES:
+    def _make_card(glyph, title, subtitle, tag, css_class, colour_key, action):
         accent = branding.color(colour_key)
-        steer_off = unconfigured and css_class in _DIM_TILES
+        steer_off = dim_run and css_class in _RUN_TILES
+        emphasise = False
+        if not installed and css_class == "soc-install":
+            emphasise = True            # hero: set this box up first
+        elif installed and unconfigured and css_class == "soc-setup":
+            emphasise = True            # installed but empty -> steer to Setup
+        # Adaptive copy: Install title/subtitle flip once installed.
+        if css_class == "soc-install":
+            title = "Reinstall / Update" if installed else "Install"
+            subtitle = ("Re-run or update the deployment" if installed
+                        else "Set this box up first")
         btn = Gtk.Button()
         btn.set_relief(Gtk.ReliefStyle.NONE)
         btn.get_style_context().add_class("soc-card")
         btn.get_style_context().add_class(css_class)
+        if css_class == "soc-uninstall":
+            btn.get_style_context().add_class("soc-danger")  # the only danger tile
         if steer_off:
             btn.set_sensitive(False)               # they'd only fail -> honest disable
             btn.get_style_context().add_class("soc-disabled")
-        elif unconfigured and css_class == "soc-setup":
-            btn.get_style_context().add_class("soc-emphasis")  # steer the eye to Setup
+        elif emphasise:
+            btn.get_style_context().add_class("soc-emphasis")
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        # Per-tile mode glyph (themed inline-SVG, accent-stroked) replaces the old
-        # numeral watermark — it says what the action IS, not a fake sequence.
         gimg = _glyph_image(glyph, accent, px=22)
         gimg.set_valign(Gtk.Align.START)
         gimg.set_margin_top(1)
@@ -706,12 +1044,11 @@ def _build_window():
 
         txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         t = Gtk.Label(xalign=0)
-        # title in near-black-green display bold with tight tracking (sans, technical).
         t.set_markup(f'<span foreground="{text}" size="12800" weight="bold" '
                      f'letter_spacing="-300">{_esc(title)}</span>')
         s = Gtk.Label(xalign=0)
-        # when steered-off, the subtitle becomes the honest 'configure first' hint.
-        sub_text = "configure first" if steer_off else subtitle
+        # when steered-off, the subtitle becomes the honest 'install first' hint.
+        sub_text = "install first" if steer_off else subtitle
         s.set_markup(f'<span foreground="{dim}" size="9800">{_esc(sub_text)}</span>')
         txt.pack_start(t, False, False, 0)
         txt.pack_start(s, False, False, 0)
@@ -723,7 +1060,6 @@ def _build_window():
             tg.set_markup(f'<span font_family="monospace" foreground="{dim}" '
                           f'size="8200" letter_spacing="800">{_esc(tag)}</span>')
             row.pack_start(tg, False, False, 0)
-        # mono '▸' marker = the run/select cue, in the card's accent.
         mark = Gtk.Label()
         mark.set_valign(Gtk.Align.CENTER)
         mark.set_markup(f'<span font_family="monospace" foreground="{accent}" '
@@ -731,9 +1067,33 @@ def _build_window():
         row.pack_start(mark, False, False, 0)
         btn.add(row)
         btn.connect("clicked", on(action))
-        body.pack_start(btn, False, False, 0)
+        return btn
 
-    win.connect("destroy", Gtk.main_quit)
+    # GROUPED build: emit a dim '// <section>' eyebrow when the section changes, then
+    # its cards. Uninstall is omitted entirely when nothing is installed.
+    cur_section = None
+    for section, glyph, title, subtitle, tag, css_class, colour_key, action in _ENTRIES:
+        if css_class == "soc-uninstall" and not installed:
+            continue  # nothing to remove yet — hide the tile entirely
+        if section != cur_section:
+            cur_section = section
+            eb = Gtk.Label(xalign=0)
+            eb.set_markup(f'<span font_family="monospace" foreground="{dim}" '
+                          f'size="8200" letter_spacing="800">// {section}</span>')
+            eb.set_margin_top(6 if section != _SECTIONS[0] else 0)
+            eb.set_margin_bottom(1)
+            body.pack_start(eb, False, False, 0)
+        body.pack_start(
+            _make_card(glyph, title, subtitle, tag, css_class, colour_key, action),
+            False, False, 0)
+
+    # Destroy quits the loop UNLESS we're swapping windows for an in-place refresh.
+    def _on_destroy(_w):
+        if _Launcher.refreshing:
+            _Launcher.refreshing = False   # the new window owns the loop now
+            return
+        Gtk.main_quit()
+    win.connect("destroy", _on_destroy)
     # One collect after the whole tree is built reclaims the many short-lived Python
     # wrappers GTK construction creates, before Gtk.main() idles. One-shot, cheap.
     import gc
@@ -744,10 +1104,23 @@ def _build_window():
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--check" in argv:               # CI: verify wiring, no GTK / no display
-        assert len(_ENTRIES) == 4 and all(len(e) == 7 and callable(e[-1]) for e in _ENTRIES)
-        assert any(e[4] == "soc-appearance" and e[-1] is launch_appearance for e in _ENTRIES)
-        # every tile names a known mode glyph (the per-tile inline-SVG icon).
-        assert all(e[0] in _GLYPHS for e in _ENTRIES), "unknown glyph key in _ENTRIES"
+        # SIX tiles now, each an 8-tuple (section, glyph, title, sub, tag, class,
+        # colour_key, action) with a callable-or-sentinel action.
+        assert len(_ENTRIES) == 6
+        assert all(len(e) == 8 for e in _ENTRIES), "every entry is an 8-tuple"
+        assert all(callable(e[-1]) or e[-1] in (_ACT_INSTALL, _ACT_UNINSTALL)
+                   for e in _ENTRIES), "action must be callable or a known sentinel"
+        # every tile lives under a known // section.
+        assert all(e[0] in _SECTIONS for e in _ENTRIES), "unknown section in _ENTRIES"
+        by_class = {e[5]: e for e in _ENTRIES}
+        assert by_class["soc-appearance"][-1] is launch_appearance
+        assert by_class["soc-install"][-1] == _ACT_INSTALL
+        assert by_class["soc-uninstall"][-1] == _ACT_UNINSTALL
+        # every tile names a known mode glyph (the per-tile inline-SVG icon), and the
+        # new system glyphs exist with unicode fallbacks.
+        assert all(e[1] in _GLYPHS for e in _ENTRIES), "unknown glyph key in _ENTRIES"
+        for g in ("download", "trash"):
+            assert g in _GLYPHS and g in _GLYPH_FALLBACK, f"missing glyph {g!r}"
         # the honest dot is health-driven: health must import + map every level
         # headless (no GTK), and dot_for must produce a real (level, label).
         from host import health
@@ -760,6 +1133,13 @@ def main(argv=None) -> int:
                  {"vault_reachable": None, "vpn_state": "not_configured"}),
                 ({"overall_sync": "configured", "panels_valid": True}, None),
             )), f"health.dot_for never yields {lvl!r}"
+        # the adaptive system group is driven by health.is_installed() — it must be
+        # present and return a bool `installed` headless.
+        inst = health.is_installed()
+        assert isinstance(inst.get("installed"), bool), "is_installed missing/bad"
+        # host.sysaction (the privileged runner) must import + wire headless too.
+        from host import sysaction
+        assert sysaction._check() == 0, "sysaction wiring check failed"
         branding.load()                 # branding must load without raising
         print("launchermenu ok")
         return 0

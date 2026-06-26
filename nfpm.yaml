@@ -103,11 +103,14 @@ contents:
   - src: ./branding/**
     dst: /opt/soc-display/branding
 
-  # ---- clickable launchers: XDG .desktop entries + icon ----
-  # The .desktop files (launcher menu, setup wizard, appearance editor) and their
-  # icon under share/ ship inside the prod tree; postinstall (install.sh,
-  # SOC_SKIP_PACKAGES=1) installs the entries onto the system apps menu against
-  # the operator's existing DE.
+  # ---- clickable launcher: the XDG .desktop entries + icon ----
+  # soc-wall.desktop is the SINGLE advertised entry — the "SOC Video Wall" control
+  # center (run / configure / install / uninstall in one window). The setup +
+  # appearance entries still ship (the control center execs their scripts) but carry
+  # NoDisplay=true in the source so they stay out of application menus. All three +
+  # the icon under share/ ship inside the prod tree; postinstall (install.sh,
+  # SOC_SKIP_PACKAGES=1) installs the entries onto the system apps menu against the
+  # operator's existing DE.
   - src: ./soc-wall.desktop
     dst: /opt/soc-display/soc-wall.desktop
   - src: ./soc-wall-setup.desktop
