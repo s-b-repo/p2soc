@@ -52,10 +52,22 @@ def _root() -> str:
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _user_branding() -> str:
+    """Per-user theme file (XDG) — always writable by a desktop user, so the
+    appearance editor / Setup never needs root on a deployed box (root-owned /etc).
+    Read above /etc (below SOC_BRANDING_FILE) so a user's saved theme wins for them."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(base, "soc-display", "branding.yaml")
+
+
 def _candidates():
     env = os.environ.get("SOC_BRANDING_FILE")
     if env:
         yield env
+    user = _user_branding()
+    if os.path.exists(user):
+        yield user
     yield "/etc/soc-display/branding.yaml"
     root = _root()
     yield os.path.join(root, "branding", "branding.yaml")
@@ -219,24 +231,20 @@ def _save_target(path: str | None) -> str:
                 f"cannot write branding to $SOC_BRANDING_FILE={env!r} "
                 f"(directory not writable) — re-run as root or fix permissions")
         return os.path.abspath(env)
-    # 3. /etc/soc-display/branding.yaml ONLY if the dir exists and is writable.
-    etc = "/etc/soc-display/branding.yaml"
+    # 3. /etc/soc-display/branding.yaml ONLY if the dir exists and is writable (root).
     if os.path.isdir("/etc/soc-display") and os.access("/etc/soc-display", os.W_OK):
-        return etc
-    # If /etc exists but isn't ours, don't silently drop to repo — but only refuse
-    # if there's also no repo checkout to fall back to (deployed box, non-root).
+        return "/etc/soc-display/branding.yaml"
+    # 4. repo checkout — keep the theme with the source in a dev tree.
     repo = os.path.join(_root(), "branding", "branding.yaml")
-    if os.path.isdir("/etc/soc-display") and not _writable(repo):
-        raise PermissionError(
-            f"cannot write branding to {etc!r} (not writable by this user) and no "
-            f"writable repo fallback — re-run as root, or set SOC_BRANDING_FILE to "
-            f"a path you own")
-    # 4. repo file (dev / the file load() already reads).
-    if not _writable(repo):
-        raise PermissionError(
-            f"cannot write branding to {repo!r} (directory not writable) — "
-            f"set SOC_BRANDING_FILE to a path you own")
-    return os.path.abspath(repo)
+    if _writable(repo):
+        return os.path.abspath(repo)
+    # 5. per-user XDG file — ALWAYS writable, so a desktop user on a deployed box
+    #    (root-owned /etc, non-writable /opt) never needs root; _candidates() reads
+    #    it above /etc so the saved theme applies on next launch. This is the path
+    #    that fixes "cannot write branding ... and no writable repo fallback".
+    user = _user_branding()
+    os.makedirs(os.path.dirname(user), exist_ok=True)
+    return os.path.abspath(user)
 
 
 def _rewrite_colors_inplace(lines: "list[str]", colors: dict) -> "list[str]":
