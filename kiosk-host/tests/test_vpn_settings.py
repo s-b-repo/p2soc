@@ -1,4 +1,7 @@
 """On-screen VPN settings: form->dict + boot override merge (pure, no GTK)."""
+import pytest
+
+pytest.importorskip("gi")  # configwin imports gi at module scope — skip where PyGObject is absent (CI)
 from host import configwin
 
 
