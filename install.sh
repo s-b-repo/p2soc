@@ -37,6 +37,12 @@
 #   VW_MODE=docker|native     how to run Vaultwarden           (default: docker)
 #   SSH_ADMIN_CIDR=<cidr>      admin subnet baked into nftables (HARDEN=1; fail-closed)
 #   HARDEN=1                  apply nftables + sshd hardening  (default: off)
+#                             also: kernel-hardening sysctls, a USB/DMA modprobe
+#                             blacklist, and nodev,nosuid,noexec on /tmp.
+#   SOC_SKIP_MODPROBE=1       under HARDEN=1, do NOT blacklist usb_storage/
+#                             firewire_core/cdc_acm modules (default: apply)
+#   SOC_SKIP_FSTAB=1          under HARDEN=1, do NOT harden /tmp mount options
+#                             (nodev,nosuid,noexec)                (default: apply)
 #   KIOSK_USER=soc            kiosk login user (tty1 autologin) (default: soc)
 #   DESKTOP_USER=socwall      desktop-mode wall user (DE session)(default: socwall)
 #   SVC_USER=socsvc           service user (autossh)           (default: socsvc)
@@ -66,6 +72,10 @@ COMPOSITOR="${COMPOSITOR:-labwc}"
 INSTALL_MODE="${INSTALL_MODE:-desktop}"
 # scanner-deception tarpit on :80 — installed always, ENABLED only when opted in.
 SOC_TARPIT_ENABLE="${SOC_TARPIT_ENABLE:-0}"
+# HARDEN sub-knobs: per-item opt-OUT for the physical-attack-surface hardening so
+# an operator can keep nftables/sshd hardening but skip module-blacklist / fstab.
+SOC_SKIP_MODPROBE="${SOC_SKIP_MODPROBE:-0}"
+SOC_SKIP_FSTAB="${SOC_SKIP_FSTAB:-0}"
 SKIP_PACKAGES="${SOC_SKIP_PACKAGES:-0}"
 DEPS_ONLY=0
 FRESH="${SOC_FRESH:-0}"
@@ -718,6 +728,24 @@ if [ "$HAS_SYSTEMD" = "1" ] && [ "${#PK_ZRAM[@]}" -gt 0 ]; then
   cp "$SOC_ROOT/security/zram.conf" /etc/systemd/zram-generator.conf
 fi
 cp "$SOC_ROOT/security/99-soc-sysctl.conf" /etc/sysctl.d/99-soc.conf
+# Capability-gate each key: a sysctl knob missing on an older Pi kernel must
+# skip-with-reason, not make `sysctl --system` complain. Comment out any line
+# whose /proc/sys/<path> isn't present so the deployed file only sets what this
+# kernel supports. Idempotent: a re-run re-copies the pristine file first, then
+# re-evaluates. kernel.foo.bar -> /proc/sys/kernel/foo/bar.
+while IFS= read -r _sline; do
+  case "$_sline" in
+    ''|'#'*) continue ;;
+  esac
+  _skey="${_sline%%=*}"
+  _skey="${_skey// /}"
+  [ -n "$_skey" ] || continue
+  if [ ! -e "/proc/sys/${_skey//.//}" ]; then
+    sed -i "s|^[[:space:]]*${_skey}[[:space:]]*=.*|# (unsupported on this kernel) &|" \
+      /etc/sysctl.d/99-soc.conf 2>/dev/null || true
+    warn "  sysctl: $_skey not present on this kernel — skipped"
+  fi
+done < "$SOC_ROOT/security/99-soc-sysctl.conf"
 sysctl --system >/dev/null 2>&1 || true
 [ "$HAS_SYSTEMD" = "1" ] && systemctl daemon-reload
 
@@ -915,13 +943,109 @@ if [ "$HARDEN" = "1" ]; then
     die "refusing to enable nftables: ssh_admin_cidr is 0.0.0.0/0 (SSH open to the world). Set a real admin subnet: SSH_ADMIN_CIDR=192.168.1.0/24 ./install.sh  (or edit /etc/nftables.conf)."
   fi
 
-  [ "$HAS_SYSTEMD" = "1" ] && systemctl enable nftables.service || \
-    warn "no systemd — enable nftables with your init (e.g. rc-update add nftables)"
-  log "nftables admin SSH source: $eff_cidr (egress is allowlisted — set vpn_gateways/jump_hosts in /etc/nftables.conf)"
-  warn "review /etc/nftables.conf egress sets (vpn_gateways, jump_hosts, dns_servers) before 'systemctl start nftables'"
+  # (B) Dry-run parse the BAKED ruleset before enabling it. A corrupt ruleset
+  # must NOT be wired into the next boot. nft present? parse it; on failure warn
+  # + skip-enable (fail-safe, never die). nft absent -> can't validate, skip-enable.
+  NFT_OK=0
+  if command -v nft >/dev/null 2>&1; then
+    if nft -c -f /etc/nftables.conf >/dev/null 2>&1; then
+      NFT_OK=1
+    else
+      warn "nftables ruleset failed 'nft -c -f /etc/nftables.conf' — NOT enabling the"
+      warn "  service (left the file in place for review). Fix it, then enable by hand."
+    fi
+  else
+    warn "nft not found — cannot validate /etc/nftables.conf; NOT enabling the service."
+  fi
+  if [ "$NFT_OK" = "1" ]; then
+    [ "$HAS_SYSTEMD" = "1" ] && systemctl enable nftables.service || \
+      warn "no systemd — enable nftables with your init (e.g. rc-update add nftables)"
+    log "nftables admin SSH source: $eff_cidr (egress is allowlisted — set vpn_gateways/jump_hosts in /etc/nftables.conf)"
+    warn "review /etc/nftables.conf egress sets (vpn_gateways, jump_hosts, dns_servers) before 'systemctl start nftables'"
+  fi
+
+  # (A) sshd hardening: install the drop-in, then VALIDATE the whole sshd config
+  # with `sshd -t`. On success reload sshd so key-only takes effect now (not just
+  # at reboot). On failure REMOVE the drop-in (fail-safe — a syntax error must
+  # never brick sshd on reboot) and warn. SSHD_INSTALLED gates the manifest row.
+  SSHD_INSTALLED=0
   install -d /etc/ssh/sshd_config.d
   cp "$SOC_ROOT/security/sshd_hardening.conf" /etc/ssh/sshd_config.d/10-soc-hardening.conf
-  warn "sshd hardening installed (key-only). Ensure you have an authorized key before reboot!"
+  _sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+  if [ -x "$_sshd_bin" ] && "$_sshd_bin" -t >/dev/null 2>&1; then
+    SSHD_INSTALLED=1
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+      systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || \
+        warn "  sshd config valid but reload failed — it applies on next sshd restart."
+    fi
+    warn "sshd hardening installed (key-only). Ensure you have an authorized key before reboot!"
+  elif [ ! -x "$_sshd_bin" ]; then
+    # No sshd to validate against — leave the drop-in (inert until sshd appears)
+    # but warn we couldn't verify it.
+    SSHD_INSTALLED=1
+    warn "sshd binary not found — installed the hardening drop-in UNVALIDATED."
+  else
+    rm -f /etc/ssh/sshd_config.d/10-soc-hardening.conf
+    warn "sshd hardening drop-in REJECTED by 'sshd -t' — removed it (sshd left as-is)."
+  fi
+
+  # (D) modprobe blacklist: block auto-load of USB-storage / FireWire-DMA / USB-modem
+  # drivers on a physically-exposed kiosk. Gate on /etc/modprobe.d existing; opt-out
+  # with SOC_SKIP_MODPROBE=1. MODPROBE_INSTALLED gates the manifest row.
+  MODPROBE_INSTALLED=0
+  if [ "$SOC_SKIP_MODPROBE" = "1" ]; then
+    log "  SOC_SKIP_MODPROBE=1 — skipping USB/DMA module blacklist"
+  elif [ ! -d /etc/modprobe.d ]; then
+    warn "  /etc/modprobe.d missing — skipping module blacklist"
+  elif [ ! -f "$SOC_ROOT/security/modprobe-blacklist.conf" ]; then
+    warn "  security/modprobe-blacklist.conf missing — skipping module blacklist"
+  else
+    cp "$SOC_ROOT/security/modprobe-blacklist.conf" /etc/modprobe.d/soc-blacklist.conf
+    MODPROBE_INSTALLED=1
+    log "  blacklisted usb_storage, firewire_core, cdc_acm (-> /etc/modprobe.d/soc-blacklist.conf)"
+  fi
+
+  # (E) /tmp mount hardening: nodev,nosuid,noexec. Probe with findmnt; only act if
+  # /tmp is a real mount AND the options aren't already applied. Idempotent: a
+  # uniquely-tagged marker block in /etc/fstab is grep-guarded and removed by
+  # uninstall. Opt-out with SOC_SKIP_FSTAB=1. FSTAB_HARDENED gates the manifest row.
+  # /tmp ONLY — never /boot (Pi firmware) or /var.
+  FSTAB_HARDENED=0
+  if [ "$SOC_SKIP_FSTAB" = "1" ]; then
+    log "  SOC_SKIP_FSTAB=1 — skipping /tmp mount-option hardening"
+  elif ! command -v findmnt >/dev/null 2>&1; then
+    warn "  findmnt not found — skipping /tmp mount-option hardening"
+  elif [ ! -f /etc/fstab ]; then
+    warn "  /etc/fstab missing — skipping /tmp mount-option hardening"
+  elif grep -q '# soc-wall:/tmp-harden' /etc/fstab 2>/dev/null; then
+    FSTAB_HARDENED=1
+    log "  /tmp hardening already present in /etc/fstab — no change"
+  else
+    _tmp_opts="$(findmnt -no OPTIONS /tmp 2>/dev/null || true)"
+    if [ -n "$_tmp_opts" ] \
+       && printf '%s' "$_tmp_opts" | grep -q '\bnodev\b' \
+       && printf '%s' "$_tmp_opts" | grep -q '\bnosuid\b' \
+       && printf '%s' "$_tmp_opts" | grep -q '\bnoexec\b'; then
+      log "  /tmp already mounted nodev,nosuid,noexec — no fstab change needed"
+    elif grep -qE '^[^#]*[[:space:]]/tmp[[:space:]]' /etc/fstab 2>/dev/null; then
+      # /tmp has its own fstab line we'd have to rewrite in place — too risky to
+      # edit blind; tell the operator instead of mangling their mount spec.
+      warn "  /tmp has an existing /etc/fstab entry — add nodev,nosuid,noexec to it"
+      warn "  by hand (left it untouched to avoid breaking your mount spec)."
+    else
+      # /tmp is not separately listed in fstab (typically a systemd tmpfs or part
+      # of /). Append a self-contained tmpfs mount so /tmp becomes a hardened
+      # tmpfs on next boot. Tagged so uninstall can strip exactly this block.
+      {
+        printf '# soc-wall:/tmp-harden BEGIN (HARDEN=1; removed by uninstall.sh)\n'
+        printf 'tmpfs /tmp tmpfs defaults,nodev,nosuid,noexec,mode=1777 0 0\n'
+        printf '# soc-wall:/tmp-harden END\n'
+      } >> /etc/fstab
+      FSTAB_HARDENED=1
+      log "  added hardened tmpfs /tmp to /etc/fstab (nodev,nosuid,noexec; applies on reboot)"
+      warn "  /tmp becomes a fresh tmpfs on next boot — existing /tmp contents won't persist."
+    fi
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -997,7 +1121,16 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
   fi
   if [ "$HARDEN" = "1" ]; then
     printf 'FILE|/etc/nftables.conf|firewall (HARDEN=1; review before removing)\n'
-    printf 'FILE|/etc/ssh/sshd_config.d/10-soc-hardening.conf|sshd hardening (HARDEN=1)\n'
+    # sshd drop-in: only recorded when it survived `sshd -t` (or sshd was absent).
+    [ "${SSHD_INSTALLED:-0}" = "1" ] && \
+      printf 'FILE|/etc/ssh/sshd_config.d/10-soc-hardening.conf|sshd hardening (HARDEN=1)\n'
+    # (D) modprobe blacklist: plain /etc file -> reversed by the generic FILE loop.
+    [ "${MODPROBE_INSTALLED:-0}" = "1" ] && \
+      printf 'FILE|/etc/modprobe.d/soc-blacklist.conf|USB/DMA module blacklist (HARDEN=1)\n'
+    # (E) /tmp fstab hardening: an in-place edit, NOT a removable file. Recorded as
+    # a REVERT row so uninstall.sh strips the tagged block from /etc/fstab.
+    [ "${FSTAB_HARDENED:-0}" = "1" ] && \
+      printf 'REVERT|fstab_tmp_harden|1\n'
   fi
 
   # other system changes touched in place (NOT owned by us — informational only)

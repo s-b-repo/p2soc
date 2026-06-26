@@ -82,6 +82,7 @@ SET_DEFAULT_CHANGED=0      # installer flipped the boot target
 GETTY_OVERRIDE=0           # installer wrote the getty@tty1 autologin override
 CONSOLEBLANK_ADDED=0       # installer appended consoleblank=0 to cmdline.txt
 CMDLINE_PATH=""            # cmdline.txt path the installer touched
+FSTAB_TMP_HARDEN=0         # installer appended a hardened tmpfs /tmp block to fstab
 # Extra files/units/users the manifest lists for removal (collected generically so
 # new install-created artifacts — e.g. the desktop-mode user, per-user units — are
 # reversed without editing this script every time).
@@ -116,6 +117,7 @@ parse_manifest(){   # parse_manifest <manifest-path>
           did_set_default)     SET_DEFAULT_CHANGED="$note" ;;
           did_consoleblank)    CONSOLEBLANK_ADDED="$note" ;;
           cmdline_path)        CMDLINE_PATH="$note" ;;
+          fstab_tmp_harden)    FSTAB_TMP_HARDEN="$note" ;;
         esac ;;
       DIR)
         # the project root is the only DIR we remove wholesale; $ETC + vault data
@@ -300,6 +302,16 @@ if [ "$HARDEN" = "1" ]; then
       systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
     fi
     warn "sshd hardening removed — reloaded sshd (key-only login no longer forced)."
+  fi
+  # (E) strip the tagged hardened-/tmp block the installer appended to /etc/fstab.
+  # Only the uniquely-tagged block is removed — any operator /tmp entry is left as-is.
+  if [ "$FSTAB_TMP_HARDEN" = "1" ] && [ -f /etc/fstab ] \
+     && grep -q '# soc-wall:/tmp-harden BEGIN' /etc/fstab 2>/dev/null; then
+    if sed -i '/# soc-wall:\/tmp-harden BEGIN/,/# soc-wall:\/tmp-harden END/d' /etc/fstab 2>/dev/null; then
+      did "removed hardened tmpfs /tmp block from /etc/fstab (reverts on reboot)"
+    else
+      warn "could not strip the soc-wall /tmp block from /etc/fstab — remove it by hand."
+    fi
   fi
 fi
 
