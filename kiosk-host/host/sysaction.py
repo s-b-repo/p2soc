@@ -143,16 +143,52 @@ def run_streamed(parent, title, argv, on_done=None):
     Gtk.main_quit (destroys the CHILD only)."""
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk, GLib
+    from gi.repository import Gtk, GLib, Gdk
 
     from host import branding
     c = branding.load().get("colors", {})
+    bg = c.get("background", "#FFFFFF")
+    s_bot = c.get("surface_bottom", "#EAF1EC")
+    border = c.get("border", "#CFE0D4")
+    text = c.get("text", "#0B1F14")
     dim = c.get("text_dim", "#5B7567")
+    accent_strong = c.get("accent_strong", "#157A49")
     good = c.get("good", "#1FA463")
     bad = c.get("bad", "#C0341D")
 
+    # OWN provider (added once at the screen) so this window themes correctly BOTH
+    # standalone (--selftest, no launcher provider present) AND embedded. We never
+    # leave the inner box / TextView / Close button to GTK's light defaults, which
+    # would paint a white log + stock-light button on a dark wall (black-on-black /
+    # light-island bugs). All colours flow from branding — no hardcoded surfaces.
+    css = (
+        f"window.soc-launcher, .soc-launcher {{ background-color: {bg};"
+        f" color: {text}; }}"
+        f".soc-launcher box {{ background-color: {bg}; }}"
+        # the log view: themed view *and* its text node (GTK paints both).
+        f".soc-launcher scrolledwindow {{ border: 1px solid {border};"
+        f" border-radius: 6px; background-color: {s_bot}; }}"
+        f".soc-launcher textview {{ background-color: {s_bot}; color: {text}; }}"
+        f".soc-launcher textview text {{ background-color: {s_bot};"
+        f" color: {text}; }}"
+        # the Close button as a branding ghost button (no stock-light island).
+        f".soc-launcher button.soc-ghost {{ background-image: none;"
+        f" background-color: transparent; color: {accent_strong};"
+        f" border: 1px solid {border}; border-radius: 6px; padding: 6px 14px; }}"
+        f".soc-launcher button.soc-ghost:hover {{ background-color: {s_bot};"
+        f" border-color: {accent_strong}; }}"
+        f".soc-launcher button.soc-ghost:disabled {{ color: {dim};"
+        f" border-color: {border}; }}"
+    ).encode()
+    _provider = Gtk.CssProvider()
+    _provider.load_from_data(css)
+    _screen = Gdk.Screen.get_default()
+    if _screen is not None:
+        Gtk.StyleContext.add_provider_for_screen(
+            _screen, _provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+
     win = Gtk.Window(title=title)
-    win.get_style_context().add_class("soc-launcher")  # reuse the launcher provider
+    win.get_style_context().add_class("soc-launcher")
     if parent is not None:
         win.set_transient_for(parent)
         win.set_modal(True)
@@ -202,7 +238,7 @@ def run_streamed(parent, title, argv, on_done=None):
     view = Gtk.TextView()
     view.set_editable(False)
     view.set_cursor_visible(False)
-    view.set_monospace(True)   # GTK picks the themed monospace; no override needed.
+    view.set_monospace(True)   # themed monospace; bg/fg set by the provider above.
     view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
     sw.add(view)
     box.pack_start(sw, True, True, 0)
@@ -211,6 +247,7 @@ def run_streamed(parent, title, argv, on_done=None):
     btnrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     btnrow.set_halign(Gtk.Align.END)
     close = Gtk.Button(label="Close")
+    close.get_style_context().add_class("soc-ghost")  # branding ghost, not stock-light
     close.set_sensitive(False)               # disabled until the process exits
     btnrow.pack_start(close, False, False, 0)
     box.pack_start(btnrow, False, False, 0)
@@ -266,15 +303,23 @@ def run_streamed(parent, title, argv, on_done=None):
     else:
         threading.Thread(target=_reader, args=(proc,), daemon=True).start()
 
-    def _on_close(_b):
-        rc = state["rc"]
-        win.destroy()                         # CHILD only — never Gtk.main_quit
-        if on_done is not None and rc is not None:
-            on_done(rc)
-    close.connect("clicked", _on_close)
-    # Closing via the WM 'x' also refreshes (only meaningful once done).
-    win.connect("destroy", lambda _w: (on_done and state["rc"] is not None
-                                       and on_done(state["rc"])))
+    # Close just destroys the CHILD (never Gtk.main_quit); the destroy handler below
+    # is the single place that fires on_done + tears down the provider, so on_done
+    # runs exactly once whether the operator clicks Close or the WM 'x'.
+    close.connect("clicked", lambda _b: win.destroy())
+
+    def _on_destroy(_w):
+        # Drop the screen-scoped provider so repeated Install/Uninstall opens never
+        # stack duplicate providers on the launcher's persistent screen.
+        if _screen is not None:
+            try:
+                Gtk.StyleContext.remove_provider_for_screen(_screen, _provider)
+            except Exception:  # noqa: BLE001
+                pass
+        # Closing via the WM 'x' also refreshes (only meaningful once done).
+        if on_done is not None and state["rc"] is not None:
+            on_done(state["rc"])
+    win.connect("destroy", _on_destroy)
 
     win.show_all()
     return win

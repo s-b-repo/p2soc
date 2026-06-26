@@ -161,3 +161,98 @@ def test_cli_list_presets():
     assert r.returncode == 0, r.stderr
     for name in appearance.PRESET_ORDER:
         assert name in r.stdout
+
+
+# --------------------------------------------------------------------------- #
+# WCAG contrast — the objective legibility guard. Every preset must pass with no
+# text/accent-on-surface pair below AA, AFTER the on-surface routing the builders
+# apply. This is the regression guard for the Midnight black-on-black class of bug.
+# --------------------------------------------------------------------------- #
+def test_every_preset_passes_contrast_matrix():
+    for name, palette in appearance.PRESETS.items():
+        fails = appearance.contrast_matrix(palette)
+        assert not fails, f"preset {name!r} below WCAG AA: {fails}"
+
+
+def test_contrast_matrix_catches_black_on_black():
+    """A deliberately broken (black-on-black) palette must be FLAGGED — proving the
+    guard actually detects invisible text, not just rubber-stamps."""
+    broken = dict(branding._DEFAULTS["colors"])
+    broken.update(background="#000000", surface_top="#050505",
+                  surface_bottom="#040404", text="#010101", text_dim="#020202")
+    fails = appearance.contrast_matrix(broken)
+    assert fails, "contrast_matrix failed to catch black-on-black text"
+    labels = {f[0] for f in fails}
+    assert any("text on" in lab for lab in labels)
+
+
+def test_branding_contrast_helpers_match_wcag():
+    # Known WCAG anchors: black/white == 21, identical == 1.
+    assert round(branding.contrast_ratio("#000000", "#FFFFFF"), 1) == 21.0
+    assert round(branding.contrast_ratio("#777777", "#777777"), 1) == 1.0
+    assert branding.is_dark("#05100B") and not branding.is_dark("#FFFFFF")
+
+
+def test_text_on_picks_readable_button_label():
+    # White on a dark fill, near-black on a light/bright fill.
+    assert branding.contrast_ratio(
+        branding.text_on("#157A49", dark="#0B1F14"), "#157A49") >= 4.5
+    assert branding.contrast_ratio(
+        branding.text_on("#19C46F", dark="#D6FBE7"), "#19C46F") >= 4.5  # bright green
+    assert branding.contrast_ratio(
+        branding.text_on("#C8860B", dark="#F5E6C8"), "#C8860B") >= 4.5  # amber
+
+
+def test_accent_on_keeps_brand_where_it_reads_and_swaps_where_it_doesnt():
+    # On a dark surface the bright brand accent reads -> kept.
+    assert branding.accent_on("#0B1E16", accent="#3DF59B", strong="#19C46F") == "#3DF59B"
+    # On the light tinted surface the brand green fails 3.0 -> swapped to strong.
+    got = branding.accent_on("#F4F8F5", accent="#1FA463", strong="#157A49")
+    assert got == "#157A49"
+    assert branding.contrast_ratio(got, "#F4F8F5") >= 3.0
+
+
+# --------------------------------------------------------------------------- #
+# Cyber glow — present on a DARK palette (Midnight), absent on the default light
+# palette, and motion (the @keyframes pulse) gated by reduced-motion. This locks
+# the deliberate Midnight green-on-black look + the reduced-motion contract.
+# --------------------------------------------------------------------------- #
+def test_midnight_has_static_cyber_glow():
+    css = appearance.build_css(appearance.PRESETS["midnight"]).decode()
+    # text-shadow on the eyebrow/headings + a box-shadow halo on the sample card.
+    assert ".soc-ap-eyebrow { text-shadow:" in css
+    assert ".soc-ap-sample { box-shadow:" in css
+
+
+def test_default_light_palette_stays_flat():
+    """The default SOC-green (white field) must NOT light up — no glow rules at all,
+    so the default look does not regress."""
+    css = appearance.build_css(appearance.PRESETS["soc-green"]).decode()
+    assert "text-shadow" not in css
+    assert "@keyframes soc-ap-pulse" not in css
+
+
+def test_glow_pulse_gated_by_reduced_motion(monkeypatch):
+    """With animations enabled the dark palette gets the @keyframes dot pulse; with
+    them disabled (reduced motion) the animation is dropped but the STATIC glow
+    remains (so the cyber look survives, just without motion)."""
+    monkeypatch.setattr(appearance, "_animations_enabled", lambda: True)
+    on = appearance.build_css(appearance.PRESETS["midnight"]).decode()
+    assert "@keyframes soc-ap-pulse" in on and "animation: soc-ap-pulse" in on
+
+    monkeypatch.setattr(appearance, "_animations_enabled", lambda: False)
+    off = appearance.build_css(appearance.PRESETS["midnight"]).decode()
+    assert "@keyframes soc-ap-pulse" not in off and "animation:" not in off
+    assert "text-shadow" in off  # static glow preserved under reduced motion
+
+
+def test_any_dark_palette_lights_up_not_just_named_midnight():
+    """The glow is branding-driven (gated on is_dark(background)), so a CUSTOM dark
+    palette gets it too — not hardcoded to the Midnight preset name."""
+    custom_dark = dict(branding._DEFAULTS["colors"])
+    custom_dark.update(background="#06080A", surface_top="#0E1318",
+                       surface_bottom="#0A0F13", text="#E6F0FF",
+                       text_dim="#9FB4CC", primary="#5AC8FF",
+                       accent_strong="#2E9BD6", good="#5AC8FF")
+    css = appearance.build_css(custom_dark).decode()
+    assert "text-shadow" in css and "box-shadow" in css
