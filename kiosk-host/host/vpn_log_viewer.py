@@ -9,10 +9,12 @@ supervisor + driver log line (the forti-vpn supervisor's `[soc-vpn] ...`,
 openfortivpn's own output, the wireguard/openvpn backend stderr) lands here
 verbatim.
 
-Single-VPN model: this tree supervises one VPN under the single
-`forti-vpn.service` unit (the unit drives Fortinet/OpenVPN/WireGuard
-depending on `vpn.type`), so there is exactly ONE log stream — no per-VPN
-tabs. The journal-stream subprocess runs read-only; on a non-root host
+One unit, N VPNs: the single `forti-vpn.service` unit fans out to one
+supervisor per enabled `vpns:[]` entry, so there is exactly ONE journald
+stream — but the manager tags every supervisor line `[vpn:<name>]`. When the
+wall runs more than one VPN, a "Show:" dropdown filters the stream to one VPN
+by that tag (untagged manager/header lines always show). The journal-stream
+subprocess runs read-only; on a non-root host
 (the wall runs as the `soc` user) it goes through `sudo -n journalctl`,
 which needs a NOPASSWD sudoers allowance for journalctl.
 
@@ -81,9 +83,16 @@ class VpnLogViewer:
     `systemctl restart forti-vpn` path (this tree is single-VPN, so no
     name argument)."""
 
-    def __init__(self, *, on_reconnect, on_close=None):
+    def __init__(self, *, on_reconnect, on_close=None, names=None):
         self._on_reconnect = on_reconnect
         self._on_close = on_close
+        # Per-VPN names for the [vpn:<name>] tag filter. The manager tags every
+        # supervisor line `[vpn:<name>]`, so a >1-VPN wall can narrow the single
+        # stream to one VPN without a separate journald unit. Empty/<=1 -> the
+        # filter row is hidden (the single-VPN view is unchanged).
+        self._names = [str(n) for n in (names or []) if str(n).strip()]
+        self._filter = ""              # "" = all VPNs; else a single name
+        self._filter_combo = None
         self._win: Optional[Gtk.Window] = None
         self._buf: Optional[Gtk.TextBuffer] = None
         self._view: Optional[Gtk.TextView] = None
@@ -185,6 +194,21 @@ class VpnLogViewer:
         unit_lbl.set_xalign(0.0)
         unit_lbl.set_markup(f"<tt>{GLib.markup_escape_text(_VPN_UNIT)}</tt>")
         head.pack_start(unit_lbl, True, True, 0)
+        # Per-VPN tag filter — only when the wall runs more than one VPN. The
+        # single forti-vpn.service stream carries every VPN's lines tagged
+        # `[vpn:<name>]`; this narrows the view to one without a second unit.
+        if len(self._names) > 1:
+            flt = Gtk.ComboBoxText()
+            flt.append_text("All VPNs")
+            for nm in self._names:
+                flt.append_text(nm)
+            flt.set_active(0)
+            flt.set_tooltip_text("Filter the log to one VPN (matches the "
+                                 "[vpn:<name>] tag the manager writes).")
+            flt.connect("changed", self._on_filter_changed)
+            self._filter_combo = flt
+            head.pack_start(Gtk.Label(label="Show:"), False, False, 0)
+            head.pack_start(flt, False, False, 0)
         reconn = Gtk.Button(label="Reconnect")
         reconn.set_tooltip_text("Restart the VPN supervisor "
                                 "(systemctl restart forti-vpn); the log "
@@ -312,9 +336,30 @@ class VpnLogViewer:
                     pass
             self._proc = None
 
+    # ---- per-VPN filter ----------------------------------------------- #
+    def _on_filter_changed(self, combo):
+        active = combo.get_active_text() or ""
+        self._filter = "" if active in ("", "All VPNs") else active
+        self._summary.set_label(
+            f"VPN log — {_VPN_UNIT}"
+            + (f" — {self._filter}" if self._filter else " (streaming)"))
+
+    def _passes_filter(self, line: str) -> bool:
+        """When a VPN is selected, show its `[vpn:<name>]`-tagged lines plus any
+        UNtagged line (manager headers, viewer notes) so context isn't lost.
+        Lines tagged for a DIFFERENT VPN are hidden."""
+        if not self._filter:
+            return True
+        if f"[vpn:{self._filter}]" in line:
+            return True
+        # a line tagged for some OTHER vpn is the only thing we drop
+        return "[vpn:" not in line
+
     # ---- text buffer -------------------------------------------------- #
     def _append(self, text: str):
         if self._buf is None:
+            return
+        if not self._passes_filter(text):
             return
         end = self._buf.get_end_iter()
         self._buf.insert(end, text)

@@ -138,32 +138,43 @@ def heaviest_panel(views):
     return best
 
 
-def wait_for_vpn(vpn: dict, timeout: float):
-    """Best-effort gate: if a Fortinet VPN is enabled with a `ready_probe`
-    (host:port reachable only once the VPN is up), wait for it before opening
-    VPN-side panels. The VPN itself is brought up by forti-vpn.service; this only
-    avoids loading those panels into a dead route. Non-fatal."""
-    vpn = vpn or {}
-    if not vpn.get("enabled"):
-        return
+def _wait_for_one_vpn(vpn: dict, timeout: float):
+    """Wait (best-effort) for ONE VPN's ready_probe to answer. Non-fatal."""
+    name = (vpn.get("name") or "vpn")
     probe = (vpn.get("ready_probe") or "").strip()
     if not probe:
         return
     host, _, port = probe.rpartition(":")
     if not host or not port.isdigit():
-        log(f"[vpn] ignoring malformed ready_probe '{probe}' (want host:port)")
+        log(f"[vpn:{name}] ignoring malformed ready_probe '{probe}' (want host:port)")
         return
     port = int(port)
-    log(f"[vpn] waiting for VPN reachability {host}:{port} ...")
+    log(f"[vpn:{name}] waiting for VPN reachability {host}:{port} ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _port_open(host, port):
-            log("[vpn] VPN up")
+            log(f"[vpn:{name}] VPN up")
             return
         time.sleep(1)
-    log(f"[vpn] WARNING {host}:{port} never became reachable; "
+    log(f"[vpn:{name}] WARNING {host}:{port} never became reachable; "
         f"VPN-side panels may show a connection error "
         f"(check: systemctl status forti-vpn / journalctl -u forti-vpn)")
+
+
+def wait_for_vpn(vpns, timeout: float):
+    """Best-effort gate over the WHOLE vpns[] list: for each enabled VPN that has
+    a `ready_probe` (a host:port reachable only once that VPN is up), wait for it
+    before opening VPN-side panels. The VPNs are brought up by forti-vpn.service;
+    this only avoids loading panels into a dead route. Non-fatal.
+
+    Accepts a list (conf.vpns) or, for back-compat, a single vpn dict. Probes run
+    sequentially — a probe-less VPN is skipped instantly, so the common 0-or-1
+    case costs the same as before."""
+    if isinstance(vpns, dict):                  # back-compat: a single vpn dict
+        vpns = [vpns] if vpns else []
+    for vpn in (vpns or []):
+        if isinstance(vpn, dict) and vpn.get("enabled"):
+            _wait_for_one_vpn(vpn, timeout)
 
 
 class KioskHost:
@@ -384,9 +395,9 @@ class KioskHost:
         return True                                   # keep the timeout alive
 
     def _poll_vpn(self):
-        # the probe can block (TCP connect), so compute off the GTK thread
+        # each probe can block (TCP connect), so compute off the GTK thread
         import threading
-        from . import vpnstatus
+        from . import vpnstatus, vpnmanager
 
         # Skip this tick if the previous probe is still running, so a slow/hung
         # connect near the poll interval can't pile up daemon threads.
@@ -395,21 +406,42 @@ class KioskHost:
         self._vpn_poll_busy = True
 
         def work():
+            # Per-name states for EACH enabled VPN, plus one aggregate for the
+            # main pill label. The tooltip lists every VPN so a multi-VPN wall
+            # shows which one is down at a glance.
+            states = {}
             try:
-                state = vpnstatus.vpn_state(self.conf.vpn)
+                for v in (self.conf.vpns or []):
+                    if isinstance(v, dict) and v.get("enabled"):
+                        nm = v.get("name") or "vpn"
+                        states[nm] = vpnstatus.vpn_state(v)
             except Exception:                          # never let the pill crash us
-                state = vpnstatus.STATE_OFFLINE
+                states = {}
             finally:
                 self._vpn_poll_busy = False
-            label = vpnstatus.LABELS.get(state, "VPN: ?")
-            css = {"not_configured": "unconfigured"}.get(state, state)
-            GLib.idle_add(self._set_pill, css, label)
+            agg = vpnmanager.aggregate_state(states)
+            n = len(states)
+            if n <= 1:
+                label = vpnstatus.LABELS.get(agg, "VPN: ?")
+            else:
+                up = sum(1 for s in states.values()
+                         if s == vpnstatus.STATE_ONLINE)
+                label = f"VPN: {up}/{n} up"
+            css = {"not_configured": "unconfigured"}.get(agg, agg)
+            # tooltip: per-name breakdown ("corp: online | lab: offline")
+            tip = " | ".join(
+                f"{nm}: {st.replace('_', ' ')}" for nm, st in states.items()
+            ) or "VPN: not configured"
+            GLib.idle_add(self._set_pill, css, label, tip)
         threading.Thread(target=work, daemon=True).start()
         return False
 
-    def _set_pill(self, css, label):
+    def _set_pill(self, css, label, tip=None):
         if self.wall is not None:
             self.wall.set_vpn_status(css, label)
+            if tip and self.wall.vpn_pill is not None:
+                self.wall.vpn_pill.set_tooltip_text(
+                    f"{tip}\nClick to re-check / reconnect")
         return False
 
     # ---- kiosk lock + VPN-log viewer --------------------------------------
@@ -436,9 +468,13 @@ class KioskHost:
             log(f"vpn-log-viewer module unavailable: {e}")
             return
         if self._vpn_log_viewer is None:
+            names = [v.get("name") or "vpn"
+                     for v in (self.conf.vpns or [])
+                     if isinstance(v, dict) and v.get("enabled")]
             self._vpn_log_viewer = _vlv.VpnLogViewer(
                 on_reconnect=self.vpn_action,
-                on_close=lambda: setattr(self, "_vpn_log_viewer", None))
+                on_close=lambda: setattr(self, "_vpn_log_viewer", None),
+                names=names)
         self._vpn_log_viewer.show()
 
     # ---- privileged systemctl ---------------------------------------------
@@ -551,7 +587,10 @@ class KioskHost:
         reconnect runs off the GTK thread so it can't freeze the wall."""
         if self.wall is not None:
             self.wall.set_vpn_status("checking", "VPN: checking…")
-        if not (self.conf.vpn or {}).get("enabled"):
+        any_enabled = any(
+            isinstance(v, dict) and v.get("enabled")
+            for v in (self.conf.vpns or []))
+        if not any_enabled:
             self._poll_vpn()
             return
         self._restart_vpn_service(
@@ -1281,7 +1320,7 @@ def main():
 
     # 3. VPN + tunnels (best-effort). VPN first: its routes may be what makes a
     #    tunnel's jump host (or a direct VPN-side panel) reachable at all.
-    wait_for_vpn(conf.vpn, timeout=ready_timeout)
+    wait_for_vpn(conf.vpns, timeout=ready_timeout)
     wait_for_tunnels(conf.panels, timeout=ready_timeout)
 
     # 4. windows
