@@ -40,6 +40,35 @@ def log(msg: str):
     print(f"{t} [soc-kiosk] {msg}", flush=True)
 
 
+def _to_rgb(hexc: str) -> "tuple[int, int, int]":
+    h = (hexc or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    try:
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except (ValueError, IndexError):
+        return 136, 136, 136
+
+
+def _rgba(hexc: str, alpha: float) -> str:
+    r, g, b = _to_rgb(hexc)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _on_color(hexc: str) -> str:
+    """Pick black or white for text drawn ON a filled accent, by WCAG relative
+    luminance — so a button label stays readable over any accent colour the
+    palette supplies (e.g. a pale Amber fill needs black, a dark green needs
+    white). Mirrors the contrast maths used by the appearance editor."""
+    def _lin(v: float) -> float:
+        v /= 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = _to_rgb(hexc)
+    lum = 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
+    # Contrast vs white = 1.05/(L+0.05); vs black = (L+0.05)/0.05. Pick the higher.
+    return "#FFFFFF" if (1.05 / (lum + 0.05)) >= ((lum + 0.05) / 0.05) else "#0B1F14"
+
+
 def _resolved_panels() -> str:
     """The panels.yaml the wall reads when $SOC_PANELS_FILE is unset — via the SAME
     resolver the wizard writes through, so a bare `python -m host.main` self-resolves
@@ -827,12 +856,39 @@ def _unlock_dialog(email: str, url: str, verify=None, timeout: float = 180.0):
         dim = c.get("text_dim", "#5B7567")
         primary = c.get("primary", "#1FA463")
         bad = c.get("bad", "#C0341D")
+        sunken = c.get("surface_bottom", "#EAF1EC")
+        border = c.get("border", "#CFE0D4")
+        accent_strong = c.get("accent_strong", "#157A49")
+        on_accent = _on_color(accent_strong)        # readable label over the fill
+        glow = _rgba(primary, 0.28)
         prov = Gtk.CssProvider()
         prov.load_from_data(
             (f"dialog, window {{ background-color: {bg}; color: {text}; }}"
              f".u-title {{ color: {text}; }} .u-sub {{ color: {dim}; }}"
              f".u-err {{ color: {bad}; }}"
-             f"entry {{ caret-color: {primary}; }}").encode())
+             # The password Gtk.Entry must follow the palette too — without these it
+             # falls back to GTK's default LIGHT entry well (a white island inside a
+             # dark dialog on Midnight/Amber). Mirrors the setupgui entry rules.
+             f"entry {{ background-color: {sunken}; color: {text};"
+             f" border: 1px solid {border}; border-radius: 4px; padding: 6px 8px;"
+             f" caret-color: {primary}; }}"
+             f"entry:focus {{ border: 1px solid {primary};"
+             f" box-shadow: 0 0 0 2px {glow}; }}"
+             # Theme the Unlock button through the palette instead of the stock
+             # .suggested-action (low-contrast on a dark dialog). on_accent is the
+             # luminance-picked label colour so it reads on any accent.
+             f"button.u-go {{ background-image: none;"
+             f" background-color: {accent_strong}; color: {on_accent};"
+             f" border: 1px solid {accent_strong}; border-radius: 6px;"
+             f" font-weight: bold; padding: 6px 14px; }}"
+             f"button.u-go:hover {{ background-color: {primary};"
+             f" border-color: {primary}; }}"
+             # Cancel as a branding ghost (not a stock-light island on dark themes).
+             f"button.soc-ghost {{ background-image: none;"
+             f" background-color: transparent; color: {accent_strong};"
+             f" border: 1px solid {border}; border-radius: 6px; padding: 6px 14px; }}"
+             f"button.soc-ghost:hover {{ background-color: {sunken};"
+             f" border-color: {accent_strong}; }}").encode())
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -840,9 +896,10 @@ def _unlock_dialog(email: str, url: str, verify=None, timeout: float = 180.0):
         dlg.set_default_size(460, -1)
         if os.environ.get("SOC_WINDOW_MODE") != "window":
             dlg.set_keep_above(True)
-        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        cancel_btn = dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        cancel_btn.get_style_context().add_class("soc-ghost")
         ok_btn = dlg.add_button("Unlock", Gtk.ResponseType.OK)
-        ok_btn.get_style_context().add_class("suggested-action")
+        ok_btn.get_style_context().add_class("u-go")
         dlg.set_default_response(Gtk.ResponseType.OK)
 
         box = dlg.get_content_area()
@@ -964,10 +1021,20 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
             c = {}
         bg, text = c.get("background", "#FFFFFF"), c.get("text", "#0B1F14")
         dim, bad = c.get("text_dim", "#5B7567"), c.get("bad", "#C0341D")
+        border = c.get("border", "#CFE0D4")
+        s_bot = c.get("surface_bottom", "#EAF1EC")
+        accent_strong = c.get("accent_strong", "#157A49")
         prov = Gtk.CssProvider()
-        prov.load_from_data((f"window {{ background-color: {bg}; }}"
+        prov.load_from_data((f"window {{ background-color: {bg}; color: {text}; }}"
                              f".e-title {{ color: {bad}; }} .e-detail {{ color: {text}; }}"
-                             f".e-hint {{ color: {dim}; }}").encode())
+                             f".e-hint {{ color: {dim}; }}"
+                             # buttons as branding ghosts (not stock-light on dark).
+                             f"button.soc-ghost {{ background-image: none;"
+                             f" background-color: transparent; color: {accent_strong};"
+                             f" border: 1px solid {border}; border-radius: 6px;"
+                             f" padding: 6px 16px; }}"
+                             f"button.soc-ghost:hover {{ background-color: {s_bot};"
+                             f" border-color: {accent_strong}; }}").encode())
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         win = Gtk.Window(title="SOC Video Wall — cannot start")
@@ -1014,8 +1081,10 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
             except OSError as e:
                 log(f"could not open Setup: {e}")
         setup_btn = Gtk.Button(label="Open Setup")
+        setup_btn.get_style_context().add_class("soc-ghost")
         setup_btn.connect("clicked", _open_setup)
         quit_btn = Gtk.Button(label="Quit")
+        quit_btn.get_style_context().add_class("soc-ghost")
         quit_btn.connect("clicked", lambda _b: Gtk.main_quit())
         btns.pack_start(setup_btn, False, False, 0)
         btns.pack_start(quit_btn, False, False, 0)

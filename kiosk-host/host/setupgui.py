@@ -443,6 +443,22 @@ def _css(branding) -> bytes:
     good = col("good", "#1FA463")
     bad = col("bad", "#C0341D")
     glow = _rgba(accent, 0.28)
+    # On-surface accent for the section-title TEXT (sits on `surface`): swap the
+    # brand green for accent_strong where it dips below AA on the tinted surface.
+    accent_surf = branding.accent_on(surface, accent=accent, strong=accent_strong)
+    # Primary-button label: palette-derived so it reads on the accent fill on any
+    # theme (white on a dark fill, near-black on a light one) — never hardcoded.
+    btn_fg = branding.text_on(accent_strong, dark=text)
+    # CYBER GLOW (dark palettes only), branding-derived, motion gated below.
+    dark = branding.is_dark(bg)
+    glow_css = ""
+    if dark:
+        halo = _rgba(accent, 0.5)
+        glow_css = f"""
+.soc-section-title {{ text-shadow: 0 0 6px {_rgba(accent, 0.6)}; }}
+.soc-header {{ box-shadow: inset 0 2px 0 -1px {halo}; }}
+.soc-card:hover {{ box-shadow: inset 0 0 0 1px {accent}, 0 6px 18px {_rgba(accent, 0.22)}; }}
+"""
     return f"""
 window.soc-assistant {{ background-color: {bg}; }}
 assistant.soc-assistant {{ background-color: {bg}; }}
@@ -453,7 +469,7 @@ assistant.soc-assistant {{ background-color: {bg}; }}
   border-top: 2px solid {accent}; border-bottom: 1px solid {border};
   padding: 16px 20px 14px 20px; }}
 .soc-page {{ background-color: {surface}; padding: 16px 18px; }}
-.soc-section-title {{ color: {accent}; font-weight: bold; }}
+.soc-section-title {{ color: {accent_surf}; font-weight: bold; }}
 .soc-divider {{ background-color: {border}; min-height: 1px; }}
 
 .soc-card {{ background-color: {surface};
@@ -481,14 +497,44 @@ assistant.soc-assistant {{ background-color: {bg}; }}
 entry {{ background-color: {sunken}; color: {text};
   border: 1px solid {border}; border-radius: 4px; padding: 6px 8px; }}
 entry:focus {{ border: 1px solid {accent}; box-shadow: 0 0 0 2px {glow}; }}
+entry image, entry placeholder {{ color: {text_dim}; }}
 .soc-field-bad {{ border: 1px solid {bad}; }}
 .soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.28)}; }}
 .soc-field-good {{ border: 1px solid {good}; }}
 
+/* SpinButton, ComboBox + its dropdown popup, and any plain button — palette-driven
+   so they don't fall back to GTK's stock LIGHT theme (a white spin/combo + white
+   button) on a DARK palette, which is the classic dark-theme black-on-white glitch
+   (and where the unthemed white 'Test connection' button came from). */
+spinbutton {{ background-color: {sunken}; color: {text};
+  border: 1px solid {border}; border-radius: 4px; }}
+spinbutton entry {{ border: 0; background-color: transparent; }}
+spinbutton button {{ background-image: none; background-color: {sunken};
+  color: {text_dim}; border: 0; }}
+spinbutton button:hover {{ color: {accent_surf}; }}
+combobox button.combo {{ background-image: none; background-color: {sunken};
+  color: {text}; border: 1px solid {border}; border-radius: 4px; padding: 4px 8px; }}
+combobox button.combo:hover {{ border-color: {accent}; }}
+combobox arrow {{ color: {text_dim}; }}
+combobox window, combobox window.background,
+combobox menu, .menu, menu {{ background-color: {surface}; color: {text};
+  border: 1px solid {border}; }}
+combobox cellview, cellview {{ color: {text}; }}
+menuitem {{ color: {text}; padding: 3px 8px; }}
+menuitem:hover, menuitem:selected {{ background-color: {sunken}; color: {text}; }}
+/* A plain (unclassed) button on a page — give it the ghost look so it isn't a
+   stock white box on a dark theme (e.g. 'Test connection', 'Add panel'). The
+   Assistant's own nav buttons live in its headerbar and keep GTK's styling. */
+.soc-page button {{ background-image: none; background-color: {sunken};
+  color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 5px 12px; }}
+.soc-page button:hover {{ border-color: {accent}; background-color: {sunken}; }}
+
 button.soc-primary {{ background-image: none; background-color: {accent_strong};
-  color: #FFFFFF; border: 1px solid {accent_strong}; border-radius: 6px;
+  color: {btn_fg}; border: 1px solid {accent_strong}; border-radius: 6px;
   font-weight: bold; padding: 6px 14px; }}
-button.soc-primary:hover {{ background-color: {accent}; border-color: {accent}; }}
+button.soc-primary:hover {{ background-color: {accent_strong};
+  border-color: {accent}; color: {btn_fg};
+  box-shadow: inset 0 0 0 1px {accent}, 0 4px 14px {glow}; }}
 button.soc-ghost {{ background-image: none; background-color: transparent;
   color: {accent_strong}; border: 1px solid {border}; border-radius: 6px;
   padding: 6px 12px; }}
@@ -496,7 +542,7 @@ button.soc-ghost:hover {{ background-color: {sunken}; border-color: {accent}; }}
 
 .soc-mono {{ font-family: monospace; font-size: 10px; }}
 .soc-problem {{ color: {bad}; }}
-""".encode()
+{glow_css}""".encode()
 
 
 # --------------------------------------------------------------------------- #
@@ -687,10 +733,15 @@ class SetupAssistant:
         page = self._page("Choose a starting point",
                           "Pick a preset to load, then customise it on the next pages.",
                           overline=self._step_overline("preset"))
-        accent = self.branding.color("primary")
         text = self.branding.color("text")
         dim = self.branding.color("text_dim")
         surface = self.branding.color("surface_top")
+        # The '▸' selection mark is accent TEXT on the card surface — route through
+        # accent_on so the brand green (below AA on the tinted surface in the light
+        # theme) is swapped for accent_strong only where it wouldn't read.
+        accent = self.branding.accent_on(
+            surface, accent=self.branding.color("primary"),
+            strong=self.branding.color("accent_strong"))
         group = None
         first = True
         for n, (name, disp, desc) in enumerate(discover_presets()):

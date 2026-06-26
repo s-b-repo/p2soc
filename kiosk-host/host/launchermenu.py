@@ -297,6 +297,7 @@ def _css() -> bytes:
     accent = col("primary", "#1FA463")
     accent_strong = col("accent_strong", "#157A49")
     bad = col("bad", "#C0341D")
+    text = col("text", "#0B1F14")
     text_dim = col("text_dim", "#5B7567")
     setup, desktop, kiosk = (col("setup", "#1FA463"), col("desktop", "#1FA463"),
                              col("kiosk", "#0E7C7B"))
@@ -324,6 +325,20 @@ def _css() -> bytes:
     except Exception:  # noqa: BLE001 — pre-GTK / no settings -> assume animations on
         animate = True
     transition = "transition: all 160ms ease; " if animate else ""
+
+    # CYBER GLOW (dark palettes only): a tasteful accent halo on the header rule and
+    # the hovered card, branding-derived so ANY dark theme lights up while the
+    # default green-on-white stays flat. Static (the box-shadow halo) is always on
+    # for a dark palette; no motion is added here (the launcher has no pulsing
+    # element), so reduced-motion needs no extra gating beyond the card transition
+    # already gated above.
+    glow_css = ""
+    if branding.is_dark(bg):
+        halo = _rgba(accent, 0.5)
+        glow_css = f"""
+.soc-header {{ box-shadow: inset 0 2px 0 -1px {halo}; }}
+.soc-card:hover {{ box-shadow: inset 0 0 0 1px {border}, 0 4px 16px {_rgba(accent, 0.18)}; }}
+"""
 
     return f"""
 window.soc-launcher {{ background-color: {bg}; }}
@@ -358,7 +373,7 @@ window.soc-launcher {{ background-color: {bg}; }}
   box-shadow: inset 0 0 0 1px {bad}, 0 6px 18px {bad_glow}; }}
 /* danger eyebrow / heading colour for the uninstall confirm surfaces. */
 .soc-danger-head {{ color: {bad}; }}
-""".encode()
+{glow_css}""".encode()
 
 
 class _Launcher:
@@ -458,7 +473,12 @@ def _show_result_window(parent, cols, cause: str, result: dict):
     loop). This child reuses the launcher's CssProvider and only win.destroy()s
     itself on close, so the launcher's loop is never touched."""
     Gtk = _Launcher.Gtk
-    primary = cols.get("primary", "#1FA463")
+    # Link text on the dialog background — routed through accent_on at AA-body (4.5)
+    # so the small 'close' link reads on a white field too (brand green dips under).
+    bg = cols.get("background", "#FFFFFF")
+    primary = branding.accent_on(bg, accent=cols.get("primary", "#1FA463"),
+                                 strong=cols.get("accent_strong", "#157A49"),
+                                 minimum=4.5)
     dim = cols.get("text_dim", "#5B7567")
     text = cols.get("text", "#0B1F14")
     sev = result.get("overall", "warn")
@@ -555,7 +575,12 @@ def _manual_window(parent, cols, action, line):
     Gtk = _Launcher.Gtk
     dim = cols.get("text_dim", "#5B7567")
     text = cols.get("text", "#0B1F14")
-    primary = cols.get("primary", "#1FA463")
+    # Code line + 'close' link on the dialog background — AA-body routed accent so
+    # the brand green (below AA on a white field) is swapped where it wouldn't read.
+    primary = branding.accent_on(cols.get("background", "#FFFFFF"),
+                                 accent=cols.get("primary", "#1FA463"),
+                                 strong=cols.get("accent_strong", "#157A49"),
+                                 minimum=4.5)
     w, box = _child_window(parent, "Run in a shell")
     box.pack_start(_eyebrow("// manual", dim), False, False, 0)
     msg = Gtk.Label(xalign=0)
@@ -819,6 +844,13 @@ def _build_window():
     htext = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
     htext.set_valign(Gtk.Align.CENTER)
     primary = cols.get("primary", "#1FA463")
+    # The header + cards sit on surface_top; the brand accent (primary) dips below
+    # AA on that tinted surface in the default light theme, so route on-surface
+    # accent TEXT/GLYPHS through accent_on (keeps primary where it reads, swaps to
+    # accent_strong where it wouldn't). Brand fills/borders keep using primary.
+    s_top = cols.get("surface_top", "#F4F8F5")
+    accent_top = branding.accent_on(s_top, accent=primary,
+                                    strong=cols.get("accent_strong", "#157A49"))
     dim = cols.get("text_dim", "#5B7567")
     # '//'-overline (mono, dim) above the wide-tracked green name eyebrow — the
     # kept comment-style + terminal-console signature, recoloured to SOC-green.
@@ -827,7 +859,7 @@ def _build_window():
                     f'size="8200" letter_spacing="800">// launcher</span>')
     name_spaced = _esc(b.get("name", "SOC Video Wall")).upper().replace(" ", "&#160;")
     eyebrow = Gtk.Label(xalign=0)
-    eyebrow.set_markup(f'<span font_family="monospace" foreground="{primary}" '
+    eyebrow.set_markup(f'<span font_family="monospace" foreground="{accent_top}" '
                        f'size="9000" weight="bold" letter_spacing="2600">{name_spaced}</span>')
     sub = Gtk.Label(xalign=0)
     sub.set_markup(f'<span foreground="{dim}" size="9500">'
@@ -1011,6 +1043,13 @@ def _build_window():
 
     def _make_card(glyph, title, subtitle, tag, css_class, colour_key, action):
         accent = branding.color(colour_key)
+        # The glyph + '▸' mark are accent-coloured TEXT/ICONS on the card surface
+        # (surface_top); route them through accent_on so the brand green (which dips
+        # below AA on the tinted surface in the light theme) is swapped for the
+        # stronger accent only where needed. The card left-border keeps `accent`.
+        accent_glyph = branding.accent_on(
+            cols.get("surface_top", "#F4F8F5"), accent=accent,
+            strong=cols.get("accent_strong", "#157A49"))
         steer_off = dim_run and css_class in _RUN_TILES
         emphasise = False
         if not installed and css_class == "soc-install":
@@ -1035,7 +1074,7 @@ def _build_window():
             btn.get_style_context().add_class("soc-emphasis")
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        gimg = _glyph_image(glyph, accent, px=22)
+        gimg = _glyph_image(glyph, accent_glyph, px=22)
         gimg.set_valign(Gtk.Align.START)
         gimg.set_margin_top(1)
         row.pack_start(gimg, False, False, 0)
@@ -1060,7 +1099,7 @@ def _build_window():
             row.pack_start(tg, False, False, 0)
         mark = Gtk.Label()
         mark.set_valign(Gtk.Align.CENTER)
-        mark.set_markup(f'<span font_family="monospace" foreground="{accent}" '
+        mark.set_markup(f'<span font_family="monospace" foreground="{accent_glyph}" '
                         f'size="11000">▸</span>')
         row.pack_start(mark, False, False, 0)
         btn.add(row)

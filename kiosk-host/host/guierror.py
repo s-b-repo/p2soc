@@ -42,15 +42,23 @@ def show(title: str, detail: str = "") -> int:
     dim = c.get("text_dim", "#5B7567")
     bg = c.get("background", "#FFFFFF")
     border = c.get("border", "#CFE0D4")
+    sunken = c.get("surface_bottom") or "#EAF1EC"
+    accent_strong = c.get("accent_strong") or "#157A49"
 
     css = (
-        f"window {{ background-color: {bg}; }}"
+        f"window {{ background-color: {bg}; color: {text}; }}"
         f".soc-err-bar {{ border-top: 3px solid {bad}; }}"
         f".soc-err-title {{ color: {bad}; font-weight: bold; font-size: 15px; }}"
         f".soc-err-detail {{ color: {text}; font-family: monospace; font-size: 11px; }}"
         f".soc-err-hint {{ color: {dim}; }}"
         f".soc-err-detail-frame {{ border: 1px solid {border}; border-radius: 5px; "
-        f"  background-color: rgba(0,0,0,0.03); padding: 8px; }}"
+        f"  background-color: {sunken}; padding: 8px; }}"
+        # Close as a branding ghost button — not a stock-light island on dark themes.
+        f"button.soc-ghost {{ background-image: none; background-color: transparent;"
+        f" color: {accent_strong}; border: 1px solid {border}; border-radius: 6px;"
+        f" padding: 6px 14px; }}"
+        f"button.soc-ghost:hover {{ background-color: {sunken};"
+        f" border-color: {accent_strong}; }}"
     ).encode()
     provider = Gtk.CssProvider()
     provider.load_from_data(css)
@@ -97,6 +105,7 @@ def show(title: str, detail: str = "") -> int:
     btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     btns.set_halign(Gtk.Align.END)
     close = Gtk.Button(label="Close")
+    close.get_style_context().add_class("soc-ghost")
     close.connect("clicked", lambda *_: Gtk.main_quit())
     btns.pack_start(close, False, False, 0)
     box.pack_start(btns, False, False, 0)

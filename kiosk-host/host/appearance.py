@@ -46,22 +46,28 @@ PRESETS: "dict[str, dict]" = {
     # The default — lifted verbatim from branding._DEFAULTS so "Reset to default"
     # is exact and a no-op against a fresh install.
     "soc-green": dict(branding._DEFAULTS["colors"]),
-    # Dark console: near-black field, light green-grey text, same green family.
+    # Midnight — a deliberate CYBER console: near-black field, phosphor-green text
+    # + green/cyan accents, lit by the tasteful glow build_css() layers on ANY dark
+    # palette (text-shadow on headings, halo on accent borders/dots, a slow dot
+    # pulse gated by reduced-motion). Bright accents so the glow reads; AA-passing
+    # throughout (every text/accent pair clears its WCAG threshold with margin). The
+    # primary-button label is auto-picked dark by build_css, never a hardcoded white.
     "midnight": {
-        "primary": "#2FD27E",
-        "setup": "#2FD27E",
-        "desktop": "#2FD27E",
-        "kiosk": "#16B8B5",
-        "background": "#0B1411",
-        "surface_top": "#12211B",
-        "surface_bottom": "#0E1A15",
-        "border": "#24443A",
-        "text": "#E6F2EB",
-        "text_dim": "#8FB3A4",
-        "accent_strong": "#1FA463",
-        "good": "#2FD27E",
-        "warn": "#E0A200",
-        "bad": "#F2635A",
+        "primary": "#3DF59B",        # phosphor green — eyebrows/accents + the glow
+        "setup": "#3DF59B",
+        "desktop": "#3DF59B",
+        "kiosk": "#34E7E0",          # cyan-green, differentiated kiosk hue
+        "background": "#05100B",     # near-black with a faint green cast
+        "surface_top": "#0B1E16",    # raised card / header / grid
+        "surface_bottom": "#081711", # sunken well / input
+        "border": "#1F6E4A",         # green hairline — glows on accent borders/dots
+        "text": "#D6FBE7",           # bright green-white body text
+        "text_dim": "#79C9A4",       # dimmer green-grey secondary
+        "accent_strong": "#19C46F",  # strong green: button fills + ghost text/rule
+                                     # (7.6:1 on the dark surface; dark button text)
+        "good": "#3DF59B",
+        "warn": "#FFC247",
+        "bad": "#FF6B61",
     },
     # Accessibility: pure black/white, WCAG-safe saturated accents.
     "high-contrast": {
@@ -145,12 +151,71 @@ def _esc(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# --- WCAG 2.x relative luminance / contrast (also feeds the contrast audit) --- #
+def _rel_lum(hexc: str) -> float:
+    """WCAG 2.x relative luminance of an #RRGGBB colour (0..1)."""
+    def _ch(c: int) -> float:
+        s = c / 255.0
+        return s / 12.92 if s <= 0.03928 else ((s + 0.055) / 1.055) ** 2.4
+    r, g, b = _to_rgb(hexc)
+    return 0.2126 * _ch(r) + 0.7152 * _ch(g) + 0.0722 * _ch(b)
+
+
+def _contrast(fg: str, bg: str) -> float:
+    """WCAG 2.x contrast ratio between two #RRGGBB colours (1.0..21.0)."""
+    l1, l2 = _rel_lum(fg), _rel_lum(bg)
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _is_dark(hexc: str) -> bool:
+    """True for a near-black/dark surface — used to gate the cyber glow so the
+    default SOC-green (white field) stays flat and only dark palettes light up."""
+    return _rel_lum(hexc) < 0.18
+
+
+def _on_accent(fill: str, *candidates: str) -> str:
+    """Pick the foreground (from `candidates`, in preference order, else a derived
+    near-white/near-black) with the HIGHEST WCAG contrast against `fill` — so a
+    button label is legible on ANY accent fill (bright green/amber included)
+    instead of a hardcoded white that fails on light/bright fills."""
+    options = [c for c in candidates if c] + ["#FFFFFF", "#101010"]
+    best, best_ratio = options[0], -1.0
+    for c in options:
+        r = _contrast(c, fill)
+        if r > best_ratio:
+            best, best_ratio = c, r
+    return best
+
+
+def _animations_enabled() -> bool:
+    """True unless GTK's gtk-enable-animations is off (which tracks
+    prefers-reduced-motion). Default-ON when GTK/Settings isn't available (the
+    headless build_css() path), mirroring launchermenu._css / sysaction."""
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk  # type: ignore
+        s = Gtk.Settings.get_default()
+        if s is not None:
+            return bool(s.get_property("gtk-enable-animations"))
+    except Exception:  # noqa: BLE001 — pre-GTK / no settings -> assume animations on
+        pass
+    return True
+
+
 def build_css(colors: dict) -> bytes:
     """The SINGLE source of the editor's own theme + sample-card CSS. Returns bytes
     (load_from_data wants bytes). Built from one f-string — no per-swatch
     concatenation — so a live colour change is a string rebuild + one CSS parse,
     never widget churn. Themes the WHOLE editor window (so it recolours live) plus
-    the sample card, Save/Reset/Close buttons and the picker grid surface."""
+    the sample card, Save/Reset/Close buttons and the picker grid surface.
+
+    On a DARK palette (near-black background) it layers a tasteful, branding-driven
+    cyber glow: text-shadow on the eyebrow/title/header, a box-shadow halo on the
+    accent left-border + status dots, and (when animations are enabled) a slow pulse
+    on the status dots. The glow colour is derived from the palette's accent, so any
+    dark theme lights up; the default green-on-white palette stays flat/unaffected."""
     def col(k, d):
         return colors.get(k) or d
     bg = col("background", "#FFFFFF")
@@ -165,6 +230,45 @@ def build_css(colors: dict) -> bytes:
     warn = col("warn", "#B8860B")
     bad = col("bad", "#C0341D")
     glow = _rgba(accent, 0.28)
+
+    # Button label: palette-derived foreground that clears contrast against the
+    # fill — never a hardcoded white that fails on a bright accent. Both rest and
+    # hover keep the dark accent_strong fill (hover only adds a ring + glow), so a
+    # bright accent never carries a low-contrast label; one foreground reads on
+    # both states.
+    btn_fg = _on_accent(accent_strong, text, bg)
+
+    # --- cyber glow (dark palettes only), gated by reduced motion --------------
+    dark = _is_dark(bg)
+    animate = _animations_enabled()
+    glow_css = ""
+    if dark:
+        halo = _rgba(accent, 0.55)         # bright accent halo for borders/dots
+        tshadow = _rgba(accent, 0.65)      # text glow
+        good_halo = _rgba(good, 0.6)
+        # Static glow (always present on dark): text-shadow on headings, a halo on
+        # the accent left-border and the status dots.
+        glow_css = f"""
+/* --- cyber glow: dark-palette only, branding-derived (accent={accent}) --- */
+.soc-ap-eyebrow {{ text-shadow: 0 0 6px {tshadow}; }}
+.soc-ap-title {{ text-shadow: 0 0 5px {_rgba(accent, 0.35)}; }}
+.soc-ap-header {{ box-shadow: inset 0 2px 0 -1px {halo}; }}
+.soc-ap-sample {{ box-shadow: -3px 0 10px -4px {halo}, 0 6px 18px {glow}; }}
+.soc-ap-good {{ text-shadow: 0 0 7px {good_halo}; }}
+.soc-ap-warn {{ text-shadow: 0 0 7px {_rgba(warn, 0.6)}; }}
+.soc-ap-bad {{ text-shadow: 0 0 7px {_rgba(bad, 0.6)}; }}
+"""
+        if animate:
+            # A slow pulse on the status dots — only when animations are enabled.
+            glow_css += f"""
+@keyframes soc-ap-pulse {{
+  0%   {{ text-shadow: 0 0 4px {_rgba(good, 0.35)}; }}
+  50%  {{ text-shadow: 0 0 10px {good_halo}; }}
+  100% {{ text-shadow: 0 0 4px {_rgba(good, 0.35)}; }}
+}}
+.soc-ap-good {{ animation: soc-ap-pulse 2.4s ease-in-out infinite; }}
+"""
+
     return f"""
 window.soc-appearance {{ background-color: {bg}; }}
 .soc-appearance {{ background-color: {bg}; color: {text}; }}
@@ -192,10 +296,27 @@ window.soc-appearance {{ background-color: {bg}; }}
   border: 1px solid {border}; border-radius: 6px; padding: 12px 14px; }}
 .soc-ap-grid label {{ color: {text}; }}
 
+/* Combobox (the preset picker) + its dropdown popup — palette-driven so it
+   doesn't fall back to GTK's stock LIGHT theme (a white combo + light popup) on a
+   dark palette. */
+combobox button.combo {{ background-image: none; background-color: {s_bot};
+  color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 4px 8px; }}
+combobox button.combo:hover {{ border-color: {accent}; }}
+combobox arrow {{ color: {text_dim}; }}
+combobox window, combobox window.background,
+combobox menu, .menu, menu {{ background-color: {s_top}; color: {text};
+  border: 1px solid {border}; }}
+combobox cellview, cellview {{ color: {text}; }}
+menuitem {{ color: {text}; padding: 3px 8px; }}
+menuitem:hover, menuitem:selected {{ background-color: {s_bot};
+  color: {text}; }}
+
 button.soc-primary {{ background-image: none; background-color: {accent_strong};
-  color: #FFFFFF; border: 1px solid {accent_strong}; border-radius: 6px;
+  color: {btn_fg}; border: 1px solid {accent_strong}; border-radius: 6px;
   font-weight: bold; padding: 6px 14px; }}
-button.soc-primary:hover {{ background-color: {accent}; border-color: {accent}; }}
+button.soc-primary:hover {{ background-color: {accent_strong};
+  border-color: {accent}; color: {btn_fg};
+  box-shadow: inset 0 0 0 1px {accent}, 0 4px 14px {glow}; }}
 button.soc-ghost {{ background-image: none; background-color: transparent;
   color: {accent_strong}; border: 1px solid {border}; border-radius: 6px;
   padding: 6px 12px; }}
@@ -207,7 +328,7 @@ button.soc-ghost:hover {{ background-color: {s_bot}; border-color: {accent}; }}
 .soc-ap-warn {{ color: {warn}; }}
 .soc-ap-bad {{ color: {bad}; }}
 .soc-ap-focus {{ box-shadow: 0 6px 18px {glow}; }}
-""".encode()
+{glow_css}""".encode()
 
 
 # --------------------------------------------------------------------------- #
@@ -633,12 +754,72 @@ def run_gui(argv=None) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Contrast matrix — the OBJECTIVE legibility guard. For a resolved palette,
+# compute the WCAG ratio for every meaningful text/accent-on-surface pair the
+# GUIs actually render, AFTER applying the same on-surface routing the builders
+# use (accent_on for accent text/dots, text_on for the button label). Returns the
+# pairs that fall below their AA threshold — [] means the palette is legible
+# everywhere. _check() runs this over every preset so a future palette edit that
+# reintroduces invisible/low-contrast text (the Midnight black-on-black class of
+# bug) fails the smoke instead of shipping.
+# --------------------------------------------------------------------------- #
+def contrast_matrix(palette: dict) -> "list[tuple]":
+    """Return [(label, fg, bg, ratio, minimum), ...] for pairs BELOW WCAG AA.
+    `palette` is a full 14-key palette (preset over defaults)."""
+    p = dict(branding._DEFAULTS["colors"])
+    p.update(palette or {})
+
+    def cr(fg, bg):
+        return branding.contrast_ratio(fg, bg)
+
+    def acc_on(bg, minimum=3.0):
+        return branding.accent_on(bg, accent=p["primary"],
+                                  strong=p["accent_strong"], minimum=minimum)
+    s_top, s_bot, bg = p["surface_top"], p["surface_bottom"], p["background"]
+    btn_fg = branding.text_on(p["accent_strong"], dark=p["text"])
+    # (label, fg, bg, minimum) — body text 4.5, accent/large 3.0.
+    pairs = [
+        ("text on background", p["text"], bg, 4.5),
+        ("text on surface_top", p["text"], s_top, 4.5),
+        ("text on surface_sunken", p["text"], s_bot, 4.5),
+        ("text_dim on background", p["text_dim"], bg, 4.5),
+        ("text_dim on surface_top", p["text_dim"], s_top, 4.5),
+        ("text_dim on surface_sunken", p["text_dim"], s_bot, 4.5),
+        # accent eyebrow/glyph/mark text — AFTER accent_on routing (as the GUIs do).
+        ("accent text on surface_top", acc_on(s_top), s_top, 3.0),
+        ("accent text on surface_sunken", acc_on(s_bot), s_bot, 3.0),
+        ("accent link on background (4.5)", acc_on(bg, 4.5), bg, 4.5),
+        # status dots (good/warn/bad render on surface_top + sunken).
+        ("good dot on surface_top", p["good"], s_top, 3.0),
+        ("good dot on surface_sunken", p["good"], s_bot, 3.0),
+        ("warn dot on surface_top", p["warn"], s_top, 3.0),
+        ("warn dot on surface_sunken", p["warn"], s_bot, 3.0),
+        ("bad dot on surface_top", p["bad"], s_top, 3.0),
+        ("bad dot on surface_sunken", p["bad"], s_bot, 3.0),
+        # the ghost-button / section-title accent_strong on surface.
+        ("accent_strong on surface_top", p["accent_strong"], s_top, 3.0),
+        # primary-button label on its accent fill (routed via text_on).
+        ("button label on accent fill", btn_fg, p["accent_strong"], 4.5),
+        # guierror title (bad) on the window background.
+        ("error title on background", p["bad"], bg, 4.5),
+    ]
+    out = []
+    for label, fg, b, mn in pairs:
+        r = cr(fg, b)
+        if r + 1e-6 < mn:
+            out.append((label, fg, b, round(r, 2), mn))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # CLI / self-check
 # --------------------------------------------------------------------------- #
 def _check() -> int:
     """Validate wiring with NO gi / NO display (the lint/CI smoke):
       * every PRESET has exactly the 14 branding keys,
       * build_css(p) is bytes for each preset,
+      * EVERY preset passes the WCAG contrast matrix (no invisible/low-contrast
+        text on any surface — the objective legibility guard),
       * save_colors round-trips a preset through a temp branding.yaml.
     """
     import tempfile
@@ -650,6 +831,10 @@ def _check() -> int:
         assert set(palette) == keys, f"preset {name!r} key mismatch: {set(palette) ^ keys}"
         css = build_css(palette)
         assert isinstance(css, (bytes, bytearray)) and css, f"build_css({name!r}) not bytes"
+        fails = contrast_matrix(palette)
+        assert not fails, (
+            f"preset {name!r} fails WCAG AA contrast: " +
+            "; ".join(f"{lab} {fg}/{bg} {r}<{mn}" for lab, fg, bg, r, mn in fails))
     # save round-trip in a temp file
     with tempfile.TemporaryDirectory() as d:
         target = os.path.join(d, "branding.yaml")

@@ -38,10 +38,10 @@ _DEFAULTS = {
         "surface_bottom": "#EAF1EC", # sunken/checked card + input wells
         "border": "#CFE0D4",         # thin green-grey hairline borders + dividers
         "text": "#0B1F14",           # near-black-green primary text
-        "text_dim": "#5B7567",       # green-grey secondary (subtitles, hints)
-        "accent_strong": "#157A49",  # darker green: button fills, hover borders, header rule
-        "good": "#1FA463",           # valid-field ring + ONLINE status (= accent)
-        "warn": "#B8860B",           # amber-on-white caution (the lone non-green accent)
+        "text_dim": "#51695C",       # green-grey secondary (subtitles, hints) — AA on tinted surfaces
+        "accent_strong": "#157A49",  # darker green: button fills, hover borders, header rule, ON-SURFACE accent/dots
+        "good": "#157A49",           # valid-field ring + ONLINE status dot (AA-readable on tinted surfaces)
+        "warn": "#9C7209",           # amber-on-white caution (the lone non-green accent), AA on tinted surfaces
         "bad": "#C0341D",            # error ring + invalid status (brick red on white)
     },
 }
@@ -155,6 +155,74 @@ def get(key: str, default=None):
 def color(name: str, default: str | None = None) -> str:
     cols = load().get("colors") or {}
     return cols.get(name) or default or _DEFAULTS["colors"].get(name, "#888888")
+
+
+# --------------------------------------------------------------------------- #
+# WCAG contrast helpers — pure stdlib (no deps), used so the CSS/markup builders
+# can pick an ACCENT and BUTTON-TEXT colour that actually reads on the current
+# surface, instead of hardcoding one that breaks on an alternate (dark) theme.
+# This is what keeps the palette legible across every preset without per-surface
+# special-casing: an accent that fails on its surface is swapped for a stronger
+# palette key (accent_strong), and button text is black/white by luminance.
+# --------------------------------------------------------------------------- #
+def _rgb(hexc: str) -> "tuple[int, int, int]":
+    h = (hexc or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    try:
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except (ValueError, IndexError):
+        return 136, 136, 136
+
+
+def relative_luminance(hexc: str) -> float:
+    """WCAG 2.x relative luminance of a #RRGGBB colour (0.0=black, 1.0=white)."""
+    def chan(c: int) -> float:
+        s = c / 255.0
+        return s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4
+    r, g, b = _rgb(hexc)
+    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+
+
+def contrast_ratio(fg: str, bg: str) -> float:
+    """WCAG 2.x contrast ratio between two #RRGGBB colours (1.0 .. 21.0)."""
+    l1, l2 = relative_luminance(fg), relative_luminance(bg)
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def is_dark(hexc: str) -> bool:
+    """True when `hexc` is a dark surface (luminance below the WCAG mid-point) —
+    used to gate the dark-theme glow rules onto ANY dark palette, not just the
+    named Midnight preset (so a custom dark palette gets the cyber glow too)."""
+    return relative_luminance(hexc) < 0.18
+
+
+def text_on(bg: str, *, dark: str | None = None, light: str = "#FFFFFF") -> str:
+    """Pick the highest-contrast text colour for an accent fill `bg`: white on a
+    dark accent, near-black on a LIGHT accent (amber / bright green) — so a button
+    label never goes invisible on an alternate theme. Considers the palette's own
+    `text` plus a hard white/near-black pair, because on a dark THEME the palette
+    text is itself light and would fail on a light accent fill; the near-black
+    guarantees a readable option for any fill. Returns the best of the candidates."""
+    cands = [c for c in (dark, color("text", "#0B1F14"), light, "#101010") if c]
+    return max(cands, key=lambda c: contrast_ratio(c, bg))
+
+
+def accent_on(bg: str, *, accent: str | None = None, strong: str | None = None,
+              minimum: float = 3.0) -> str:
+    """Return an accent colour that meets `minimum` contrast on surface `bg`:
+    prefer the brand `accent` (primary); if it fails, fall back to the stronger
+    palette accent (accent_strong); if that ALSO fails (very light surface) keep
+    whichever of the two contrasts better. Keeps the brand identity where it reads
+    and only swaps where the tinted/sunken surface would make it illegible."""
+    accent = accent or color("primary", "#1FA463")
+    strong = strong or color("accent_strong", "#157A49")
+    if contrast_ratio(accent, bg) >= minimum:
+        return accent
+    if contrast_ratio(strong, bg) >= minimum:
+        return strong
+    return strong if contrast_ratio(strong, bg) >= contrast_ratio(accent, bg) else accent
 
 
 def icon_path() -> str:
