@@ -494,6 +494,11 @@ chmod 0750 "$ETC/keys"; chown "$SVC_USER:$SVC_USER" "$ETC/keys"
 # Host-bound sealed vault secret (master.enc / pin.enc) — owned by the kiosk user
 # (it unlocks the vault at boot), 0700. setup.py first-run/deploy seals it here.
 mkdir -p "$ETC/secret"; chmod 0700 "$ETC/secret"; chown "$KIOSK_USER:$KIOSK_USER" "$ETC/secret"
+# Persistent panel web data (cookies.sqlite, localStorage, IndexedDB, Chromium
+# --user-data-dir) — holds SESSION TOKENS, so 0700 and owned by the kiosk user
+# (the panels write it). A SIBLING of secret/, not inside it, so the sealed-master
+# guarantee is untouched. The wall creates per-panel 0700 subdirs on first use.
+mkdir -p "$ETC/webdata"; chmod 0700 "$ETC/webdata"; chown "$KIOSK_USER:$KIOSK_USER" "$ETC/webdata"
 # soc.env must be readable by BOTH the kiosk user (sources it at session start)
 # and the autossh service user — but NEVER world-readable (it holds the vault
 # email/URL, secret-dir path and config-item name). Prefer an ACL; if ACLs are

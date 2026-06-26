@@ -140,11 +140,71 @@ port before opening the window.
 | `title` | the `id` | display name (shown on the status card + on-screen config) |
 | `url` | — | for `mode: direct`; **may be omitted** — the tile then shows a "not configured" card until a URL is set (in YAML or at the glass) |
 | `vault_item` | — | the Vaultwarden login to auto-fill this panel; **omit for a display-only tile** (no auto-login). When set, `selectors` are required |
-| `allow_insecure` | `false` | accept a self-signed TLS cert for this panel (trusted LAN only) |
+| `allow_insecure` | `false` | accept a self-signed TLS cert for this panel (trusted LAN only). `insecure_tls:` is an accepted alias |
 | `allow_media` | `false` | keep WebGL / WebAudio / HTML5 media enabled (off by default to save RAM/GPU on 1 GB boards) |
+| `persist` | `true` | keep cookies + web storage on disk so a cookie-session dashboard stays logged in across a panel reload **and** a wall restart. `false` → ephemeral (no on-disk session) |
+| `user_agent` | — | override the browser User-Agent string for this panel (some dashboards gate behaviour on it) |
+| `allow` | `[]` | extra domains this panel may navigate its **top-level** frame to, on top of its own origin + the bundled SSO list. Wildcard `*.example.com` ok |
+| `block_trackers` | `true` | apply the analytics/tracker blocklist for this panel. `false` → don't (for a dashboard that legitimately needs one) |
+| `unblock` | `[]` | specific tracker hosts this panel is allowed to load even with `block_trackers: true` |
 
 So the minimum panel is just `{id, grid}` (a blank, configurable tile); add `url`
 to display a page, and `vault_item` + `selectors` to auto-log-in.
+
+### Renderer security & site restriction
+
+Every panel renders a third-party-fronted SOC dashboard that could be compromised
+or buggy. The renderer reduces blast radius **without breaking a normal dashboard**
+— every restriction is scoped to things a dashboard doesn't need, and every
+loosening is explicit opt-in. The defaults are safe and invisible.
+
+- **WebKit hardening (always on).** No file:// escalation, no Java/plugins, no
+  mixed (insecure) content on HTTPS pages, no downloads / arbitrary file pickers,
+  a hardened `NO_THIRD_PARTY` cookie accept policy, and the WebKit sandbox where
+  available. TLS certs are **verified** (fail-closed); a panel opts out per-tile
+  with `allow_insecure` / `insecure_tls` (trusted LAN only).
+- **Navigation allowlist.** Top-level (main-frame) navigation is restricted to an
+  allowlist: each panel's own origin (and its subdomains) + a bundled cloud-SSO
+  list (`security/allowlist-sso.txt`) + any per-panel `allow:` + the global
+  `security.allow:` / `security.sso_allow:`. Sub-resources, XHR, websockets and
+  SSO **redirect** chains are *not* gated, so real logins and live dashboards keep
+  working — only an attempt to drive the panel's top-level frame to an unrelated
+  site is refused (and logged). Self-hosted dashboards add their origin with one
+  `allow:` line; the master switch `SOC_NAV_ALLOWLIST=0` disables the gate for an
+  unmapped dashboard.
+- **Tracker / analytics blocking.** The curated top-20 analytics/tracker domains
+  (`security/trackers-top20.json`, a WebKit `WKContentRuleList` / Chromium
+  `Network.setBlockedURLs` data file — easy to extend by appending hosts) are
+  dropped as **third-party** requests, so a dashboard's own first-party telemetry
+  is never caught. Less third-party JS = smaller attack surface and less RAM/CPU.
+  Opt a panel out with `block_trackers: false`, or allow one host with `unblock:`.
+
+#### Optional top-level `security:` block
+
+All keys are optional and default to the safe/on value; omit the block entirely
+for today's behaviour.
+
+```yaml
+security:
+  nav_allowlist: true        # gate top-level navigation to the allowlist
+  block_trackers: true       # global default for the per-panel knob
+  allow: []                  # extra allowed top-level-nav domains (every panel)
+  sso_allow: []              # extra SSO/redirect domains on top of the bundled list
+```
+
+Environment overrides (set in `soc.env`): `SOC_NAV_ALLOWLIST` and
+`SOC_BLOCK_TRACKERS` (`0`/`1`) override the file defaults at boot; `SOC_WEBDATA_DIR`
+overrides where persistent web data is stored.
+
+#### Where sessions are stored
+
+Persistent cookies and web storage hold **session tokens**, so they live in a
+private `webdata/` dir — mode `0700`, owned by the kiosk user, a **sibling** of
+the sealed-master `secret/` dir (never inside it), outside the repo, and never
+logged. Each panel gets its own subdirectory (`webdata/<panel-id>/`) so one
+panel cannot read another's session. The location follows the same precedence as
+the rest of the config (`$SOC_WEBDATA_DIR` → user dir when the active marker is
+set → `/etc/soc-display/webdata` when deployed → `dev/run/webdata` in a checkout).
 
 ### Auto-login & the sign-in popup
 

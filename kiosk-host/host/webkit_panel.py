@@ -47,7 +47,7 @@ if _WK_VER is None:
 from gi.repository import Gtk, Gdk, GLib, GObject, WebKit2  # noqa: E402
 
 from . import config as cfg  # noqa: E402
-from . import inject, perf, style  # noqa: E402
+from . import configpaths, inject, perf, style, websecurity  # noqa: E402
 
 RETRY_INITIAL = 5       # seconds; load-failure retry backoff
 RETRY_MAX = 120
@@ -57,6 +57,124 @@ MAX_LOGIN_ATTEMPTS = 3        # then show the "please sign in" popup instead
 
 _default_ctx_proxied = False
 _mem_pressure_done = False
+
+# The compiled tracker UserContentFilter is process-wide (it holds no secrets and
+# the rule set is identical for every blocking panel). Compile ONCE, lazily, off
+# the data file; panels add_filter() it as soon as it lands. Keyed by the sorted
+# `unblock` set so a panel that legitimately needs one tracker gets its own
+# variant. None until the first compile is requested.
+_filter_store = None                     # WebKit2.UserContentFilterStore | None
+_filters: "dict[tuple, object]" = {}     # unblock-key -> compiled UserContentFilter
+_filters_pending: "set[tuple]" = set()   # compiles in flight (don't double-submit)
+_filter_waiters: "dict[tuple, list]" = {}  # unblock-key -> [callbacks awaiting it]
+
+
+def _ucf_supported() -> bool:
+    """4.1 ships UserContentFilterStore (compiled WKContentRuleList); 4.0 does
+    not — there we fall back to a resource-load redirect."""
+    return getattr(WebKit2, "UserContentFilterStore", None) is not None
+
+
+def _webdata_base() -> str:
+    """The private 0700 web-data root for this wall, created on first use. Holds
+    session tokens, so kiosk-user-owned + 0700, outside the repo (see
+    configpaths.resolve_webdata_dir)."""
+    base = configpaths.resolve_webdata_dir()
+    try:
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        os.chmod(base, 0o700)            # tighten even if it pre-existed 0755
+    except OSError:
+        pass
+    return base
+
+
+def _panel_data_dir(panel) -> str:
+    """Per-panel web-data subdir (profile isolation: one panel's cookies/storage
+    are not readable by another). 0700, under the private base."""
+    d = os.path.join(_webdata_base(), "wk-" + panel.id)
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _ensure_tracker_filter(panel, on_ready, log):
+    """Compile (once, async, on the GLib main loop) the tracker UserContentFilter
+    variant for this panel's `unblock` set and call on_ready(filter) when it
+    lands. Best-effort: silently does nothing if the store/data file is absent —
+    the panel just renders without the filter (the host fallback covers 4.0)."""
+    global _filter_store
+    if not _ucf_supported():
+        return
+    rules = websecurity.load_tracker_rules_text()
+    if not rules:
+        return
+    # Trim the rule set to honour this panel's `unblock:` hosts.
+    unblock = tuple(sorted({h.lower() for h in (getattr(panel, "unblock", ()) or ())}))
+    if unblock:
+        try:
+            import json as _json
+            keep = [r for r in _json.loads(rules)
+                    if not _rule_unblocked(r, unblock)]
+            rules = _json.dumps(keep)
+        except Exception:                # malformed -> fall back to the full set
+            unblock = ()
+    key = unblock
+
+    if key in _filters:                  # already compiled — hand it back at once
+        on_ready(_filters[key])
+        return
+    _filter_waiters.setdefault(key, []).append(on_ready)
+    if key in _filters_pending:
+        return                           # a compile for this key is already running
+    _filters_pending.add(key)
+
+    if _filter_store is None:
+        store_dir = os.path.join(_webdata_base(), "filter-store")
+        try:
+            os.makedirs(store_dir, mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+        try:
+            _filter_store = WebKit2.UserContentFilterStore.new(store_dir)
+        except Exception:                # very old/odd build — give up gracefully
+            _filters_pending.discard(key)
+            return
+
+    ident = "soc-trackers" + ("-" + "_".join(key) if key else "")
+
+    def _done(store, result):
+        _filters_pending.discard(key)
+        try:
+            filt = store.save_finish(result)
+        except Exception as e:           # compile failed -> no filter, log once
+            log(f"tracker filter compile failed ({ident}): {e}")
+            _filter_waiters.pop(key, None)
+            return
+        _filters[key] = filt
+        for cb in _filter_waiters.pop(key, []):
+            try:
+                cb(filt)
+            except Exception:
+                pass
+
+    try:
+        _filter_store.save(ident, GLib.Bytes.new(rules.encode("utf-8")), None, _done)
+    except Exception as e:
+        _filters_pending.discard(key)
+        _filter_waiters.pop(key, None)
+        log(f"tracker filter save failed: {e}")
+
+
+def _rule_unblocked(rule, unblock) -> bool:
+    """True if this WKContentRuleList rule targets a host the panel unblocked."""
+    try:
+        uf = str(rule["trigger"]["url-filter"]).replace("\\.", ".").lower()
+    except (KeyError, TypeError):
+        return False
+    return any(u in uf for u in unblock)
 
 
 def _apply_memory_pressure():
@@ -110,6 +228,39 @@ def _hwaccel_policy():
     }.get(mode)
 
 
+def _harden_settings(s, panel):
+    """Attack-surface reduction applied to EVERY WebView's settings (both the
+    shared-default and the private-context panels) in ONE place, so no branch can
+    silently skip a control. None of these are features a SOC dashboard needs.
+
+    Each property is guarded — names/availability differ between webkit2gtk-4.0
+    and 4.1 (and across aarch64 builds), so an unknown key must never crash boot.
+    """
+    # file:// can't read other files / reach other origins (no local-file escalation)
+    for _prop, _val in (
+        ("allow-file-access-from-file-urls", False),
+        ("allow-universal-access-from-file-urls", False),
+        # legacy plugin / Java surface — absent on most 4.1 builds (guarded)
+        ("enable-java", False),
+        ("enable-plugins", False),
+        # block mixed content on HTTPS dashboards (the active-mixed block is the
+        # real attack-surface win; display-mixed off too)
+        ("allow-running-of-insecure-content", False),
+        ("allow-display-of-insecure-content", False),
+    ):
+        try:
+            s.set_property(_prop, _val)
+        except Exception:                    # unknown on this build -> skip
+            pass
+    # UA override (some dashboards gate on UA). Only when explicitly set.
+    ua = getattr(panel, "user_agent", None)
+    if ua:
+        try:
+            s.set_property("user-agent", ua)
+        except Exception:
+            pass
+
+
 def _apply_tls(ctx, panel, log):
     if panel.allow_insecure and hasattr(ctx, "set_tls_errors_policy"):
         try:
@@ -120,34 +271,97 @@ def _apply_tls(ctx, panel, log):
             pass
 
 
+def _data_manager_for(panel, log):
+    """A per-panel WebsiteDataManager: persistent (base/cache dirs under the
+    private 0700 web-data root) when `persist` is True, else ephemeral (no
+    on-disk session). Per-panel base dir == profile ISOLATION: one panel's
+    cookies/localStorage/IndexedDB are not readable by another.
+
+    Guarded: webkit2gtk-4.0's constructor differs / may lack the kwargs — on any
+    failure return None so the caller builds a plain context (persistence
+    degrades but the wall never crashes)."""
+    DM = getattr(WebKit2, "WebsiteDataManager", None)
+    if DM is None:
+        return None
+    persist = getattr(panel, "persist", True)
+    try:
+        if not persist:
+            return DM.new_ephemeral() if hasattr(DM, "new_ephemeral") else None
+        base = _panel_data_dir(panel)
+        return DM(base_data_directory=base,
+                  base_cache_directory=os.path.join(base, "cache"))
+    except Exception as e:                       # 4.0 API drift -> default DM
+        log(f"[{panel.id}] WebsiteDataManager unavailable ({e}); "
+            f"session persistence degraded for this panel")
+        return None
+
+
+def _setup_cookies(ctx, dm, panel, log):
+    """Persistent SQLITE cookie storage (survives a wall restart) + a hardened
+    NO_THIRD_PARTY accept policy (refuse third-party cookie writes — complements
+    the tracker blocklist). Ephemeral panels (`persist:false`) skip the on-disk
+    store and just harden the policy."""
+    try:
+        cm = dm.get_cookie_manager() if dm is not None and hasattr(dm, "get_cookie_manager") \
+            else ctx.get_cookie_manager()
+    except Exception:
+        return
+    if cm is None:
+        return
+    persist = getattr(panel, "persist", True)
+    if persist:
+        try:
+            cm.set_persistent_storage(
+                os.path.join(_panel_data_dir(panel), "cookies.sqlite"),
+                WebKit2.CookiePersistentStorage.SQLITE)
+        except Exception as e:                   # very old 4.0 -> session-only
+            log(f"[{panel.id}] persistent cookies unavailable ({e})")
+    try:
+        cm.set_accept_policy(WebKit2.CookieAcceptPolicy.NO_THIRD_PARTY)
+    except Exception:
+        pass
+
+
+def _new_context(dm):
+    """Build a WebContext bound to `dm` (per-panel persistence + isolation), or a
+    plain WebContext when no DM is available (4.0 fallback)."""
+    if dm is not None and hasattr(WebKit2.WebContext, "new_with_website_data_manager"):
+        try:
+            return WebKit2.WebContext.new_with_website_data_manager(dm)
+        except Exception:
+            pass
+    return WebKit2.WebContext.new()
+
+
 def _context_for(panel, proxy, log):
-    """The WebContext for a panel: the shared default one (with the global proxy
-    applied once, if any), or a *private* context when this panel must differ —
-    it bypasses the global proxy (`proxy: false`) or accepts self-signed TLS
-    (`allow_insecure: true`)."""
+    """A PRIVATE, per-panel WebContext backed by its own WebsiteDataManager, so
+    each panel persists cookies/web-storage independently (profile isolation) and
+    sessions survive a wall restart. The previous shared get_default() context is
+    gone — sharing would defeat isolation and a single persistent store can't be
+    keyed per panel. The global proxy (if any) is applied to every panel's
+    context; a `proxy: false` panel is pinned to NO_PROXY; `allow_insecure`
+    relaxes TLS for that panel only."""
     global _default_ctx_proxied
-    _apply_memory_pressure()                      # before any WebContext is created
+    _apply_memory_pressure()                      # before any WebContext/DM is created
+    dm = _data_manager_for(panel, log)
+    ctx = _new_context(dm)
+
     proxied = bool(proxy and proxy.enabled)
-    if (proxied and not panel.proxy) or panel.allow_insecure:
-        ctx = WebKit2.WebContext.new()
-        if proxied and panel.proxy:
-            ignore = cfg.proxy_ignore_hosts(proxy)
+    if proxied:
+        ignore = cfg.proxy_ignore_hosts(proxy)
+        if panel.proxy:
             ctx.set_network_proxy_settings(
                 WebKit2.NetworkProxyMode.CUSTOM,
                 WebKit2.NetworkProxySettings.new(proxy.url, ignore))
-        elif proxied:
+            if not _default_ctx_proxied:
+                _default_ctx_proxied = True
+                log(f"proxy: webkit panels -> {proxy.url} "
+                    f"(bypass: {', '.join(ignore)})")
+        else:
             ctx.set_network_proxy_settings(WebKit2.NetworkProxyMode.NO_PROXY, None)
-        _apply_tls(ctx, panel, log)
-        _tune_context(ctx)
-        return ctx
-    ctx = WebKit2.WebContext.get_default()
-    if proxied and not _default_ctx_proxied:
-        ignore = cfg.proxy_ignore_hosts(proxy)
-        settings = WebKit2.NetworkProxySettings.new(proxy.url, ignore)
-        ctx.set_network_proxy_settings(WebKit2.NetworkProxyMode.CUSTOM, settings)
-        _default_ctx_proxied = True
-        log(f"proxy: webkit panels -> {proxy.url} "
-            f"(bypass: {', '.join(ignore)})")
+
+    _apply_tls(ctx, panel, log)
+    _setup_cookies(ctx, dm, panel, log)
     _tune_context(ctx)
     return ctx
 
@@ -155,13 +369,14 @@ def _context_for(panel, proxy, log):
 class WebKitPanel:
     def __init__(self, panel, on_need_login, log, embedded: bool = False,
                  proxy=None, proxy_creds=None, on_config=None,
-                 on_login_success=None):
+                 on_login_success=None, security=None):
         self.panel = panel
         self.on_need_login = on_need_login   # callable(panel) -> {"user","pass"} | None
         self.log = log
         self.embedded = embedded
         self.proxy = proxy                   # config.ProxyCfg | None
         self.proxy_creds = proxy_creds       # callable() -> {"user","pass"} | None
+        self.security = security             # config.SecurityCfg | None (wall-wide)
         self.on_config = on_config           # callable() -> open the config window
         self.on_login_success = on_login_success   # callable(panel) on a good login
         self._login_attempts = 0
@@ -183,6 +398,7 @@ class WebKitPanel:
         g = p.geometry
 
         ucm = WebKit2.UserContentManager()
+        self._ucm = ucm
         ucm.register_script_message_handler("socCreds")
         ucm.connect("script-message-received::socCreds", self._on_message)
 
@@ -196,6 +412,11 @@ class WebKitPanel:
         )
         ucm.add_script(script)
 
+        # Per-panel top-level navigation allowlist, computed ONCE (a cached set
+        # lookup on each main-frame nav). Gate honoured at decision time.
+        self._allowlist = websecurity.build_allowlist(p, self._security())
+        self._nav_gate = self._nav_gate_enabled()
+
         ctx = _context_for(p, self.proxy, self.log)
         self.webview = WebKit2.WebView(web_context=ctx,
                                        user_content_manager=ucm)
@@ -207,8 +428,14 @@ class WebKitPanel:
         except TypeError:
             pass
         s.set_property("enable-page-cache", False)        # save RAM
-        s.set_property("enable-html5-database", False)
+        # IndexedDB/WebSQL — SPA dashboards use it for offline state + session;
+        # lives under the per-panel DM base dir (private 0700). REVERSED from the
+        # old lean-off so a cookie/IDB-session dashboard stays logged in.
+        s.set_property("enable-html5-database", True)
         s.set_property("enable-offline-web-application-cache", False)
+        # Attack-surface hardening (file://, plugins/Java, mixed content, UA) —
+        # one helper so every WebView gets it identically.
+        _harden_settings(s, p)
         # WebGL / WebAudio / media pin RAM + GPU; SOC dashboards rarely need them.
         # Off by default; set `allow_media: true` on a panel that does (video,
         # WebGL Grafana, screen share). Each property is guarded — names vary by
@@ -239,6 +466,23 @@ class WebKitPanel:
         self.webview.connect("load-failed", self._on_load_failed)
         self.webview.connect("load-changed", self._on_load_changed)
         self.webview.connect("authenticate", self._on_authenticate)
+
+        # ---- renderer security: nav allowlist + trackers + no downloads -------
+        # Top-level navigation allowlist (and always-ignore new windows).
+        self.webview.connect("decide-policy", self._on_decide_policy)
+        # A SOC wall never saves a file — refuse all downloads (neutralises
+        # drive-by file drops). Signal name differs 4.0/4.1 + lives on context.
+        for _sig, _obj in (("download-started", ctx),
+                           ("download-started", self.webview)):
+            if GObject.signal_lookup(_sig, type(_obj)):
+                try:
+                    _obj.connect(_sig, self._on_download_started)
+                    break
+                except Exception:
+                    pass
+        # Tracker blocklist: compile-once WKContentRuleList (4.1) added when ready;
+        # 4.0 fallback observes resource loads and redirects matches to about:blank.
+        self._install_tracker_block(ctx)
 
         # match the wall background so navigations never flash white
         rgba = Gdk.RGBA()
@@ -284,6 +528,120 @@ class WebKitPanel:
     def widget(self):
         """The embeddable widget (used by wall.py in single-window layout)."""
         return self.frame
+
+    # ---- renderer security -------------------------------------------------
+    def _security(self):
+        """The wall-wide SecurityCfg, if the host passed one (via on_config's
+        config). Falls back to None -> websecurity uses its safe defaults."""
+        return getattr(self, "security", None)
+
+    def _nav_gate_enabled(self) -> bool:
+        """Master gate for the nav allowlist: the env toggle AND the security
+        block both default ON; either set to off disables it (escape hatch for a
+        brand-new dashboard whose redirect chain isn't mapped yet)."""
+        sec = self._security()
+        sec_on = getattr(sec, "nav_allowlist", True) if sec is not None else True
+        env_on = cfg.env_bool("SOC_NAV_ALLOWLIST", True)
+        on = sec_on and env_on
+        if not on:
+            self.log(f"[{self.panel.id}] nav allowlist DISABLED "
+                     f"(SOC_NAV_ALLOWLIST / security.nav_allowlist) — top-level "
+                     f"navigation is not gated")
+        return on
+
+    def _on_decide_policy(self, _wv, decision, decision_type):
+        """Refuse top-level navigation outside the panel's allowlist (own origin
+        + its SSO/redirect domains + configured allow). Only main-frame top-level
+        nav is gated — sub-resources/CDNs/XHR/websockets/SSO POST-backs are NOT
+        (they go through the tracker filter only), so real dashboards + logins
+        keep working. New windows are always refused (a wall panel never opens
+        one). Returning True = we handled it; False = let WebKit proceed."""
+        PDT = WebKit2.PolicyDecisionType
+        try:
+            if decision_type == PDT.NEW_WINDOW_ACTION:
+                decision.ignore()                 # a wall panel never opens a new window
+                return True
+            if decision_type != PDT.NAVIGATION_ACTION:
+                return False                      # response/other -> default
+        except Exception:
+            return False
+        if not self._nav_gate:
+            return False
+        try:
+            na = decision.get_navigation_action()
+            # Only gate the TOP-LEVEL frame; sub-frames are not gated (the tracker
+            # filter still protects them). On builds lacking is_main_frame, fail
+            # OPEN for sub-frames so a dashboard's iframes are never broken.
+            if hasattr(na, "is_main_frame") and not na.is_main_frame():
+                return False
+            uri = na.get_request().get_uri()
+        except Exception:
+            return False
+        host = websecurity.host_of(uri)
+        # about:blank / non-http(s) have no host: allow (set_url already refuses
+        # non-http(s) loads upstream; about:blank is our own status/sink target).
+        if not host:
+            return False
+        if websecurity.host_matches(host, self._allowlist):
+            return False                          # allowed -> proceed
+        try:
+            decision.ignore()
+        except Exception:
+            return False
+        self.log(f"[{self.panel.id}] refused off-allowlist nav -> {uri}")
+        return True
+
+    def _on_download_started(self, _ctx_or_view, download):
+        """Cancel every download — a SOC wall never needs to save a file."""
+        try:
+            download.cancel()
+        except Exception:
+            pass
+        self.log(f"[{self.panel.id}] download refused (downloads disabled)")
+        return True
+
+    def _install_tracker_block(self, ctx):
+        """Add the top-20 analytics/tracker blocklist for this panel, honouring
+        block_trackers / unblock. 4.1: a compiled WKContentRuleList (added async
+        when it lands). 4.0: a resource-load-started redirect to about:blank."""
+        if not websecurity.should_block_trackers(
+                self.panel, self._security(),
+                cfg.env_bool("SOC_BLOCK_TRACKERS", True)):
+            return
+        if _ucf_supported():
+            def _add(filt):
+                try:
+                    self._ucm.add_filter(filt)
+                except Exception:
+                    pass
+            _ensure_tracker_filter(self.panel, _add, self.log)
+            return
+        # 4.0 fallback: no compiled-filter store. Observe resource loads and
+        # redirect any whose host matches the (unblock-trimmed) blocklist.
+        self._tracker_hosts = websecurity.effective_tracker_hosts(
+            self.panel, self._security())
+        if self._tracker_hosts and GObject.signal_lookup(
+                "resource-load-started", WebKit2.WebView):
+            try:
+                self.webview.connect("resource-load-started",
+                                     self._on_resource_load_started)
+            except Exception:
+                pass
+
+    def _on_resource_load_started(self, _wv, resource, request):
+        """4.0 tracker fallback: redirect a matched request to about:blank (a true
+        cancel isn't available on this signal). Coarse but cuts third-party JS."""
+        try:
+            host = websecurity.host_of(request.get_uri())
+        except Exception:
+            return
+        if not host:
+            return
+        if any(host == h or host.endswith("." + h) for h in self._tracker_hosts):
+            try:
+                request.set_uri("about:blank")
+            except Exception:
+                pass
 
     # ---- lifecycle ---------------------------------------------------------
     def show(self):

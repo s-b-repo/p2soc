@@ -51,6 +51,24 @@ def env_float(name: str, default: float, *, lo: float = None, hi: float = None) 
     return _env_num(name, default, float, lo, hi)
 
 
+def env_bool(name: str, default: bool) -> bool:
+    """os.environ[name] as a bool. '0'/'false'/'no'/'off' (any case) -> False,
+    '1'/'true'/'yes'/'on' -> True; missing/garbage -> default. Used for the
+    security master toggles (SOC_NAV_ALLOWLIST / SOC_BLOCK_TRACKERS) — a typo'd
+    value must never crash the wall, it falls back to the SAFE default."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    sys.stderr.write(f"[soc-kiosk] {name}={raw!r} is not a boolean; "
+                     f"using {default}\n")
+    return default
+
+
 # The vault backend selected when $SOC_VAULT_BACKEND is unset. The pure-Python
 # litebw client is the production default (no Rust toolchain on the 1 GB Pi);
 # 'native' is its alias and 'rbw' stays selectable. Callers re-derive the name
@@ -70,11 +88,15 @@ VALID_SCHEMES = {"http", "https"}
 VALID_PROXY_SCHEMES = {"http", "https", "socks", "socks4", "socks5"}
 VALID_VPN_TYPES = {"fortinet", "openvpn", "wireguard", "inode"}
 
-_TOP_KEYS = {"display", "panels", "tunnel", "vpn", "proxy"}
+_TOP_KEYS = {"display", "panels", "tunnel", "vpn", "proxy", "security"}
 _DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout"}
 _PANEL_KEYS = {"id", "engine", "grid", "mode", "url", "tunnel", "path", "scheme",
                "vault_item", "selectors", "login_marker", "keepalive", "proxy",
-               "title", "allow_insecure", "allow_media"}
+               "title", "allow_insecure", "allow_media",
+               # renderer security/compat knobs (all optional, safe defaults):
+               "persist", "user_agent", "allow", "block_trackers", "unblock",
+               "insecure_tls"}
+_SECURITY_KEYS = {"nav_allowlist", "allow", "block_trackers", "sso_allow"}
 _PROXY_KEYS = {"enabled", "url", "vault_item", "ignore_hosts"}
 _TUNNEL_PANEL_KEYS = {"local_port", "remote_host", "remote_port"}
 _KEEPALIVE_KEYS = {"strategy", "intervalSec", "url", "target"}
@@ -119,9 +141,19 @@ class Panel:
     scheme: str = "http"
     proxy: bool = True              # use the global proxy (when one is enabled)
     title: str = ""                 # display name (defaults to id)
-    allow_insecure: bool = False    # accept self-signed TLS (trusted LAN only)
+    allow_insecure: bool = False    # accept self-signed TLS (trusted LAN only).
+                                    # `insecure_tls:` in YAML is an accepted alias.
     allow_media: bool = False       # keep WebGL/WebAudio/<video> (off by default
                                     # to save RAM/GPU on 1 GB boards)
+    # --- renderer security / compat knobs (consumed by webkit_panel/chromium_panel) ---
+    persist: bool = True            # persist cookies + web storage on disk so a
+                                    # session survives reload + wall restart
+                                    # (False -> ephemeral, no on-disk session)
+    user_agent: Optional[str] = None  # UA override (some dashboards gate on it)
+    allow: tuple = ()               # extra allowed top-level nav domains
+                                    # (wildcard '*.example.com' ok)
+    block_trackers: bool = True     # apply the analytics/tracker blocklist
+    unblock: tuple = ()             # tracker hosts this panel may load anyway
     geometry: Optional[Geometry] = None
 
     @property
@@ -196,12 +228,28 @@ class DisplayCfg:
 
 
 @dataclass
+class SecurityCfg:
+    """Wall-wide renderer security defaults (optional top-level `security:` block).
+
+    Every field defaults to the SAFE/ON value, so a config that omits the block
+    behaves exactly as before. The env toggles SOC_NAV_ALLOWLIST /
+    SOC_BLOCK_TRACKERS override nav_allowlist / block_trackers at boot.
+    """
+    nav_allowlist: bool = True      # gate top-level navigation to the allowlist
+    allow: tuple = ()               # extra allowed domains added to every panel
+    block_trackers: bool = True     # global default for the per-panel knob
+    sso_allow: tuple = ()           # extra SSO/redirect domains on top of the
+                                    # bundled security/allowlist-sso.txt
+
+
+@dataclass
 class Config:
     display: DisplayCfg
     panels: list = field(default_factory=list)
     tunnel: dict = field(default_factory=dict)
     vpn: dict = field(default_factory=dict)
     proxy: ProxyCfg = field(default_factory=ProxyCfg)
+    security: SecurityCfg = field(default_factory=SecurityCfg)
     warnings: list = field(default_factory=list)
 
 
@@ -411,6 +459,26 @@ def _unknown_keys(d: dict, known: set, where: str, warns: list):
         warns.append(f"{where}: unknown key '{k}' (typo?) — it is ignored")
 
 
+def _validate_domain_list(v, where: str, errs: list):
+    """A list of non-empty domain strings (wildcard '*.d.com' ok). Empty list ok."""
+    if not isinstance(v, list) or not all(
+            isinstance(x, str) and x.strip() for x in v):
+        errs.append(f"{where}: must be a list of non-empty domain strings, got {v!r}")
+
+
+def _validate_security(sec, errs: list, warns: list):
+    if not isinstance(sec, dict):
+        errs.append("security: must be a mapping")
+        return
+    _unknown_keys(sec, _SECURITY_KEYS, "security", warns)
+    for k in ("nav_allowlist", "block_trackers"):
+        if k in sec and not isinstance(sec[k], bool):
+            errs.append(f"security.{k}: must be true or false, got {sec[k]!r}")
+    for k in ("allow", "sso_allow"):
+        if k in sec:
+            _validate_domain_list(sec[k], f"security.{k}", errs)
+
+
 def _validate_display(d: dict, errs: list, warns: list):
     _unknown_keys(d, _DISPLAY_KEYS, "display", warns)
     for k in ("width", "height", "cols", "rows"):
@@ -498,6 +566,27 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
     if "allow_media" in p and not isinstance(p["allow_media"], bool):
         errs.append(f"{where}: allow_media must be true or false, "
                     f"got {p['allow_media']!r}")
+
+    # renderer security/compat knobs — all optional, validated mirroring the
+    # allow_insecure/allow_media bool pattern (and list-of-str for domain lists).
+    for k in ("persist", "block_trackers"):
+        if k in p and not isinstance(p[k], bool):
+            errs.append(f"{where}: {k} must be true or false, got {p[k]!r}")
+    # insecure_tls is an ALIAS of allow_insecure — same bool check, same field.
+    if "insecure_tls" in p and not isinstance(p["insecure_tls"], bool):
+        errs.append(f"{where}: insecure_tls must be true or false, "
+                    f"got {p['insecure_tls']!r}")
+    if "insecure_tls" in p and "allow_insecure" in p \
+            and p["insecure_tls"] != p["allow_insecure"]:
+        errs.append(f"{where}: insecure_tls and allow_insecure both set to "
+                    f"conflicting values (they are aliases — set only one)")
+    for k in ("allow", "unblock"):
+        if k in p:
+            _validate_domain_list(p[k], f"{where}: {k}", errs)
+    if "user_agent" in p and p["user_agent"] is not None \
+            and not (isinstance(p["user_agent"], str) and p["user_agent"].strip()):
+        errs.append(f"{where}: user_agent must be a non-empty string (or omit it), "
+                    f"got {p['user_agent']!r}")
 
     # Auto-login is optional: a panel with a vault_item logs itself in (and then
     # needs selectors); a panel without one is display-only (the page just shows,
@@ -783,6 +872,7 @@ def _parse(raw, path: str) -> Config:
     _validate_cross(raw, disp, panels_raw, errs, warns)
     _validate_vpn(raw.get("vpn", {}) or {}, errs, warns)
     _validate_proxy(raw.get("proxy", {}) or {}, errs, warns)
+    _validate_security(raw.get("security", {}) or {}, errs, warns)
 
     if errs:
         raise ConfigError(
@@ -806,8 +896,14 @@ def _parse(raw, path: str) -> Config:
             scheme=p.get("scheme", "http"),
             proxy=bool(p.get("proxy", True)),
             title=str(p.get("title", "") or ""),
-            allow_insecure=bool(p.get("allow_insecure", False)),
+            # insecure_tls is an alias of allow_insecure: either name opts in.
+            allow_insecure=bool(p.get("allow_insecure", p.get("insecure_tls", False))),
             allow_media=bool(p.get("allow_media", False)),
+            persist=bool(p.get("persist", True)),
+            user_agent=(str(p["user_agent"]) if p.get("user_agent") else None),
+            allow=tuple(p.get("allow") or ()),
+            block_trackers=bool(p.get("block_trackers", True)),
+            unblock=tuple(p.get("unblock") or ()),
         )
         panel.geometry = compute_geometry(disp, panel.grid)
         panels.append(panel)
@@ -820,10 +916,21 @@ def _parse(raw, path: str) -> Config:
         ignore_hosts=tuple(pr.get("ignore_hosts") or ()),
     )
 
+    sc = raw.get("security", {}) or {}
+    # env toggles override the file default (and the file overrides the dataclass
+    # default) — all default to the SAFE/ON value.
+    security = SecurityCfg(
+        nav_allowlist=env_bool("SOC_NAV_ALLOWLIST", bool(sc.get("nav_allowlist", True))),
+        allow=tuple(sc.get("allow") or ()),
+        block_trackers=env_bool("SOC_BLOCK_TRACKERS", bool(sc.get("block_trackers", True))),
+        sso_allow=tuple(sc.get("sso_allow") or ()),
+    )
+
     return Config(display=disp, panels=panels,
                   tunnel=raw.get("tunnel", {}) or {},
                   vpn=raw.get("vpn", {}) or {},
                   proxy=proxy,
+                  security=security,
                   warnings=warns)
 
 
@@ -869,11 +976,37 @@ def to_yaml(conf: "Config") -> str:
             pd["allow_insecure"] = True
         if p.allow_media:
             pd["allow_media"] = True
+        # renderer knobs — emit only when non-default (keeps round-tripped
+        # configs minimal and backward-compatible).
+        if not p.persist:
+            pd["persist"] = False
+        if p.user_agent:
+            pd["user_agent"] = p.user_agent
+        if p.allow:
+            pd["allow"] = list(p.allow)
+        if not p.block_trackers:
+            pd["block_trackers"] = False
+        if p.unblock:
+            pd["unblock"] = list(p.unblock)
         out["panels"].append(pd)
     if conf.tunnel:
         out["tunnel"] = conf.tunnel
     if conf.vpn:
         out["vpn"] = conf.vpn
+    sec = conf.security
+    # Emit the security block only when it deviates from the all-safe defaults,
+    # so existing minimal configs round-trip unchanged.
+    sd: dict = {}
+    if not sec.nav_allowlist:
+        sd["nav_allowlist"] = False
+    if not sec.block_trackers:
+        sd["block_trackers"] = False
+    if sec.allow:
+        sd["allow"] = list(sec.allow)
+    if sec.sso_allow:
+        sd["sso_allow"] = list(sec.sso_allow)
+    if sd:
+        out["security"] = sd
     pr = conf.proxy
     if pr.enabled:
         out["proxy"] = {"enabled": True, "url": pr.url}
