@@ -301,7 +301,7 @@ def openfortivpn_args(vpn: dict) -> list:
 
 
 def vpn_kind(vpn: dict) -> str:
-    """The VPN backend: 'fortinet' (default), 'openvpn', or 'wireguard'."""
+    """The VPN backend: 'fortinet' (default), 'openvpn', 'wireguard', 'inode'."""
     t = str((vpn or {}).get("type", "fortinet") or "fortinet").lower()
     return t if t in VALID_VPN_TYPES else "fortinet"
 

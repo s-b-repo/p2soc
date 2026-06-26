@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-import string
 from dataclasses import dataclass, field
 
 
@@ -128,12 +127,4 @@ _COMMON_BAD = {
     "123456", "1234567", "12345678", "123456789", "1234567890",
     "1234", "12345", "0000", "1111", "2222", "9999",
     "soc", "kiosk", "wall", "default",
-}
-
-
-_CLASS_LABELS = {  # for GUI display
-    "lower": "lowercase",
-    "upper": "uppercase",
-    "digit": "digit",
-    "symbol": "symbol",
 }

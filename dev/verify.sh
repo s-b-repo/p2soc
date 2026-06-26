@@ -6,7 +6,7 @@
 #
 # Run:  make verify    (or: bash dev/verify.sh)
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 PY="$ROOT/.venv/bin/python"
 DISP="${SOC_TEST_DISPLAY:-:7}"

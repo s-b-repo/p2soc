@@ -330,11 +330,11 @@ def build_headless(preset: str, output_dir: str, *, non_interactive: bool = True
     non-zero on unknown preset / validation failure. Never touches the master
     password / sealing (that is GUI-only). Imports NO gi."""
     setup = _load_setup()
-    config = None
     _ensure_host_on_path()
     try:
-        from host import config as _config  # type: ignore
-        config = _config
+        # Imported only to confirm host.config is importable before we proceed;
+        # the actual validation runs via setup.py's renderers below.
+        from host import config as _config  # type: ignore  # noqa: F401
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"setupgui: cannot import host.config ({e})\n")
         return 2
@@ -567,12 +567,6 @@ class SetupAssistant:
         page.pack_start(self._header(title, subtitle, overline=overline),
                         False, False, 0)
         return page
-
-    def _divider(self):
-        Gtk = self.Gtk
-        sep = Gtk.Box()
-        sep.get_style_context().add_class("soc-divider")
-        return sep
 
     def _entry(self, value, validator, on_change):
         """A Gtk.Entry that runs a setup.v_* validator on every change, toggles

@@ -104,10 +104,6 @@ def resolve_url() -> str:
     return os.environ.get("SOC_VAULT_URL") or load_config().get("base_url", "")
 
 
-def resolve_pinentry() -> str:
-    return os.environ.get("SOC_PINENTRY") or load_config().get("pinentry", "")
-
-
 # --------------------------------------------------------------------------- #
 # Master password acquisition (host-bound; never a plaintext file)
 # --------------------------------------------------------------------------- #
