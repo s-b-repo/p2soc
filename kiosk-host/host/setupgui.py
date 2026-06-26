@@ -1145,11 +1145,26 @@ class SetupAssistant:
         email = self._entry(m.vault_email, self.setup.v_email, _set_email)
         url = self._entry(m.vault_url, self.setup.v_url, _set_url)
 
-        srcs = self.mastersource.available_sources()
+        # Selectable-source availability is a CAPABILITY probe for the wizard, NOT
+        # mastersource.available_sources() (which means "usable RIGHT NOW" and only
+        # lists 'sealed' once a seal already exists — wrong for a fresh box). Here
+        # 'sealed' is offered whenever cryptography can seal, independent of an
+        # existing seal; 'secret-service' needs a real Secret Service backend; 'env'
+        # is dev-only. A genuinely-unavailable source shows a one-line reason.
+        try:
+            _sealed_ok = self.secretstore.available()
+        except Exception:  # noqa: BLE001 — never block the wizard on a probe
+            _sealed_ok = False
+        _ss_ok = "secret-service" in self.mastersource.available_sources()
+        src_reason = {
+            "auto": "",
+            "sealed": "" if _sealed_ok else "  (install 'cryptography')",
+            "secret-service": "" if _ss_ok else "  (no secret-tool/libsecret)",
+            "env": "  (dev only)",
+        }
         source = Gtk.ComboBoxText()
         for s in ("auto", "sealed", "secret-service", "env"):
-            mark = "" if s in srcs or s == "auto" else "  (unavailable)"
-            source.append_text(s + mark)
+            source.append_text(s + src_reason.get(s, ""))
         source.set_active(0)
 
         pw = Gtk.Entry()
@@ -1220,14 +1235,15 @@ class SetupAssistant:
             # without mutating, so on ANY login failure we reveal "Create account"
             # — it authoritatively distinguishes (registers -> created, or detects
             # the account already exists with a different master and says so).
-            if create_btn is not None:
-                if offer_create and self.vaultsetup is not None \
-                        and self.vaultsetup.available():
-                    create_btn.show()
-                    seed_chk.show()
-                else:
-                    create_btn.hide()
-                    seed_chk.hide()
+            # Create stays reachable on ANY failure for a real backend (litebw/rbw)
+            # — never hidden by a transport blip or a successful test, so the
+            # operator always has a way forward. It is only hidden for the dev
+            # backend (no account to create). The companion seed checkbox rides
+            # with it. When cryptography is genuinely missing, on_create surfaces a
+            # clear "create it in the web vault" message rather than silently no-op.
+            if create_btn is not None and m.vault_backend != "dev":
+                create_btn.show()
+                seed_chk.show()
             self._recheck_vault(page)
             return False
 
@@ -1288,6 +1304,13 @@ class SetupAssistant:
                 self._vault_tested_ok = False
                 col = self.branding.color("bad")
                 _set_test(f'<span foreground="{col}">✗ {_esc(payload)}</span>')
+                # Reset rejection used to be a dead-end: no Create button. A
+                # rejected master can mean the account was never created OR the
+                # wrong master for an existing one — reveal Create (litebw/rbw) so
+                # the operator can register it / it reports the account exists.
+                if create_btn is not None and not dev:
+                    create_btn.show()
+                    seed_chk.show()
             self._recheck_vault(page)
             return False
 
@@ -1321,6 +1344,10 @@ class SetupAssistant:
                     litebw.ReadSession(url_, email_, master_).list_ciphers()
                 except Exception as e:  # noqa: BLE001 — surface the vault's reason
                     msg = str(e) or e.__class__.__name__
+                    if not self._vault_unreachable(msg):
+                        msg += ("  — use “Create account” if this account was "
+                                "never created, or enter the correct master if "
+                                "it already exists.")
                     self.GLib.idle_add(_reset_done, False,
                                        f"vault rejected the master: {msg}")
                     return
@@ -1453,9 +1480,16 @@ class SetupAssistant:
             for w in (email, url, pw, pin, source, test_btn, reset_btn,
                       create_btn):
                 w.set_sensitive(not dev)
+            # Create is ALWAYS present for a real backend (litebw/rbw) — so the
+            # fresh-box "account never registered" path is reachable without first
+            # having to click Test and get a rejection. Hidden only for dev (no
+            # account to create). seed_chk rides with it.
             if dev:
                 create_btn.hide()
                 seed_chk.hide()
+            else:
+                create_btn.show()
+                seed_chk.show()
             # A backend change invalidates any prior green test.
             self._vault_tested_ok = False
             self._vault_tested_key = None
