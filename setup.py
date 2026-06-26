@@ -43,6 +43,34 @@ import time
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
+# The SHARED PROVISIONING CORE. Re-exported so the GUI (which loads setup.py as a
+# module) reaches the same step functions via `self.setup.provision_*` /
+# `self.setup.step_*` — the single place CLI + GUI call, no parallel logic. Pure
+# stdlib, so importing it here (before the venv) is safe. Best-effort: if the
+# file is ever missing, the CLI subcommands degrade rather than crash setup.py.
+try:
+    sys.path.insert(0, REPO)
+    import provision  # noqa: E402  — same dir as setup.py
+    # Flat re-export so the GUI (which loads setup.py as a module) can reach the
+    # core either as `self.setup.provision.step_users` OR `self.setup.step_users`
+    # / `self.setup.Opts` — both resolve to the SAME object, no drift.
+    Opts = provision.Opts
+    ProvResult = provision.ProvResult
+    Plan = provision.Plan
+    step_packages = provision.step_packages
+    step_users = provision.step_users
+    step_deploy = provision.step_deploy
+    step_units = provision.step_units
+    step_vault_running = provision.step_vault_running
+    step_vault_account = provision.step_vault_account
+    step_vault_seed = provision.step_vault_seed
+    step_seal = provision.step_seal
+    step_write_config = provision.step_write_config
+    provision_all = provision.provision_all
+    provision_plan = provision.plan
+except Exception:  # noqa: BLE001
+    provision = None  # type: ignore
+
 
 def _configpaths():
     """The shared read/write-location resolver (host.configpaths). Imported lazily
@@ -1982,6 +2010,7 @@ def cmd_deploy(args) -> int:
     # 3) bring Vaultwarden up (real-vault backends: litebw / rbw)
     if is_vault:
         url = soc_env.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
+        email = soc_env.get("SOC_VAULT_EMAIL", "")
         if _have("systemctl") and os.path.isdir("/run/systemd/system"):
             if ask_bool("Step 3/6 — start Vaultwarden (systemctl start vaultwarden)?",
                         target == "pi"):
@@ -1996,7 +2025,17 @@ def cmd_deploy(args) -> int:
                     warn(f"{url} not answering /alive yet — check it before continuing")
         else:
             note("Step 3/6 — no systemd; start Vaultwarden via your init manager.")
-        note("Create the kiosk account in the web vault (signups on) if not done yet.")
+        # Ensure the account EXISTS (create if missing) via the shared core — the
+        # same path the GUI's "Create account" button uses. No more "create it in
+        # the web vault by hand" dead-end.
+        if provision is not None and email and ask_bool(
+                f"  ensure the Vaultwarden account {email} exists (create if missing)?", True):
+            pw = _resolve_master(soc_env) or _unseal_master(
+                soc_env.get("SOC_SECRET_DIR"), "vault master (to create/verify the account)")
+            popts = provision.Opts(email=email, url=url, dry_run=args.dry_run)
+            res = provision.step_vault_account(popts, pw)
+            pw = ""  # scrub
+            (ok if res.ok else warn)(res.detail)
     else:
         note("Step 3/6 — dev vault backend; no Vaultwarden server needed.")
 
@@ -2193,12 +2232,17 @@ def main():
         description="Setup, diagnose, repair + install the SOC video wall.")
     ap.add_argument("command", nargs="?", default=None,
                     choices=["menu", "deploy", "first-run", "wizard", "wizard-gui",
-                             "doctor", "repair", "install", "creds"],
+                             "doctor", "repair", "install", "creds",
+                             "provision", "create-users", "vault-register",
+                             "vault-seed", "seal", "write-config", "uninstall"],
                     help="menu (default on a TTY) | deploy (full automated "
                          "deploy) | first-run (seal the one-time PIN) | wizard "
                          "(config) | wizard-gui (graphical config) | doctor "
                          "(diagnose) | repair (fix/install missing) | install "
-                         "(OS install + wizard) | creds (logins)")
+                         "(OS install + wizard) | creds (logins) || PROVISIONING "
+                         "(headless parity with the GUI): provision (whole "
+                         "fresh-box flow) | create-users | vault-register | "
+                         "vault-seed | seal | write-config | uninstall")
     ap.add_argument("--clean", action="store_true",
                     help="deploy: wipe generated config/state first (fresh deploy)")
     ap.add_argument("--fresh", action="store_true",
@@ -2208,6 +2252,21 @@ def main():
     ap.add_argument("--target", choices=["pi", "dev"], help="where to write (default: pi if root, else dev)")
     ap.add_argument("--section", choices=["all", "display", "panels", "tunnel", "vpn", "proxy", "vault", "server"],
                     default="all", help="run just one section (wizard)")
+    # --- provisioning-core flags (parity with the GUI Setup) ------------------
+    ap.add_argument("--mode", choices=["kiosk", "desktop"], default="kiosk",
+                    help="provision: which mode's session/units to wire (default: kiosk)")
+    ap.add_argument("--email", default="", help="provision/vault-*: the Vaultwarden account email")
+    ap.add_argument("--url", default="http://127.0.0.1:8222",
+                    help="provision/vault-*: the Vaultwarden base URL")
+    ap.add_argument("--pin", default="", help="seal: PIN for the host-bound seal (auto-generated if omitted)")
+    ap.add_argument("--master-fd", type=int, default=None,
+                    help="seal/vault-*: read the master password from this FD (NEVER an argv flag)")
+    ap.add_argument("--seed", dest="seed", action="store_true", default=True,
+                    help="provision: seed the configured panels' vault-login items (default)")
+    ap.add_argument("--no-seed", dest="seed", action="store_false",
+                    help="provision: do NOT seed panel-login items")
+    ap.add_argument("--purge", action="store_true", help="uninstall: also remove users + Vaultwarden data")
+    ap.add_argument("--yes", action="store_true", help="non-interactive: accept every prompt")
     args = ap.parse_args()
     ASSUME_DEFAULTS = args.defaults
 
@@ -2225,8 +2284,209 @@ def main():
         "menu": cmd_menu, "deploy": cmd_deploy, "first-run": cmd_firstrun,
         "doctor": cmd_doctor, "repair": cmd_repair, "install": cmd_install,
         "creds": cmd_creds, "wizard": cmd_wizard, "wizard-gui": cmd_wizard_gui,
+        "provision": cmd_provision, "create-users": cmd_create_users,
+        "vault-register": cmd_vault_register, "vault-seed": cmd_vault_seed,
+        "seal": cmd_seal, "write-config": cmd_write_config,
+        "uninstall": cmd_uninstall,
     }
     return dispatch[cmd](args)
+
+
+# --------------------------------------------------------------------------- #
+# Provisioning-core CLI wrappers — every GUI Setup action reachable headlessly.
+# Each is a THIN wrapper over a provision.* function (the GUI calls the identical
+# function — parity by construction; no duplicated logic).
+# --------------------------------------------------------------------------- #
+def _opts_from_args(args) -> "provision.Opts":
+    """Build the provisioning Opts from argparse (the GUI builds the same)."""
+    return provision.Opts(
+        mode=getattr(args, "mode", "kiosk"),
+        email=getattr(args, "email", "") or "",
+        url=getattr(args, "url", "http://127.0.0.1:8222"),
+        pin=getattr(args, "pin", "") or "",
+        seed=getattr(args, "seed", True),
+        target=getattr(args, "target", None) or "pi",
+        fresh=getattr(args, "fresh", False),
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+
+def _read_master_fd(args) -> str:
+    """Read the master from --master-fd (NEVER argv). Returns '' if none given —
+    the seal/vault steps then fall back to the sealed source / stdin prompt."""
+    fd = getattr(args, "master_fd", None)
+    if fd is None:
+        return ""
+    try:
+        with os.fdopen(os.dup(fd), "r") as fh:
+            return fh.readline().rstrip("\n")
+    except Exception as e:  # noqa: BLE001
+        err(f"could not read the master from fd {fd}: {e}")
+        return ""
+
+
+def _require_provision() -> bool:
+    if provision is None:
+        err("the provisioning core (provision.py) is not available")
+        return False
+    return True
+
+
+def cmd_provision(args) -> int:
+    """The whole fresh-box flow — the CLI analogue of the GUI's Apply. Calls the
+    SAME provision.provision_all the GUI drives. Honours --dry-run / SOC_PROVISION_DRY_RUN."""
+    if not _require_provision():
+        return 1
+    env = Env()
+    opts = _opts_from_args(args)
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    paths = resolve_paths(opts.target)
+    if opts.dry:
+        banner("SOC video-wall · provision (DRY RUN — nothing will change)")
+        provision.print_plan(opts)
+        # Drive the full flow in dry-run so the printed plan is exercised end to end.
+        cfg = load_yaml(paths["panels_installed"]) or {}
+        soc_env = load_env_file(paths["soc_env"])
+        provision.provision_all(opts, cfg=cfg, soc_env=soc_env, paths=paths,
+                                master="", report=_prov_report)
+        banner("Dry run complete — no host state changed")
+        return 0
+    if not env.is_root:
+        warn("provision needs root for packages/users/deploy — re-run with sudo")
+        return 1
+    cfg = load_yaml(paths["panels_installed"]) or {}
+    soc_env = load_env_file(paths["soc_env"])
+    master = _read_master_fd(args)
+    backend = (soc_env or {}).get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
+    banner("SOC video-wall · provision (end to end)")
+    res = provision.provision_all(opts, cfg=cfg, soc_env=soc_env, paths=paths,
+                                  master=master, backend=backend, report=_prov_report)
+    master = ""  # scrub
+    if res.ok:
+        ok(res.detail)
+        return 0
+    err(res.detail)
+    return 1
+
+
+def _prov_report(step: str, status: str, detail: str = "") -> None:
+    tail = f" — {detail}" if detail else ""
+    if status == "FAILED":
+        err(f"{step}: {status}{tail}")
+    elif status == "running":
+        note(f"{step} …")
+    else:
+        ok(f"{step}: {status}{tail}")
+
+
+def cmd_create_users(args) -> int:
+    """Create the kiosk + desktop (+ service) users (provision.step_users)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    if not opts.dry and os.geteuid() != 0:
+        err("create-users needs root (or --dry-run)")
+        return 1
+    res = provision.step_users(opts)
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_vault_register(args) -> int:
+    """Register / ensure the Vaultwarden account (provision.step_vault_account,
+    which calls host.vaultsetup.ensure_account — the SAME path the GUI's Create
+    account button uses)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    if not opts.email:
+        err("vault-register needs --email")
+        return 1
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    master = _read_master_fd(args)
+    if not master and not opts.dry:
+        master = ask_secret("vault master password (for the account)")
+    res = provision.step_vault_account(opts, master)
+    master = ""  # scrub
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_vault_seed(args) -> int:
+    """Seed the configured panels' vault-login items (provision.step_vault_seed)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    paths = resolve_paths(opts.target)
+    cfg = load_yaml(paths["panels_installed"]) or {}
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    master = _read_master_fd(args)
+    if not master and not opts.dry:
+        master = ask_secret("vault master password (to seed logins)")
+    res = provision.step_vault_seed(opts, master, cfg)
+    master = ""  # scrub
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_seal(args) -> int:
+    """Seal the master host-bound (provision.step_seal -> setup.seal_master).
+    Master via --master-fd / stdin — NEVER argv."""
+    if not _require_provision():
+        return 1
+    env = Env()
+    opts = _opts_from_args(args)
+    paths = resolve_paths(opts.target)
+    soc_env = load_env_file(paths["soc_env"])
+    backend = (soc_env or {}).get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    master = _read_master_fd(args)
+    if not master and not opts.dry:
+        if not sys.stdin.isatty():
+            master = sys.stdin.readline().rstrip("\n")
+        else:
+            master = ask_secret("vault master password (to seal)")
+    res = provision.step_seal(opts, master, paths, soc_env, backend)
+    master = ""  # scrub
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_write_config(args) -> int:
+    """Render + write panels.yaml / soc.env / wall-unit (provision.step_write_config)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    paths = resolve_paths(opts.target)
+    cfg = load_yaml(paths["panels_installed"]) or {}
+    soc_env = load_env_file(paths["soc_env"])
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    if not cfg.get("panels"):
+        warn("no panels configured yet — run the wizard first (python3 setup.py wizard)")
+    res = provision.step_write_config(opts, cfg, soc_env, paths)
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_uninstall(args) -> int:
+    """Headless uninstall — shells uninstall.sh so removal == the GUI Uninstall.
+    --purge passes through (also removes users + Vaultwarden data)."""
+    env = Env()
+    script = os.path.join(REPO, "uninstall.sh")
+    if not os.path.exists(script):
+        err(f"uninstall.sh not found at {script}")
+        return 1
+    cmd = [script] + (["--purge"] if getattr(args, "purge", False) else [])
+    if getattr(args, "yes", False):
+        cmd.append("--yes")
+    return _run(cmd if env.is_root else ["sudo"] + cmd)
 
 
 def cmd_wizard(args) -> int:

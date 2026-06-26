@@ -37,7 +37,8 @@
 #   VW_MODE=docker|native     how to run Vaultwarden           (default: docker)
 #   SSH_ADMIN_CIDR=<cidr>      admin subnet baked into nftables (HARDEN=1; fail-closed)
 #   HARDEN=1                  apply nftables + sshd hardening  (default: off)
-#   KIOSK_USER=soc            kiosk login user                 (default: soc)
+#   KIOSK_USER=soc            kiosk login user (tty1 autologin) (default: soc)
+#   DESKTOP_USER=socwall      desktop-mode wall user (DE session)(default: socwall)
 #   SVC_USER=socsvc           service user (autossh)           (default: socsvc)
 #   COMPOSITOR=labwc          Wayland compositor to install    (default: labwc)
 #                             (e.g. sway/cage — runtime override is SOC_COMPOSITOR)
@@ -55,6 +56,7 @@ VW_MODE="${VW_MODE:-docker}"
 HARDEN="${HARDEN:-0}"
 SSH_ADMIN_CIDR="${SSH_ADMIN_CIDR:-}"
 KIOSK_USER="${KIOSK_USER:-soc}"
+DESKTOP_USER="${DESKTOP_USER:-socwall}"
 SVC_USER="${SVC_USER:-socsvc}"
 COMPOSITOR="${COMPOSITOR:-labwc}"
 # desktop (default): deploy everything but DON'T hijack the boot — the existing
@@ -365,13 +367,24 @@ if [ "$DEPS_ONLY" = "1" ]; then
 fi
 
 # --------------------------------------------------------------------------- #
-log "Creating users ($KIOSK_USER kiosk, $SVC_USER service)"
+log "Creating users ($KIOSK_USER kiosk, $DESKTOP_USER desktop, $SVC_USER service)"
+# Both the kiosk + desktop users are created REGARDLESS of INSTALL_MODE so a box
+# can switch modes later without re-provisioning; only the mode's user gets the
+# tty1-autologin/session wiring (below). All three are unprivileged.
 if ! id "$KIOSK_USER" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$KIOSK_USER"
 fi
-# kiosk user needs access to video/render/input/tty for the display + GPU
+# kiosk user needs video/render/input/tty/seat — it OWNS tty1 (its own session).
 for grp in video render input tty audio seat; do
   getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" "$KIOSK_USER" || true
+done
+if ! id "$DESKTOP_USER" >/dev/null 2>&1; then
+  useradd -m -s /bin/bash "$DESKTOP_USER"
+fi
+# desktop user runs the wall windowed INSIDE the operator's already-running DE
+# session, so it needs GPU/input access but NOT tty/seat takeover.
+for grp in video render input audio; do
+  getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" "$DESKTOP_USER" || true
 done
 if ! id "$SVC_USER" >/dev/null 2>&1; then
   useradd -r -m -s "$(command -v nologin || echo /usr/sbin/nologin)" "$SVC_USER"
@@ -735,6 +748,14 @@ fi
 EOF
 chown -R "$KIOSK_USER:$KIOSK_USER" "$HOME_DIR/.config" "$HOME_DIR/.xinitrc" "$HOME_DIR/.bash_profile"
 
+# Desktop-mode user: seed a per-user .config dir (so appearance/branding persist
+# per-user when the wall runs windowed) but DON'T touch tty1/the boot — it starts
+# on demand inside the operator's DE session. Recorded as a SYSCHANGE below.
+DESKTOP_HOME="$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6)"
+if [ -n "$DESKTOP_HOME" ]; then
+  install -d -o "$DESKTOP_USER" -g "$DESKTOP_USER" "$DESKTOP_HOME/.config/soc-display"
+fi
+
 # Capture the original default target BEFORE we touch it, so uninstall.sh can
 # restore it (only meaningful with systemd). Recorded into the manifest below.
 ORIG_DEFAULT_TARGET=""
@@ -913,13 +934,19 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
   printf 'META|vw_mode|%s\n' "$VW_MODE"
   printf 'META|harden|%s\n' "$HARDEN"
   printf 'META|kiosk_user|%s\n' "$KIOSK_USER"
+  printf 'META|desktop_user|%s\n' "$DESKTOP_USER"
   printf 'META|svc_user|%s\n' "$SVC_USER"
   printf 'META|has_systemd|%s\n' "$HAS_SYSTEMD"
 
-  # users (PRESERVE on plain uninstall; --purge removes)
+  # users (PRESERVE on plain uninstall; --purge removes). Every created user MUST
+  # be recorded so uninstall removes it (+ its home) — no orphans.
   printf 'USER|%s|kiosk user (preserve unless --purge)\n' "$KIOSK_USER"
+  printf 'USER|%s|desktop-mode user (preserve unless --purge)\n' "$DESKTOP_USER"
   printf 'USER|%s|service user (preserve unless --purge)\n' "$SVC_USER"
   [ "$VW_MODE" = "native" ] && printf 'USER|%s|vaultwarden user (preserve unless --purge)\n' vaultwarden
+  # NOTE: the desktop user's home is removed by `userdel -r` when the USER row is
+  # purged — we deliberately DON'T emit a DIR row for it (uninstall.sh's DIR
+  # handler treats an unknown DIR as the project root and would mis-target it).
 
   # deployed trees + config (config dir holds secrets -> preserve unless --purge)
   printf 'DIR|%s|project root (remove on uninstall)\n' "$SOC_ROOT"
@@ -972,6 +999,7 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
   printf 'REVERT|did_consoleblank|%s\n' "$DID_CONSOLEBLANK"
   printf 'REVERT|cmdline_path|%s\n' "/boot/firmware/cmdline.txt"
   [ -n "$HOME_DIR_M" ] && printf 'SYSCHANGE|%s|kiosk session dotfiles (.bash_profile/.xinitrc/.config/openbox)\n' "$HOME_DIR_M"
+  [ -n "$DESKTOP_HOME" ] && printf 'SYSCHANGE|%s|desktop-user .config/soc-display (per-user appearance/branding)\n' "$DESKTOP_HOME"
 } > "$ETC/.install-manifest" 2>/dev/null || warn "could not write $ETC/.install-manifest"
 chmod 0644 "$ETC/.install-manifest" 2>/dev/null || true
 
