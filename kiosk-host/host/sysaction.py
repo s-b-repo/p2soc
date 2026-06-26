@@ -111,8 +111,14 @@ def build_argv(action: str, *, mode: "str | None" = None,
         argv = [term, "-e", "sudo", "env"] + envparts + [script] + extra_args
         return argv, "terminal"
 
-    # NEITHER — the caller must tell the operator the exact line, never fail silently.
-    return ([script] + extra_args), "manual"
+    # NEITHER — the caller shows the exact shell line (manual_hint) instead of
+    # executing this argv; still thread the env knob so the shape matches the
+    # pkexec/terminal/fake branches (and --check passes where neither pkexec nor a
+    # terminal exists, e.g. the CI runner).
+    argv = [script] + extra_args
+    if envparts:
+        argv = ["env"] + envparts + argv
+    return argv, "manual"
 
 
 def manual_hint(action: str, *, mode: "str | None" = None,

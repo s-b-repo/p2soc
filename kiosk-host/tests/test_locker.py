@@ -12,6 +12,9 @@ runs under `make test` headlessly.
 """
 import os
 
+import pytest
+
+pytest.importorskip("gi")  # host.locker imports gi at module scope — skip where PyGObject is absent (CI)
 from host import locker, totp
 
 

@@ -17,6 +17,7 @@ import sys
 
 import pytest
 
+pytest.importorskip("gi")  # host.main imports gi at module scope — skip where PyGObject is absent (CI)
 from host import main as hostmain
 from host.litebw import VaultLockedError
 from host.vault import VaultError
