@@ -68,6 +68,14 @@ MemoryMax=92%
 # multi-hundred-MB cores onto the 40 GB SD card (also enforced distro-wide by
 # security/coredump-soc.conf). You don't debug cores in-place on a kiosk.
 LimitCORE=0
+# Bound process/fd/task growth so a fork-bomb or fd-leak in a dashboard or
+# renderer throttles (and, worst case, restarts the session) instead of
+# exhausting the 1 GB Pi. Conservative ceilings well above normal compositor +
+# 4-panel + Chromium-CDP usage. (No SystemCallFilter/PrivateDevices: those can
+# silently break WebKitGTK/Chromium and need real-hardware validation.)
+LimitNPROC=256
+LimitNOFILE=8192
+TasksMax=512
 # SEC-11: defense-in-depth (safe for the browser sandbox — does not restrict the
 # SUID/devices the compositor + Chromium need).
 ProtectClock=yes
