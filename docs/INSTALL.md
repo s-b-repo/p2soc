@@ -82,25 +82,52 @@ The installer records every file it lays down and every system change it makes
 in a manifest at `/etc/soc-display/install-manifest` — that is what
 [`uninstall.sh`](#uninstall) replays to revert cleanly.
 
+### The control center (one entry for everything)
+
+The install advertises a **single** desktop entry — **SOC Video Wall** (category:
+System) — which opens the **control center**: one themed window that is the place
+to do everything, grouped under quiet `//` sections:
+
+| `// run` | `// configure` | `// system` |
+|----------|----------------|-------------|
+| Desktop mode, Kiosk mode | Setup / Configure, Appearance | Install / Update, Uninstall |
+
+It is **adaptive** to the install state: on a box that isn't installed yet,
+**Install** is the highlighted action and the Run tiles are dimmed with an
+"install first" hint; once installed, Run takes over, Install reads
+**Reinstall / Update**, and **Uninstall** appears (in red) in the quiet `// system`
+group. A health dot + active-config line show what will launch, and **Validate**
+runs the doctor checks in place. The privileged **Install / Update** and
+**Uninstall** actions never silently `sudo`: they prompt via graphical polkit
+(`pkexec`), fall back to a terminal, or — if neither is available — show the exact
+shell line. Either way the script's output streams **live** into a themed progress
+window, and you land back on a refreshed control center when it finishes.
+
+The **Setup** and **Appearance** entries are still installed but ship hidden
+(`NoDisplay=true`) — the control center is the way in (it launches the wizard and
+opens Appearance in-process), so only **SOC Video Wall** shows in your menu.
+
 ### Launching the wall (desktop mode)
 
-After a desktop-mode install, open your applications menu and click **SOC Wall**
-(category: System / Network). The launcher sources `/etc/soc-display/soc.env` and
-runs the kiosk host against your **current** display (`$DISPLAY` /
-`$WAYLAND_DISPLAY`) — no tty1, no separate login. Run it from a terminal the same
-way with `/opt/soc-display/scripts/soc-wall-desktop.sh`. Close the windows to
-stop the wall; it leaves your desktop session as it was.
+From the control center, click **Desktop mode** (windowed) or **Kiosk mode**
+(fullscreen). The launcher sources `/etc/soc-display/soc.env` and runs the kiosk
+host against your **current** display (`$DISPLAY` / `$WAYLAND_DISPLAY`) — no tty1,
+no separate login. Run it from a terminal the same way with
+`/opt/soc-display/scripts/soc-wall-desktop.sh`. Close the windows to stop the
+wall; it leaves your desktop session as it was.
 
 > Easiest path: after the installer, run the guided wizard
 > `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
 > the config interactively (Vaultwarden's own config is in its systemd unit).
 
-The installer also adds a **SOC Wall Setup** desktop entry (next to **SOC Wall**)
-that opens the **graphical** configuration wizard — the same flow in a desktop
-window, with **presets** and live-validated fields. It writes the *identical*
-artifacts as the text wizard (it reuses `setup.py`'s renderers/validators and the
-host secret store, so the two can't drift). The launcher's **Setup** card opens
-the same window. Launch it any of these ways:
+The control center's **Setup / Configure** card opens the **graphical**
+configuration wizard — the same flow in a desktop window, with **presets** and
+live-validated fields. It writes the *identical* artifacts as the text wizard (it
+reuses `setup.py`'s renderers/validators and the host secret store, so the two
+can't drift), and on finishing it returns you to the control center so you can
+launch the wall with the fresh config. The matching **SOC Wall Setup** desktop
+entry is installed but hidden (`NoDisplay=true`) — reach it through the control
+center. Launch it any of these ways:
 
 ```bash
 make wizard-gui                      # from the repo (dev)
@@ -110,8 +137,10 @@ python3 setup.py wizard-gui          # degrades to the text wizard with no displ
 
 ### Appearance (theme colours & presets)
 
-A third desktop entry, **SOC Wall Appearance**, opens the **graphical theme
-editor** — and the launcher menu carries a matching **Appearance** card. Pick a
+The control center's **Appearance** card opens the **graphical theme editor**
+in-process (a live colour change recolours the open control center). The matching
+**SOC Wall Appearance** desktop entry is installed but hidden (`NoDisplay=true`) —
+reach it through the control center. Pick a
 built-in **theme preset** (`SOC Green/White` [default], `Midnight` [dark],
 `High Contrast`, `Amber Ops`) or fine-tune any of the 14 palette colours with the
 per-colour pickers. Changes preview **live** on a sample card, and **Save**

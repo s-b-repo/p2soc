@@ -12,21 +12,34 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _KIOSK = os.path.join(_REPO, "kiosk-host")
 
 
-def test_four_entries_with_appearance():
+def test_six_grouped_entries_with_system_actions():
     e = launchermenu._ENTRIES
-    assert len(e) == 4
-    assert all(len(row) == 7 and callable(row[-1]) for row in e)
-    # the 4th tile is Appearance, wired to launch_appearance
-    by_class = {row[4]: row for row in e}
-    assert "soc-appearance" in by_class
+    assert len(e) == 6
+    # each row is now an 8-tuple: (section, glyph, title, sub, tag, class, ckey, action)
+    assert all(len(row) == 8 for row in e)
+    # action is a plain callable OR a known in-process sentinel (install/uninstall).
+    for row in e:
+        act = row[-1]
+        assert callable(act) or act in (launchermenu._ACT_INSTALL,
+                                        launchermenu._ACT_UNINSTALL)
+    by_class = {row[5]: row for row in e}
+    # configure group: Appearance still wired to launch_appearance.
     assert by_class["soc-appearance"][-1] is launchermenu.launch_appearance
-    assert by_class["soc-appearance"][1] == "Appearance"
+    assert by_class["soc-appearance"][2] == "Appearance"
+    # system group: Install/Uninstall sentinels (in-process, need the window).
+    assert by_class["soc-install"][-1] == launchermenu._ACT_INSTALL
+    assert by_class["soc-uninstall"][-1] == launchermenu._ACT_UNINSTALL
+    # every entry lives under a known // section, in run -> configure -> system order.
+    assert all(row[0] in launchermenu._SECTIONS for row in e)
+    seen = [row[0] for row in e]
+    # sections appear contiguously (the build loop groups by section change).
+    assert seen == sorted(seen, key=launchermenu._SECTIONS.index)
 
 
 def test_entries_use_known_mode_glyphs():
-    # index-0 is now a mode GLYPH key (gear/window/expand/swatch), not a numeral.
-    keys = [row[0] for row in launchermenu._ENTRIES]
-    assert keys == ["gear", "window", "expand", "swatch"]
+    # index-1 is the mode GLYPH key (gear/window/expand/swatch/download/trash).
+    keys = [row[1] for row in launchermenu._ENTRIES]
+    assert keys == ["window", "expand", "gear", "swatch", "download", "trash"]
     assert all(k in launchermenu._GLYPHS for k in keys)
     # each glyph template renders a non-empty accent-stroked SVG body (headless,
     # no gi) and has a unicode fallback so a box without the SVG loader still shows.
@@ -52,6 +65,21 @@ def test_launch_appearance_is_callable():
     assert callable(launchermenu.launch_appearance)
 
 
+def test_health_is_installed_force_override(monkeypatch):
+    # The adaptive // system group keys off health.is_installed(); the
+    # SOC_FORCE_INSTALLED override (verify's analogue of SOC_VAULT_BACKEND=dev) must
+    # drive both states deterministically without touching /etc or /opt.
+    from host import health
+    keys = {"installed", "etc_present", "opt_present", "units_present",
+            "kiosk_user", "reason"}
+    monkeypatch.setenv("SOC_FORCE_INSTALLED", "1")
+    on = health.is_installed()
+    assert set(on) == keys and on["installed"] is True
+    monkeypatch.setenv("SOC_FORCE_INSTALLED", "0")
+    off = health.is_installed()
+    assert off["installed"] is False
+
+
 def test_reapply_safe_without_provider():
     # _reapply must be a no-op (not crash) when no launcher window is built.
     launchermenu._Launcher.provider = None
@@ -59,7 +87,8 @@ def test_reapply_safe_without_provider():
 
 
 def test_check_smoke_no_gi():
-    """`--check` must validate the 4-tile wiring in a fresh interpreter without gi."""
+    """`--check` must validate the 6-tile control-center wiring in a fresh
+    interpreter without importing gi (sysaction._check runs headless too)."""
     code = (
         "import sys\n"
         "import host.launchermenu as m\n"

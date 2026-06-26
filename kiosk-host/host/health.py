@@ -167,6 +167,61 @@ def sync_state() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# is_installed — SYNC-class (cheap os.path.exists / pwd.getpwnam, NO sockets, NO
+# subprocess). Drives the launcher's adaptive system-group (Install hero vs
+# Reinstall + Uninstall). Probes the LITERAL /opt + /etc paths the installer writes
+# — never SOC_ROOT, so a dev checkout doesn't read as "installed". A
+# SOC_FORCE_INSTALLED=0|1 override (the analogue of SOC_VAULT_BACKEND=dev) lets
+# verify drive both states without touching /etc or /opt.
+# --------------------------------------------------------------------------- #
+def is_installed() -> dict:
+    """{installed, etc_present, opt_present, units_present, kiosk_user, reason}.
+
+    `installed = stamp or (opt_present and units_present)`. The stamp
+    (/etc/soc-display/.installed) is the most authoritative signal; opt+units is the
+    fallback for an older install with no stamp. Never raises, never blocks."""
+    force = os.environ.get("SOC_FORCE_INSTALLED")
+    stamp = os.path.exists("/etc/soc-display/.installed")
+    etc_present = os.path.isdir("/etc/soc-display")
+    opt_present = os.path.isdir("/opt/soc-display")  # LITERAL — never SOC_ROOT
+    units_present = (os.path.exists("/etc/systemd/system/soc-wall.service")
+                     or os.path.exists("/usr/lib/systemd/system/soc-wall.service"))
+    kiosk_user = False
+    try:
+        import pwd
+        pwd.getpwnam(os.environ.get("SOC_KIOSK_USER", "soc"))
+        kiosk_user = True
+    except Exception:  # noqa: BLE001 — KeyError (no user) / no pwd -> not present
+        kiosk_user = False
+
+    installed = bool(stamp or (opt_present and units_present))
+    # reason names the strongest present signal (for tooltips / debugging).
+    if stamp:
+        reason = "install stamp"
+    elif opt_present and units_present:
+        reason = "/opt tree + units"
+    elif opt_present:
+        reason = "/opt tree only"
+    elif units_present:
+        reason = "units only"
+    else:
+        reason = "no install signals"
+
+    if force in ("0", "1"):
+        installed = force == "1"
+        reason = f"forced ({force})"
+
+    return {
+        "installed": installed,
+        "etc_present": etc_present,
+        "opt_present": opt_present,
+        "units_present": units_present,
+        "kiosk_user": kiosk_user,
+        "reason": reason,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # PROBE — slow, thread-only. HARD-timeboxed sockets; UNKNOWN -> None.
 # --------------------------------------------------------------------------- #
 def _tcp_ok(hostport: str, timeout: float) -> "bool | None":
@@ -378,6 +433,34 @@ def _check() -> int:
     for need in ("red", "amber", "green", "neutral"):
         if need not in levels_seen:
             problems.append(f"dot_for never produced level {need!r}")
+
+    # is_installed must return the fixed key-set with a bool `installed`, never
+    # raise, and honour the SOC_FORCE_INSTALLED override in both directions.
+    try:
+        inst = is_installed()
+    except Exception as e:
+        problems.append(f"is_installed raised: {e}")
+        inst = {}
+    inst_keys = {"installed", "etc_present", "opt_present", "units_present",
+                 "kiosk_user", "reason"}
+    if set(inst) != inst_keys:
+        problems.append(f"is_installed key-set: {sorted(set(inst))}")
+    elif not isinstance(inst.get("installed"), bool):
+        problems.append("is_installed['installed'] not bool")
+    else:
+        _save = os.environ.get("SOC_FORCE_INSTALLED")
+        try:
+            os.environ["SOC_FORCE_INSTALLED"] = "1"
+            if is_installed().get("installed") is not True:
+                problems.append("SOC_FORCE_INSTALLED=1 did not force installed")
+            os.environ["SOC_FORCE_INSTALLED"] = "0"
+            if is_installed().get("installed") is not False:
+                problems.append("SOC_FORCE_INSTALLED=0 did not force uninstalled")
+        finally:
+            if _save is None:
+                os.environ.pop("SOC_FORCE_INSTALLED", None)
+            else:
+                os.environ["SOC_FORCE_INSTALLED"] = _save
 
     if problems:
         for p in problems:

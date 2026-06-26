@@ -777,15 +777,20 @@ if [ -f /boot/firmware/cmdline.txt ] && ! grep -q consoleblank /boot/firmware/cm
 fi
 
 # --------------------------------------------------------------------------- #
-# Clickable launcher: an XDG .desktop app + icon so the wall can be started on
-# demand against the current display (no tty1 required). Installed in BOTH modes
-# — it's the primary entry point in desktop mode. Guarded so a repo that hasn't
-# shipped the asset yet (or a trimmed deploy) degrades gracefully.
+# Clickable launcher: the "SOC Video Wall" XDG .desktop app + icon — THE single
+# advertised entry, opening the control center (run / configure / install /
+# uninstall in one window). Installed in BOTH modes — the primary entry point in
+# desktop mode. Guarded so a repo that hasn't shipped the asset yet (or a trimmed
+# deploy) degrades gracefully.
 #
-# Rebrand-aware: the .desktop entry is GENERATED from branding (host.branding) so
-# an operator's name/tagline/icon flow into the launcher, and the branding source
-# is installed under $ETC for in-place editing. Falls back to the static asset
-# when branding/python isn't available (trimmed deploy / pre-venv).
+# The setup + appearance companion entries are still installed (the control center's
+# scripts exec them, and SOC_RETURN_TO_MENU re-execs setup) but they ship with
+# NoDisplay=true so only "SOC Video Wall" shows in application menus.
+#
+# Rebrand-aware: the control-center .desktop entry is GENERATED from branding
+# (host.branding) so an operator's name/tagline/icon flow into the launcher, and the
+# branding source is installed under $ETC for in-place editing. Falls back to the
+# static asset when branding/python isn't available (trimmed deploy / pre-venv).
 DESKTOP_FILE=""
 SETUP_DESKTOP_FILE=""
 APPEARANCE_DESKTOP_FILE=""
@@ -846,10 +851,11 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
     fi
   fi
 
-  # Companion entry: "SOC Wall Setup" — the graphical config wizard. It shares
-  # the soc-wall icon and execs the setup-gui launcher. Static copy (the entry's
-  # Name is intentionally the product-neutral "SOC Wall Setup", so it is NOT
-  # regenerated from branding); chmod +x the gui launcher so the entry works.
+  # Companion entry: "SOC Wall Setup" — the graphical config wizard. SECONDARY +
+  # HIDDEN (the source ships NoDisplay=true): the control center launches Setup, so
+  # this entry exists only so its .sh stays installed + reachable by path. Static
+  # copy (product-neutral name, NOT regenerated from branding); chmod +x the gui
+  # launcher so the entry works.
   SETUP_DESKTOP_DST="/usr/share/applications/soc-wall-setup.desktop"
   if [ -f "$SOC_ROOT/soc-wall-setup.desktop" ]; then
     install -Dm0644 "$SOC_ROOT/soc-wall-setup.desktop" "$SETUP_DESKTOP_DST"
@@ -861,9 +867,10 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
     warn "no $SOC_ROOT/soc-wall-setup.desktop — skipping setup launcher entry"
   fi
 
-  # Companion entry: "SOC Wall Appearance" — the graphical theme editor. Shares the
-  # soc-wall icon and execs the appearance launcher. Static copy (product-neutral
-  # name, NOT regenerated from branding); chmod +x the gui launcher so it works.
+  # Companion entry: "SOC Wall Appearance" — the graphical theme editor. SECONDARY +
+  # HIDDEN (the source ships NoDisplay=true): the control center opens Appearance
+  # in-process, so this entry exists only so its .sh stays installed. Static copy
+  # (product-neutral name, NOT regenerated from branding); chmod +x the launcher.
   APPEARANCE_DESKTOP_DST="/usr/share/applications/soc-wall-appearance.desktop"
   if [ -f "$SOC_ROOT/soc-wall-appearance.desktop" ]; then
     install -Dm0644 "$SOC_ROOT/soc-wall-appearance.desktop" "$APPEARANCE_DESKTOP_DST"
