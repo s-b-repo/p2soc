@@ -70,6 +70,17 @@ while true; do
   code=$?
   ran=$(( $(date +%s) - started ))
 
+  # Exit 2 = a fail-safe screen the operator already saw + dismissed (bad config,
+  # vault locked, or the Unlock-Vaultwarden prompt cancelled). Relaunching would
+  # just re-pop it forever ("won't close"), so STOP supervising and hand back to
+  # the launcher menu ("start") instead of restarting the wall.
+  if [ "$code" -eq 2 ]; then
+    echo "[launcher] host exited with the operator-action code (2); returning to the menu" >&2
+    menu="$ROOT/scripts/soc-wall-menu"
+    [ -x "$menu" ] && exec "$menu"
+    exit 0
+  fi
+
   # native Wayland that fails fast twice -> switch to XWayland (auto only)
   if [ "$wl" = auto ] && [ "${GDK_BACKEND:-}" = wayland ] && [ "$ran" -lt 8 ]; then
     native_fails=$(( native_fails + 1 ))
