@@ -296,9 +296,16 @@ class ChromiumPanel:
             base = configpaths.resolve_webdata_dir()
             # base + chromium/ created 0700 (private); install.sh chowns the
             # /etc tier to the kiosk user. exist_ok keeps re-spawns cheap.
+            # Re-chmod both: makedirs honours umask and won't tighten a dir that
+            # pre-existed 0755 — match webkit_panel so session tokens never leak.
             os.makedirs(base, mode=0o700, exist_ok=True)
             chromium_base = os.path.join(base, "chromium")
             os.makedirs(chromium_base, mode=0o700, exist_ok=True)
+            for d in (base, chromium_base):
+                try:
+                    os.chmod(d, 0o700)
+                except OSError:
+                    pass
             return os.path.join(chromium_base, p.id)
         return os.path.join(
             os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "soc-profiles", p.id)

@@ -200,7 +200,7 @@ pm_try(){           # optional packages: best effort, one by one, warn only
 #   PK_XSRV_ALT   XLibre server package name(s) to try if PK_XSRV is unavailable
 #   PK_X11        the rest of the X session (xinit + openbox), server excluded
 #   PK_WAYLAND    Wayland compositor(s); $COMPOSITOR is appended below
-#   PK_TOOLS      optional niceties (cursor hider, fonts, pinentry, jq)
+#   PK_TOOLS      optional niceties (cursor hider, fonts, pinentry)
 #   PK_ZRAM       zram swap generator (optional)
 #   PK_SECRETTOOL libsecret `secret-tool` (optional; only the secret-service
 #                 master source needs it — KWallet / GNOME-keyring / KeePassXC)
@@ -212,7 +212,7 @@ case "$FAMILY" in
     PK_XSRV=(xserver-xorg xserver-xorg-legacy)
     PK_X11=(xinit x11-xserver-utils openbox)
     PK_WAYLAND=(cage)
-    PK_TOOLS=(wmctrl xdotool unclutter fonts-dejavu-core pinentry-tty jq)
+    PK_TOOLS=(unclutter fonts-dejavu-core pinentry-tty)
     PK_ZRAM=(systemd-zram-generator)
     PK_SECRETTOOL=(libsecret-tools)
     # WebKit2 typelib: prefer 4.1 (Bookworm+), fall back to 4.0
@@ -228,8 +228,8 @@ case "$FAMILY" in
     PK_XSRV=(xorg-x11-server-Xorg)
     PK_X11=(xorg-x11-xinit openbox)
     PK_WAYLAND=(cage)
-    PK_TOOLS=(xorg-x11-server-utils xsetroot wmctrl xdotool unclutter
-              dejavu-sans-fonts pinentry jq)
+    PK_TOOLS=(xorg-x11-server-utils xsetroot unclutter
+              dejavu-sans-fonts pinentry)
     PK_ZRAM=(zram-generator zram-generator-defaults)
     PK_SECRETTOOL=(libsecret)
     ;;
@@ -240,8 +240,8 @@ case "$FAMILY" in
     PK_XSRV_ALT=(xlibre-xserver)   # AUR / Artix; honoured if already installed
     PK_X11=(xorg-xinit openbox)
     PK_WAYLAND=(cage)
-    PK_TOOLS=(xorg-xset xorg-xsetroot xorg-xrandr wmctrl xdotool unclutter
-              ttf-dejavu pinentry jq)
+    PK_TOOLS=(xorg-xset xorg-xsetroot xorg-xrandr unclutter
+              ttf-dejavu pinentry)
     PK_ZRAM=(zram-generator)
     PK_SECRETTOOL=(libsecret)
     ;;
@@ -251,7 +251,7 @@ case "$FAMILY" in
     PK_XSRV=(xorg-x11-server)
     PK_X11=(xinit openbox)
     PK_WAYLAND=(cage)
-    PK_TOOLS=(wmctrl xdotool unclutter dejavu-fonts pinentry jq)
+    PK_TOOLS=(unclutter dejavu-fonts pinentry)
     PK_ZRAM=()
     PK_SECRETTOOL=(libsecret-tools)
     ;;
@@ -261,7 +261,7 @@ case "$FAMILY" in
     PK_XSRV=(xorg-server)
     PK_X11=(xinit openbox)
     PK_WAYLAND=(cage)
-    PK_TOOLS=(xrandr xset wmctrl xdotool font-dejavu pinentry jq)
+    PK_TOOLS=(xrandr xset font-dejavu pinentry)
     PK_ZRAM=()
     PK_SECRETTOOL=(libsecret)
     ;;
@@ -271,7 +271,7 @@ case "$FAMILY" in
     PK_XSRV=(xorg-server)
     PK_X11=(xinit openbox)
     PK_WAYLAND=(cage)
-    PK_TOOLS=(xrandr xset wmctrl xdotool dejavu-fonts-ttf pinentry jq)
+    PK_TOOLS=(xrandr xset dejavu-fonts-ttf pinentry)
     PK_ZRAM=()
     PK_SECRETTOOL=(libsecret)
     ;;

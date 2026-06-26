@@ -277,11 +277,6 @@ class AppearanceEditor:
         b = round(rgba.blue * 255)
         return f"#{r:02X}{g:02X}{b:02X}"
 
-    def _label(self, markup):
-        lbl = self.Gtk.Label(xalign=0)
-        lbl.set_markup(markup)
-        return lbl
-
     def _clabel(self, text, css_class, markup_attrs=""):
         """A label whose COLOUR comes from a CSS class (so it recolours live with
         the provider), not baked Pango foreground=. `markup_attrs` adds non-colour

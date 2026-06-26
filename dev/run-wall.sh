@@ -5,7 +5,7 @@
 #
 #   make dev            # -> bash dev/run-wall.sh
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 PY="$ROOT/.venv/bin/python"
 DISP="${SOC_DEV_DISPLAY:-:8}"

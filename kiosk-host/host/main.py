@@ -196,12 +196,6 @@ class KioskHost:
             log(f"[proxy] vault: {e}")
             return None
 
-    def open_vault(self):
-        backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND)
-        log(f"opening vault (backend={backend}) ...")
-        self.vault.open()
-        log("vault unlocked + synced")
-
     def prewarm_creds(self):
         """Fetch every panel/proxy/remembered login into the cache in the
         background, so the first login of each panel is served from cache and

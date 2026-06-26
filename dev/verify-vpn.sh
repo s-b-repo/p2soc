@@ -4,7 +4,7 @@
 # the load-line classification, the secure credential paths, and connect/reconnect.
 # Run:  make verify-vpn
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 PY="$ROOT/.venv/bin/python"
 FAKE="$ROOT/dev/run/vpnverify"; rm -rf "$FAKE"; mkdir -p "$FAKE/run"

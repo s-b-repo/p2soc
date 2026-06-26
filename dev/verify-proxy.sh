@@ -8,7 +8,7 @@
 # The tunnel panel (p2, 127.0.0.1) asserts the bypass list still works.
 # Run:  make verify-proxy
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 PY="$ROOT/.venv/bin/python"
 DISP="${SOC_TEST_DISPLAY:-:7}"

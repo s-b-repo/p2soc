@@ -1,6 +1,4 @@
 """RFC 4226 / 6238 vectors + edge cases for kiosk-host/host/totp.py."""
-import time
-
 from host import totp
 
 

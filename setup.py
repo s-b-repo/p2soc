@@ -976,7 +976,6 @@ def post_actions(env: Env, cfg: dict, target: str, dry: bool):
         note("dry-run: skipping actions")
         return
     if env.has_apt and ask_bool("Run the installer (sudo ./install.sh) now?", False):
-        installer = os.path.join(REPO, "install.sh")
         _run((["./install.sh"] if env.is_root else ["sudo", "./install.sh"]))
     if target == "dev":
         if ask_bool("Seed the dev vault (make dev-vault)?", True):
@@ -1236,7 +1235,10 @@ def cmd_doctor(args) -> int:
                 else ("FAIL", f"missing: {ident or '(unset)'}",
                       "setup.py repair  (generates a restricted ed25519 key)")))
     except Exception as e:  # noqa: BLE001
-        d.check("panels.yaml parses", lambda: ("FAIL", str(e),
+        # Bind the message now: `e` is del'd when this except block exits, so a
+        # lambda closing over `e` would NameError when d.check runs it later.
+        err = str(e)
+        d.check("panels.yaml parses", lambda: ("FAIL", err,
                 "fix the config / run the wizard: setup.py"))
 
     # vault reachability + master password sanity

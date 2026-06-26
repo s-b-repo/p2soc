@@ -141,12 +141,9 @@ def run_streamed(parent, title, argv, on_done=None):
 
     from host import branding
     c = branding.load().get("colors", {})
-    bg = c.get("background", "#FFFFFF")
-    text = c.get("text", "#0B1F14")
     dim = c.get("text_dim", "#5B7567")
     good = c.get("good", "#1FA463")
     bad = c.get("bad", "#C0341D")
-    accent = c.get("primary", "#1FA463")
 
     win = Gtk.Window(title=title)
     win.get_style_context().add_class("soc-launcher")  # reuse the launcher provider

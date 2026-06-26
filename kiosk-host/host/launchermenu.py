@@ -603,8 +603,6 @@ def _on_install(win, cols, installed, on_done):
     appliance, each with its consequence stated inline. On Install -> run_streamed."""
     Gtk = _Launcher.Gtk
     dim = cols.get("text_dim", "#5B7567")
-    text = cols.get("text", "#0B1F14")
-    accent = cols.get("primary", "#1FA463")
     warn = cols.get("warn", "#B8860B")
     w, box = _child_window(win, "Install / Update")
 

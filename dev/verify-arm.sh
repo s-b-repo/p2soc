@@ -7,7 +7,7 @@
 #
 # Run:  make verify-arm
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 fail=0
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$*"; }
