@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch the graphical SOC wall APPEARANCE editor (host.appearance).
-# Clickable path: soc-wall-appearance.desktop and the launcher's "Appearance"
-# tile (fallback spawn). Sources the (tmpfs, 0600) env if readable, sets
+# The control center (soc-wall.desktop) execs this wrapper for its "Appearance"
+# tile — there is no separate appearance .desktop entry. Sources the (tmpfs, 0600) env if readable, sets
 # PYTHONPATH to the in-tree host package, requires a graphical display, runs the
 # editor in the foreground; on a non-zero exit it pops the themed guierror so a
 # clickable launch never "does nothing". Honours SOC_RETURN_TO_MENU like setup.

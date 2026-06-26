@@ -262,6 +262,7 @@ class AppearanceEditor:
         self._status_label = None
         self._preset_combo = None
         self._suppress = False     # guard: don't fire on_change while setting RGBA
+        self.dirty = False         # user changed a colour/preset since load/save
         self.window = None
 
     # ---- small helpers --------------------------------------------------- #
@@ -292,6 +293,7 @@ class AppearanceEditor:
     # ---- live apply ------------------------------------------------------ #
     def _on_change(self):
         """A picker or preset changed -> repaint the sample, then the host surface."""
+        self.dirty = True          # mark so an embedding wizard can auto-persist on Finish
         if self._sample_provider is not None:
             self._sample_provider.load_from_data(build_css(self._colors))
         if callable(self.on_apply):
@@ -356,6 +358,7 @@ class AppearanceEditor:
                 pass
             return
         branding.load(refresh=True)
+        self.dirty = False
         self._set_status(f"saved theme -> {path}")
         if callable(self.on_saved):
             try:

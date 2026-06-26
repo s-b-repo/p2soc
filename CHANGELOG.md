@@ -3,6 +3,78 @@
 All notable changes to **p2soc** (the SOC video-wall kiosk). Format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.0] - 2026-06-26
+
+A GUI + renderer overhaul: one unified control center, an honest launcher, a
+theme editor, browser security hardening, and a quieter, faster runtime.
+
+### Added
+
+- **Unified control center** — a single `.desktop` opens one themed launcher with
+  grouped *run / configure / system* sections: Setup, Appearance, Desktop/Kiosk
+  mode, **Install** and **Uninstall**. It adapts to install state (Install is the
+  hero on a fresh box, Run once installed). Privileged Install/Uninstall run via
+  `pkexec` and stream into a live themed progress window (PASS/FAIL + real exit
+  code); Uninstall double-confirms and lists exactly what it removes.
+- **Appearance editor** — theme presets + per-colour pickers with live preview,
+  persisted to `branding.yaml`; reachable at startup (own entry) and in-menu
+  (launcher tile + a wizard page).
+- **Honest launcher** — meaningful mode glyphs replace the numerals, a real health
+  dot (green/amber/red from vault + VPN + config state), an active-config line
+  showing what will actually launch, a pre-launch **Validate**, and a first-run
+  empty state that steers to Setup.
+- **Interactive "Unlock Vaultwarden" prompt** — when the wall starts and the vault
+  is locked / no master is sealed, it shows a themed master-password dialog (with
+  an opt-in "seal on this host for next boot") instead of the cryptic "no vault
+  master password" error. Setup now also configures Vaultwarden with a required
+  connection **Test** before it seals.
+- **Renderer site support** — persistent cookies + web storage so dashboards stay
+  logged in across reloads/restarts, JS + the features dashboards need, and
+  optional per-panel knobs (`persist`/`user_agent`/`allow`/`block_trackers`/`insecure_tls`).
+- **Dependabot** — weekly grouped dependency-update PRs (pip + GitHub Actions),
+  gated by CI; a tracked `requirements.txt` manifest.
+
+### Changed
+
+- **Config write = read** — one shared resolver (`host.configpaths`) used by both
+  the wizard (write) and the wall (read), so the config you save is the one the
+  wall launches; a fresh user config is never shadowed by a stale `/etc` one, and
+  the wizard tells you visibly if a save can't reach the wall.
+- **Lighter, smoother runtime** (baseline-benchmarked, no latency regression) — the
+  manifest drift-hash of the whole deploy tree moved off the GTK main thread (no
+  startup stall); FortiVPN reconnect reuses one bounded-TTL vault instead of a full
+  unseal+sync per attempt; a duplicate `panels.yaml` parse per health probe removed.
+
+### Security
+
+- **WebKit hardening + safe-site allowlist + tracker blocking** — sandbox,
+  fail-closed TLS (no silent cert bypass; opt-in per panel), no file/universal
+  access, mixed content blocked; top-level navigation restricted to an allowlist
+  (panel domain + SSO/redirects + config); the top-20 analytics/trackers are
+  dropped (smaller attack surface + less RAM/CPU). All session/web data lives in a
+  private `0700` dir.
+- Dependency audit — dropped unused `jq`/`wmctrl`/`xdotool` from every distro
+  family + package format; verified every remaining package name resolves.
+
+### Fixed
+
+- **Setup's Next/Back buttons were gone** — a custom `Gtk.HeaderBar` set via
+  `set_titlebar()` replaced the `Gtk.Assistant`'s own header bar, which is where it
+  keeps the navigation buttons, leaving the wizard with no way to advance. Dropped
+  the custom titlebar; the branded title is kept by a `notify::title` clamp.
+- **Setup config didn't reach the wall when run as a desktop user** — apply now
+  writes to a per-user location (with an `active` marker) that the resolver reads,
+  so a non-root Setup takes effect without needing root.
+- The launcher is now a **single `.desktop`** entry — Setup and Appearance are
+  reached through the control center, not separate desktop icons.
+- **Setup `.desktop` did nothing** — stale `/opt` code plus `Terminal=false`
+  hiding stderr; the launch path now surfaces any failure in a visible themed
+  dialog and returns to the launcher after Setup completes.
+- **`doctor` hid the real config error** — a `NameError` from an `except … as e`
+  lambda evaluated after the block exits masked the actual `panels.yaml` parse
+  error this check exists to report; fixed.
+- Dead code + unused imports removed across the host (each adversarially verified).
+
 ## [1.1.0] - 2026-06-25
 
 The first feature release after the 1.0 baseline — and the fix for a 1.0.0

@@ -623,3 +623,51 @@ def test_sync_401_reunlock_retry_success(monkeypatch):
 
     be.sync()
     assert be.get("wazuh") == ("admin", "s3cr3t")
+
+
+# --------------------------------------------------------------------------- #
+# Interactive unlock — sync() with no master must raise the catchable
+# VaultLockedError (NOT a generic VaultError), so the host can pop the themed
+# Unlock dialog instead of a cryptic fatal. Then unlock_with() opens a session.
+# --------------------------------------------------------------------------- #
+def test_sync_interactive_no_master_raises_vaultlocked(monkeypatch):
+    # Regression: sync()'s broad `except VaultSeedError` used to catch + wrap the
+    # VaultLockedError into a plain VaultError, swallowing the 'please unlock'
+    # signal so the host never popped the prompt. It must now propagate as-is.
+    monkeypatch.setenv("SOC_VAULT_INTERACTIVE", "1")
+    monkeypatch.setattr(litebw, "get_master", lambda *a, **k: "")  # no master
+    be = litebw.LitebwBackend()
+    be.unlock()                       # interactive + no master -> defers (no raise)
+    assert be._session is None
+    with pytest.raises(litebw.VaultLockedError):
+        be.sync()
+
+
+def test_unlock_with_opens_session(monkeypatch):
+    # The operator-supplied master from the Unlock dialog opens a ReadSession,
+    # then sync() populates the cache. The master is never written to a file.
+    be = litebw.LitebwBackend()
+    be.url, be.email = "http://vault.local", "kiosk@soc.local"
+    captured = {}
+
+    def fake_session(url, email, master):
+        captured.update(url=url, email=email, master=master)
+        return _FakeSession()
+    monkeypatch.setattr(litebw, "ReadSession", fake_session)
+    be.unlock_with("operator-typed-master")
+    assert captured["master"] == "operator-typed-master"
+    be.sync()
+    assert be.get("wazuh") == ("admin", "s3cr3t")
+
+
+def test_unlock_with_bad_password_raises_vaulterror(monkeypatch):
+    from host.vault import VaultError
+    be = litebw.LitebwBackend()
+    be.url, be.email = "http://vault.local", "kiosk@soc.local"
+
+    def bad_session(url, email, master):
+        raise VaultSeedError("login failed — check the email/master password")
+    monkeypatch.setattr(litebw, "ReadSession", bad_session)
+    with pytest.raises(VaultError):
+        be.unlock_with("wrong")
+    assert be._session is None

@@ -172,6 +172,19 @@ class Vault:
         self.backend.sync()
         self._ready = True
 
+    def unlock_with(self, master: str):
+        """Open the session with an operator-supplied master (from the host's
+        themed Unlock dialog), then sync. The master stays in RAM only — never
+        written to a file. Raises VaultError on bad password / unreachable server
+        so the dialog can report which and re-prompt. Only the interactive
+        backend (litebw) implements unlock_with."""
+        fn = getattr(self.backend, "unlock_with", None)
+        if fn is None:
+            raise VaultError("this vault backend cannot be unlocked interactively")
+        fn(master)
+        self.backend.sync()
+        self._ready = True
+
     def ready(self) -> bool:
         return self._ready
 

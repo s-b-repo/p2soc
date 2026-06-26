@@ -666,10 +666,12 @@ class SetupAssistant:
         self._page_vpn()
         self._page_review()
 
-        self.assistant.connect("cancel", lambda *_: self.Gtk.main_quit())
+        # On any non-apply exit, drop the Appearance preview from branding's cache
+        # (on_apply mutated it in place) so a same-process re-read isn't poisoned.
+        self.assistant.connect("cancel", self._on_quit)
         self.assistant.connect("close", lambda *_: self.Gtk.main_quit())
-        self.assistant.connect("escape", lambda *_: self.Gtk.main_quit())
-        self.assistant.connect("destroy", lambda *_: self.Gtk.main_quit())
+        self.assistant.connect("escape", self._on_quit)
+        self.assistant.connect("destroy", self._on_quit)
         self.assistant.connect("apply", self._on_apply)
         self.assistant.connect("prepare", self._on_prepare)
         # The page appends above stamped page-0's title onto the chrome; restore it.
@@ -1050,15 +1052,22 @@ class SetupAssistant:
         # state by running the validators once on the model's current values.
         self._vault_email_ok = self.setup.v_email(m.vault_email or "") is None
         self._vault_url_ok = self.setup.v_url(m.vault_url or "") is None
+        # Live-test state — seeded BEFORE the entries below, whose set_text fires
+        # _set_email/_set_url during construction (which read these).
+        self._vault_tested_ok = False
+        self._vault_test_running = False
+        self._vault_tested_key = None
 
         def _set_email(v, ok):
             m.vault_email = v
             self._vault_email_ok = ok
+            self._vault_tested_ok = False   # changed identity -> re-test required
             self._recheck_vault(page)
 
         def _set_url(v, ok):
             m.vault_url = v
             self._vault_url_ok = ok
+            self._vault_tested_ok = False   # changed identity -> re-test required
             self._recheck_vault(page)
 
         email = self._entry(m.vault_email, self.setup.v_email, _set_email)
@@ -1087,12 +1096,75 @@ class SetupAssistant:
                         f'“sealed” for unattended use. “env” is dev-only.'
                         f'</span>')
 
+        # Test connection: prove litebw can reach + log into Vaultwarden BEFORE the
+        # wizard seals, so a well-formed-but-WRONG url/email/master can't slip past
+        # and leave the wall dying later with the cryptic vault error. The probe runs
+        # OFF the GTK main thread (ReadSession does network I/O); the result returns
+        # via GLib.idle_add. A passing test is REQUIRED to leave the page (litebw/rbw).
+        test_btn = Gtk.Button(label="Test connection")
+        test_status = Gtk.Label(xalign=0, wrap=True)
+        test_status.set_max_width_chars(56)
+
+        # Identity of the last params that passed, so editing any field after a green
+        # test re-arms the gate (a stale pass can't authorise a changed config).
+        def _vault_key():
+            return (m.vault_backend, m.vault_email, m.vault_url, pw.get_text())
+
+        def _set_test(markup):
+            test_status.set_markup(markup)
+
+        def _test_done(ok, msg):
+            self._vault_test_running = False
+            test_btn.set_sensitive(True)
+            self._vault_tested_ok = ok
+            self._vault_tested_key = _vault_key() if ok else None
+            col = self.branding.color("good" if ok else "bad")
+            glyph = "● " if ok else "✗ "
+            _set_test(f'<span foreground="{col}">{glyph}{_esc(msg)}</span>')
+            self._recheck_vault(page)
+            return False
+
+        def on_test(_b):
+            be = m.vault_backend
+            if be == "dev":
+                return
+            master = pw.get_text()
+            if not (m.vault_url and m.vault_email and master):
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Enter URL, email and master password first.</span>')
+                return
+            self._vault_test_running = True
+            test_btn.set_sensitive(False)
+            _set_test(f'<span foreground="{self.branding.color("text_dim")}">'
+                      f'… contacting {_esc(m.vault_url)}</span>')
+            self._recheck_vault(page)
+            url_, email_, be_ = m.vault_url, m.vault_email, be
+
+            def _worker():
+                try:
+                    from host import litebw  # type: ignore
+                    sess = litebw.ReadSession(url_, email_, master)
+                    sess.list_ciphers()      # confirm decrypt, not just login
+                    self.GLib.idle_add(_test_done, True,
+                                       "Connected + logged in — vault reachable.")
+                except Exception as e:  # noqa: BLE001 — surface the message verbatim
+                    msg = str(e) or e.__class__.__name__
+                    self.GLib.idle_add(_test_done, False, msg)
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        test_btn.connect("clicked", on_test)
+
         def on_backend(*_):
             be = backend.get_active_text() or "dev"
             m.vault_backend = be
             dev = be == "dev"
-            for w in (email, url, pw, pin, source):
+            for w in (email, url, pw, pin, source, test_btn):
                 w.set_sensitive(not dev)
+            # A backend change invalidates any prior green test.
+            self._vault_tested_ok = False
+            self._vault_tested_key = None
             self._recheck_vault(page)
 
         def on_source(*_):
@@ -1102,6 +1174,10 @@ class SetupAssistant:
 
         def on_pw(e):
             m.master_password = e.get_text()
+            # Editing the master after a green test re-arms the gate.
+            if self._vault_tested_key != _vault_key():
+                self._vault_tested_ok = False
+            self._recheck_vault(page)
 
         def on_pin(e):
             m.master_pin = e.get_text()
@@ -1116,6 +1192,8 @@ class SetupAssistant:
         page.pack_start(self._row("Master source", source), False, False, 0)
         page.pack_start(self._row("Master password", pw), False, False, 0)
         page.pack_start(self._row("One-time PIN", pin), False, False, 0)
+        page.pack_start(self._row("", test_btn), False, False, 0)
+        page.pack_start(test_status, False, False, 0)
         page.pack_start(hint, False, False, 0)
 
         on_backend()
@@ -1129,10 +1207,19 @@ class SetupAssistant:
     def _recheck_vault(self, page):
         """Vault page is complete when the backend is 'dev' (email/URL ignored),
         or — for litebw/rbw — BOTH the account email and the Vaultwarden URL pass
-        their setup.v_* validators. Mirrors the TTY wizard, which won't accept an
-        invalid email/URL, so the GUI can't write a broken soc.env."""
+        their setup.v_* validators AND the live 'Test connection' has SUCCEEDED for
+        the current params (so a well-formed-but-wrong vault can't be sealed). A
+        running test holds the page incomplete so Next can't race the probe."""
         m = self.model
-        ok = (m.vault_backend == "dev") or (self._vault_email_ok and self._vault_url_ok)
+        if m.vault_backend == "dev":
+            ok = True
+        elif getattr(self, "_vault_test_running", False):
+            ok = False
+        else:
+            ok = (self._vault_email_ok and self._vault_url_ok
+                  and getattr(self, "_vault_tested_ok", False)
+                  and self._vault_tested_key == (m.vault_backend, m.vault_email,
+                                                 m.vault_url, m.master_password))
         if self._page_appended(page):
             self.assistant.set_page_complete(page, ok)
         return ok
@@ -1329,9 +1416,38 @@ class SetupAssistant:
                 f'{_esc(text)}</span>')
 
     # ---- Apply / Write --------------------------------------------------- #
+    def _on_quit(self, *_):
+        # Cancel/Escape/destroy without Finish: the Appearance preview poked the
+        # live palette into branding's cache (on_apply, _page_appearance). Drop it
+        # so a later same-process branding read sees the on-disk theme, not a
+        # preview that was never saved.
+        try:
+            self.branding.load(refresh=True)
+        except Exception:  # noqa: BLE001
+            pass
+        self.Gtk.main_quit()
+
+    def _persist_appearance(self):
+        """Auto-persist the wizard Appearance palette on Finish when the user
+        touched it, so clicking Finish (without the page's own Save) never silently
+        loses a colour change. No-op when the user never changed a colour/preset (or
+        already Saved). branding.save_colors refreshes the cache, clearing any
+        preview poison too."""
+        editor = getattr(self, "_appearance_editor", None)
+        if editor is None or not getattr(editor, "dirty", False):
+            return
+        try:
+            self.branding.save_colors(dict(editor._colors))
+            editor.dirty = False
+            # Don't overwrite a seal/PIN status from _write() on success (silent win);
+            # only surface a failure to persist the theme.
+        except (OSError, ValueError) as e:
+            self._set_status(f"theme not saved: {e}", bad=True)
+
     def _on_apply(self, assistant):
         try:
             self._write()
+            self._persist_appearance()
         except Exception as e:  # noqa: BLE001
             self._set_status(f"write failed: {e}", bad=True)
 

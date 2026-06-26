@@ -506,6 +506,14 @@ class _HTTPStatusError(VaultSeedError):
         self.code = code
 
 
+class VaultLockedError(VaultSeedError):
+    """Raised in interactive mode when a session is needed but no master is
+    available yet — a catchable signal that the host should pop the themed
+    'Unlock Vaultwarden' dialog and feed the master back via unlock_with(),
+    NOT a hard misconfig. Distinct class so the host can tell 'prompt the
+    operator' apart from 'server unreachable / wrong URL'."""
+
+
 # --------------------------------------------------------------------------- #
 # In-process backend (mirrors vault.RbwBackend's interface)
 # --------------------------------------------------------------------------- #
@@ -551,22 +559,45 @@ class LitebwBackend:
         self.configure()
         master = get_master()
         if not master:
+            # Interactive: defer to the host's themed Unlock dialog, which feeds
+            # the master back via unlock_with(). _ensure_session signals this
+            # with VaultLockedError rather than masquerading as "unlocked".
             if self.interactive:
-                return   # operator unlocks later; mirror RbwBackend best-effort
+                return
             raise self._vault_error(
                 "no vault master password (host not sealed and no "
                 "$SOC_VAULT_PASSWORD)")
         try:
             self._session = ReadSession(self.url, self.email, master)
         except VaultSeedError as e:
-            if self.interactive:
-                return
+            # A sealed/env master that fails to log in is a real auth/connect
+            # error even in interactive mode — propagate it as-is so the host
+            # tells the operator *which* (wrong password vs. unreachable),
+            # instead of silently looping on a dead session.
+            raise self._vault_error(str(e))
+
+    def unlock_with(self, master: str):
+        """Open the session with an operator-supplied master (from the host's
+        Unlock dialog). Kept in RAM only — never written to a file, preserving
+        the no-plaintext-master guarantee. Raises on bad password / unreachable
+        server so the dialog can report the failure and re-prompt."""
+        if not master:
+            raise self._vault_error("empty master password")
+        try:
+            self._session = ReadSession(self.url, self.email, master)
+        except VaultSeedError as e:
+            self._session = None
             raise self._vault_error(str(e))
 
     def _ensure_session(self) -> ReadSession:
         if self._session is None:
             self.unlock()
         if self._session is None:
+            # Interactive + no master yet: a catchable "please unlock" signal,
+            # not a dead end. Non-interactive: the generic locked fatal.
+            if self.interactive:
+                raise VaultLockedError(
+                    "vault is locked — Vaultwarden master needed")
             raise self._vault_error("vault is locked")
         return self._session
 
@@ -576,6 +607,12 @@ class LitebwBackend:
         try:
             session = self._ensure_session()
             items = session.list_ciphers()
+        except VaultLockedError:
+            # Interactive "please unlock" signal — propagate AS-IS (never wrap it
+            # into a generic VaultError) so the host can tell it apart from a real
+            # misconfig and pop the themed Unlock dialog. Caught before the broad
+            # VaultSeedError branch below because it IS a VaultSeedError subclass.
+            raise
         except _HTTPStatusError as e:
             if e.code != 401:
                 raise self._vault_error(str(e))
@@ -589,6 +626,8 @@ class LitebwBackend:
             try:
                 session = self._ensure_session()
                 items = session.list_ciphers()
+            except VaultLockedError:
+                raise
             except VaultSeedError as e2:
                 raise self._vault_error(str(e2))
         except VaultSeedError as e:

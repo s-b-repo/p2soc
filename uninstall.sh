@@ -228,8 +228,6 @@ rm_path /usr/local/bin/litebw
 # safe: it only ever GRANTED the kiosk user the live-restart capability.
 rm_path /etc/sudoers.d/soc-wall-restart
 rm_path /usr/share/applications/soc-wall.desktop
-rm_path /usr/share/applications/soc-wall-setup.desktop
-rm_path /usr/share/applications/soc-wall-appearance.desktop
 rm_path /usr/share/icons/hicolor/scalable/apps/soc-wall.svg
 rm_path /etc/sysctl.d/99-soc.conf
 rm_path /etc/systemd/zram-generator.conf

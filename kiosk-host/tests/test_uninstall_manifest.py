@@ -131,9 +131,10 @@ def test_desktop_manifest_no_takeover(tmp_path):
 def test_uninstall_removes_every_installed_desktop_entry():
     """install/uninstall symmetry: every /usr/share/applications/*.desktop entry
     install.sh installs must have a matching rm_path in uninstall.sh's section-4
-    removal block. soc-wall-setup.desktop was installed but never removed, leaving
-    a dangling 'SOC Wall Setup' launcher (Exec=/opt/... at a deleted path) after
-    uninstall. This guards the asymmetry from coming back for any desktop entry."""
+    removal block. Once asymmetric (soc-wall-setup.desktop was installed but never
+    removed); now soc-wall.desktop is the SOLE advertised entry (the control center
+    execs the setup/appearance scripts directly, no secondary entries). This guards
+    the asymmetry from coming back for any desktop entry."""
     install_src = open(_INSTALL, encoding="utf-8").read()
     uninstall_src = open(_UNINSTALL, encoding="utf-8").read()
     # Destinations install.sh writes into the shared XDG applications dir.
@@ -144,9 +145,12 @@ def test_uninstall_removes_every_installed_desktop_entry():
     removed = set(re.findall(r"rm_path\s+(\S+\.desktop)", uninstall_src))
     missing = installed - removed
     assert not missing, f"uninstall.sh never removes installed desktop entries: {sorted(missing)}"
-    # Both entries the installer ships must be covered explicitly.
+    # The single advertised entry must be covered explicitly.
     assert "/usr/share/applications/soc-wall.desktop" in removed
-    assert "/usr/share/applications/soc-wall-setup.desktop" in removed
+    # The secondary setup/appearance entries were merged away — they must NOT be
+    # installed (the control center execs the scripts directly).
+    assert "/usr/share/applications/soc-wall-setup.desktop" not in installed
+    assert "/usr/share/applications/soc-wall-appearance.desktop" not in installed
 
 
 def test_pipe_format_is_not_parsed_as_key_value(tmp_path):
