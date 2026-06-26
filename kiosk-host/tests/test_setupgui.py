@@ -112,6 +112,26 @@ def test_master_never_in_cfg_or_env(tmp_path):
     assert "super-secret-master" not in setup.render_soc_env(model.soc_env())
 
 
+def test_soc_env_secret_dir_tracks_paths_after_fallback(tmp_path):
+    """Regression: when the wizard's /etc pkexec escalation is declined and it falls
+    back to the per-user dir, _write() updates model.paths['secret_dir'] to the
+    user-dir secret and then RE-DERIVES soc.env from it. If soc.env were rendered
+    from the stale /etc paths, the wall (run as this user) would hunt for the sealed
+    master in root-owned /etc and never self-unlock. Assert soc_env() tracks paths."""
+    setup = setupgui._load_setup()
+    paths = dict(setup.resolve_paths("dev"))
+    paths["secret_dir"] = "/etc/soc-display/secret"
+    model = setupgui.WizardModel(setup, paths)
+    assert model.soc_env()["SOC_SECRET_DIR"] == "/etc/soc-display/secret"
+    # the per-user fallback repoints secret_dir; re-deriving soc_env must follow it
+    user_secret = str(tmp_path / "soc-display" / "secret")
+    p2 = dict(model.paths)
+    p2["secret_dir"] = user_secret
+    model.paths = p2
+    assert model.soc_env()["SOC_SECRET_DIR"] == user_secret
+    assert "SOC_VAULT_PASSWORD" not in setup.render_soc_env(model.soc_env())
+
+
 def test_validate_catches_broken_cfg(tmp_path):
     setup = setupgui._load_setup()
     paths = setup.resolve_paths("dev")

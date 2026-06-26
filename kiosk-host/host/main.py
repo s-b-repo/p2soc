@@ -725,18 +725,95 @@ def load_config(vault: Vault) -> cfg.Config:
     return cfg.load(panels_file)
 
 
-def _unlock_dialog(email: str, url: str, timeout: float = 180.0):
+class _GtkUnlockUI:
+    """The GTK side of the Unlock prompt, behind a tiny interface so the retry
+    state machine (_unlock_attempt_loop) can be unit-tested without a window. ONE
+    instance wraps ONE already-built dialog — every attempt re-runs the SAME dialog
+    (no 're-pop')."""
+
+    def __init__(self, dlg, entry, seal_chk, err):
+        self._dlg, self._entry, self._seal, self._err = dlg, entry, seal_chk, err
+
+    def prompt(self):
+        """Run the dialog for one attempt. Returns (ok, master, seal_it); ok is
+        False on Cancel/close/timeout (the timeout source responds CANCEL)."""
+        resp = self._dlg.run()
+        return (resp == Gtk.ResponseType.OK,
+                self._entry.get_text(), self._seal.get_active())
+
+    def show_error(self, text):
+        self._err.set_text(text)
+        self._err.show()
+        self._entry.grab_focus()
+
+    def clear_entry(self):
+        self._entry.set_text("")          # master stays in RAM only — never a file
+        self._entry.grab_focus()
+
+
+def _unlock_attempt_loop(verify, ui):
+    """Retry state machine for the Unlock prompt, factored out of _unlock_dialog so
+    it is unit-testable without a GTK window (tests/test_main_unlock.py). `ui`
+    provides prompt()/show_error()/clear_entry(); ONE ui (one dialog) serves every
+    attempt — the dialog is NEVER re-created, so a wrong master re-prompts IN PLACE.
+
+    `verify(master)` returns (ok, reason): on a wrong master / unreachable server,
+    `reason` is shown in the error label and the entry is cleared for another try.
+    Returns (master, seal_it) once a master verifies, or (None, False) on
+    Cancel/close/timeout (ui.prompt() -> ok False). The master is RAM-only here —
+    never written to a file, preserving the no-plaintext-master guarantee."""
+    while True:
+        ok, master, seal_it = ui.prompt()
+        if not ok:
+            return (None, False)            # Cancel / close / timeout
+        if not master:
+            ui.show_error("Enter the master password to unlock the vault.")
+            continue
+        if verify is None:
+            return (master, seal_it)
+        verified, reason = verify(master)
+        if verified:
+            return (master, seal_it)
+        ui.show_error(reason or "The master password was rejected. Try again.")
+        ui.clear_entry()
+        # loop: the SAME dialog stays up for another attempt — no re-pop
+
+
+def _classify_unlock_error(msg: str, url: str) -> str:
+    """Turn a raw VaultError string into a short, operator-actionable reason for the
+    Unlock dialog. A reachability fault (DNS/connect/timeout) and a credential
+    rejection get DIFFERENT guidance — otherwise the operator re-types a correct
+    master forever against a dead URL with no clue which is actually wrong."""
+    low = (msg or "").lower()
+    unreachable = ("reach", "refused", "timed out", "timeout", "connection",
+                   "resolve", "name or service", "unreachable", "no route",
+                   "network is")
+    if any(s in low for s in unreachable):
+        where = f" at {url}" if url else ""
+        return (f"Could not reach Vaultwarden{where} — check the server is running "
+                f"and the URL/account in Setup, then try again.")
+    return "Master password rejected — check it and try again."
+
+
+def _unlock_dialog(email: str, url: str, verify=None, timeout: float = 180.0):
     """Themed, time-boxed 'Unlock Vaultwarden' prompt shown at startup when the
     host is not sealed (no usable master) or the vault is locked — instead of the
     cryptic 'no vault master password' fatal. Runs on the GTK main thread (startup
     is single-threaded, pre-Gtk.main), so a plain nested dialog loop is correct.
 
-    Returns (master, seal_it): the entered master (kept in RAM only — NEVER written
+    The prompt re-prompts IN PLACE: ONE dialog handles the whole attempt sequence.
+    When `verify(master)` is given it is called for each Unlock press and returns
+    (ok, reason); on a wrong master / unreachable server the reason is shown in the
+    error label and the entry is cleared for a retry — no fresh dialog 're-pops'.
+
+    Returns (master, seal_it): the verified master (kept in RAM only — NEVER written
     to a file) and whether the operator asked to seal it host-bound for next boot.
     Returns (None, False) on Cancel/close/timeout so the caller falls through to the
-    fail-safe screen. The 'Seal for next boot' check defaults ON for unattended use,
-    but the master is only ever sealed via secretstore (AES-GCM, host-bound) — the
-    plaintext never touches soc.env or any file, preserving no-plaintext-master."""
+    fail-safe screen (exit 2 -> launcher menu). The single timeout below bounds the
+    whole attempt sequence so a headless wall never wedges. The 'Seal for next boot'
+    check defaults ON for unattended use, but the master is only ever sealed via
+    secretstore (AES-GCM, host-bound) — the plaintext never touches soc.env or any
+    file, preserving no-plaintext-master."""
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return (None, False)  # headless: can't prompt; let the fatal path log it
     try:
@@ -821,23 +898,28 @@ def _unlock_dialog(email: str, url: str, timeout: float = 180.0):
 
         dlg.show_all()
         entry.grab_focus()
-        resp = dlg.run()
-        # Only remove a source that is still live (the operator answered before the
-        # timeout). Removing an already-fired source emits a noisy GLib-Warning.
-        if timed_out["src"] is not None:
-            try:
-                _GLib.source_remove(timed_out["src"])
-            except Exception:  # noqa: BLE001 — defensive; already gone
-                pass
-        master = entry.get_text()
-        seal_it = seal_chk.get_active()
-        dlg.destroy()
-        # Drain the destroy so the next GTK window starts clean.
-        while Gtk.events_pending():
-            Gtk.main_iteration()
-        if resp == Gtk.ResponseType.OK and master:
-            return (master, seal_it)
-        return (None, False)
+
+        def _finish(result):
+            # Only remove a source that is still live (answered before the timeout).
+            # Removing an already-fired source emits a noisy GLib-Warning.
+            if timed_out["src"] is not None:
+                try:
+                    _GLib.source_remove(timed_out["src"])
+                except Exception:  # noqa: BLE001 — defensive; already gone
+                    pass
+            dlg.destroy()
+            # Drain the destroy so the next GTK window starts clean.
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            return result
+
+        # Re-prompt IN PLACE via the extracted retry state machine (unit-tested in
+        # tests/test_main_unlock.py without a GTK window): a wrong master /
+        # unreachable server shows the reason and clears the entry for a retry; the
+        # dialog is NEVER re-created (no 're-pop'). Cancel/close/timeout ->
+        # (None, False). The timeout above is a hard overall bound across all
+        # retries so a headless wall cannot wedge.
+        return _finish(_unlock_attempt_loop(verify, _GtkUnlockUI(dlg, entry, seal_chk, err)))
     except Exception as e:  # noqa: BLE001 — never let the prompt mask the real error
         log(f"(could not show the unlock dialog: {e})")
         return (None, False)
@@ -988,31 +1070,33 @@ def main():
             break
         except VaultLockedError:
             # No usable master yet (host not sealed + no $SOC_VAULT_PASSWORD).
-            # Pop the interactive unlock prompt instead of the cryptic fatal.
+            # Pop the interactive unlock prompt instead of the cryptic fatal. The
+            # dialog verifies IN PLACE: a wrong master / unreachable server is shown
+            # in the dialog and the operator retries in the SAME window — no re-pop.
             email = getattr(vault.backend, "email", "") or os.environ.get("SOC_VAULT_EMAIL", "")
             url = getattr(vault.backend, "url", "") or os.environ.get("SOC_VAULT_URL", "")
-            master, seal_it = _unlock_dialog(email, url)
+
+            def _verify(master):
+                """Attempt the unlock for the dialog; (ok, human reason). On success
+                the backend session is open. master is RAM-only — never written."""
+                try:
+                    vault.backend.unlock_with(master)
+                    return (True, "")
+                except VaultError as e:
+                    log(f"unlock failed: {e}")
+                    return (False, _classify_unlock_error(str(e), url))
+
+            master, seal_it = _unlock_dialog(email, url, verify=_verify)
             if not master:
+                # Cancel / close / timeout — return cleanly to the menu (exit 2),
+                # never re-pop the dialog.
                 return _fatal_screen(
                     "Vaultwarden is locked",
                     "No master password is configured for the secrets vault, and the "
                     "unlock prompt was cancelled, so the wall cannot read its logins.",
                     "Run Setup to configure + seal the vault master, or relaunch and "
                     "enter the master password when prompted.")
-            try:
-                vault.backend.unlock_with(master)   # RAM-only; never written to a file
-            except VaultError as e:
-                # Wrong password OR unreachable server — say which, then re-loop so
-                # the operator can retry within the deadline.
-                log(f"unlock failed: {e}")
-                if time.time() > deadline:
-                    return _fatal_screen(
-                        "Could not unlock Vaultwarden",
-                        f"The master password was rejected, or Vaultwarden could not be "
-                        f"reached.\n\n{e}",
-                        "Check the server URL/account in Setup, or the master password, "
-                        "then relaunch.")
-                continue
+            # _verify already opened the backend session on success.
             if seal_it:
                 _try_seal_master(master)
             continue   # session is open now; re-run open() to sync
