@@ -8,10 +8,14 @@
 # that manifest when present and falls back to the known default paths otherwise,
 # so it still does the right thing on an install that predates the manifest.
 #
-# PRESERVES operator data by default. The users + their homes, /etc/soc-display
-# (panels.yaml, soc.env, sealed secrets) and /var/lib/vaultwarden (the operator's
-# vault) are kept unless you pass --purge. --purge asks for one explicit
-# confirmation before it deletes anything irreversible.
+# PRESERVES operator data by default. Every install-created user (kiosk + desktop
+# + service + vaultwarden) and their homes, /etc/soc-display (panels.yaml, soc.env,
+# sealed secrets) and /var/lib/vaultwarden (the operator's vault) are kept unless
+# you pass --purge. The user list, the deployed files and the systemd units removed
+# are MANIFEST-DRIVEN — uninstall removes exactly what install recorded, so a newly
+# added artifact (e.g. the desktop-mode user or a per-user unit) is reversed with no
+# edit here, and nothing the installer did NOT record is ever touched. --purge asks
+# for one explicit confirmation before it deletes anything irreversible.
 #
 # Idempotent: safe to re-run (every step tolerates already-gone state).
 #
@@ -66,6 +70,7 @@ SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
 ETC="/etc/soc-display"
 MANIFEST="$ETC/.install-manifest"
 KIOSK_USER="soc"
+DESKTOP_USER="socwall"
 SVC_USER="socsvc"
 VW_USER="vaultwarden"
 VW_DATA="/var/lib/vaultwarden"
@@ -77,10 +82,12 @@ SET_DEFAULT_CHANGED=0      # installer flipped the boot target
 GETTY_OVERRIDE=0           # installer wrote the getty@tty1 autologin override
 CONSOLEBLANK_ADDED=0       # installer appended consoleblank=0 to cmdline.txt
 CMDLINE_PATH=""            # cmdline.txt path the installer touched
-# Extra files/units the manifest lists for removal (collected generically so new
-# install-created artifacts are reversed without editing this script every time).
+# Extra files/units/users the manifest lists for removal (collected generically so
+# new install-created artifacts — e.g. the desktop-mode user, per-user units — are
+# reversed without editing this script every time).
 MANIFEST_FILES=()
 MANIFEST_UNITS=()
+MANIFEST_USERS=()           # every USER row's value, purged together under --purge
 
 # --------------------------------------------------------------------------- #
 # Load the manifest. install.sh writes pipe-delimited rows:
@@ -99,6 +106,7 @@ parse_manifest(){   # parse_manifest <manifest-path>
           install_mode) INSTALL_MODE="$note" ;;
           vw_mode)      VW_MODE="$note" ;;
           kiosk_user)   KIOSK_USER="$note" ;;
+          desktop_user) DESKTOP_USER="$note" ;;
           svc_user)     SVC_USER="$note" ;;
           harden)       HARDEN="$note" ;;
         esac ;;
@@ -126,6 +134,10 @@ parse_manifest(){   # parse_manifest <manifest-path>
       UNIT)
         MANIFEST_UNITS+=("$val") ;;
       USER)
+        # Record every install-created user so --purge removes them all (kiosk +
+        # desktop + svc + vw), not just a hardcoded three. The vaultwarden user is
+        # also special-cased into VW_USER for the keep-data summary lines.
+        MANIFEST_USERS+=("$val")
         case "$note" in
           *vaultwarden*) VW_USER="$val" ;;
         esac ;;
@@ -154,7 +166,7 @@ else
 fi
 
 log "SOC video-wall uninstall — mode: $([ "$PURGE" = 1 ] && echo PURGE || echo keep-data)$([ "$FORCE" = 1 ] && echo ', non-interactive')"
-log "  SOC_ROOT=$SOC_ROOT  ETC=$ETC  users: $KIOSK_USER/$SVC_USER"
+log "  SOC_ROOT=$SOC_ROOT  ETC=$ETC  users: $KIOSK_USER/$DESKTOP_USER/$SVC_USER"
 
 if [ "$FORCE" != "1" ]; then
   confirm "Uninstall the SOC wall now?" || die "aborted — nothing changed"
@@ -164,6 +176,17 @@ fi
 # 1) systemd units — disable + remove
 # --------------------------------------------------------------------------- #
 UNITS=(soc-wall.service forti-vpn.service autossh-tunnel.service soc-tarpit.service vaultwarden.service)
+# Fold in any unit the manifest recorded (e.g. future per-user desktop-wall units)
+# so newly-added units are reversed without editing this list. A manifest UNIT row
+# may carry either a bare unit name or an absolute path; normalise to a name and
+# dedup against the hardcoded core list.
+for _mu in "${MANIFEST_UNITS[@]:-}"; do
+  [ -n "$_mu" ] || continue
+  _name="${_mu##*/}"                         # strip any /etc/systemd/system/ prefix
+  _seen=0
+  for _u in "${UNITS[@]}"; do [ "$_u" = "$_name" ] && { _seen=1; break; }; done
+  [ "$_seen" = "0" ] && UNITS+=("$_name")
+done
 if [ "$HAS_SYSTEMD" = "1" ]; then
   log "Disabling + removing systemd units"
   for u in "${UNITS[@]}"; do
@@ -235,6 +258,20 @@ rm_path /etc/systemd/journald.conf.d/10-soc.conf
 rm_path /etc/systemd/coredump.conf.d/10-soc.conf
 # native Vaultwarden binary (install.sh extracts it to /usr/local/bin in VW_MODE=native)
 [ "$VW_MODE" = "native" ] && rm_path /usr/local/bin/vaultwarden
+# Remove any other file the manifest recorded that the hardcoded block above didn't
+# cover (the FILE rows are the load-bearing record — anything install.sh lays down
+# and registers is reversed here without editing this list every release). rm_path
+# is a no-op on already-gone paths, so re-listing the ones above is harmless. We
+# skip absolute paths under the preserved data dirs ($ETC / vault) so a recorded
+# config/secret/vault FILE is never deleted on a keep-data uninstall — those are
+# handled only by the --purge block below.
+for _mf in "${MANIFEST_FILES[@]:-}"; do
+  [ -n "$_mf" ] || continue
+  case "$_mf" in
+    "$ETC"|"$ETC"/*|"$VW_DATA"|"$VW_DATA"/*) continue ;;   # operator data: --purge only
+  esac
+  rm_path "$_mf"
+done
 # refresh the desktop database / icon cache if the tooling is around (best effort)
 command -v update-desktop-database >/dev/null 2>&1 && \
   update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
@@ -304,8 +341,16 @@ fi
 # --------------------------------------------------------------------------- #
 # 6) PURGE — operator data (only with --purge, after an explicit confirm)
 # --------------------------------------------------------------------------- #
+# A display list of the users that will be / were preserved-or-purged: the manifest
+# rows when present (so the desktop user shows up), else the known three.
+if [ "${#MANIFEST_USERS[@]}" -gt 0 ]; then
+  USER_LIST="$(IFS='/'; echo "${MANIFEST_USERS[*]}")"
+else
+  USER_LIST="$KIOSK_USER/$SVC_USER/$VW_USER"
+fi
+
 if [ "$PURGE" = "1" ]; then
-  warn "--purge will DELETE operator data: the $KIOSK_USER/$SVC_USER/$VW_USER users"
+  warn "--purge will DELETE operator data: the $USER_LIST users"
   warn "and homes, $ETC (panels.yaml, soc.env, SEALED SECRETS) and the vault at"
   warn "$VW_DATA. This is IRREVERSIBLE."
   if confirm "Purge all operator data + accounts now?"; then
@@ -318,7 +363,22 @@ if [ "$PURGE" = "1" ]; then
     fi
     rm_path "$ETC"
     rm_path "$VW_DATA"
-    for u in "$KIOSK_USER" "$SVC_USER" "$VW_USER"; do
+    # Remove every user the manifest recorded (kiosk + desktop + svc + vw), so a
+    # newly-added role — e.g. the desktop-mode user — is purged automatically once
+    # install.sh records its USER row. Fall back to the known three on a pre-manifest
+    # / manifest-less install so an old box still cleans up. userdel -r removes each
+    # recorded home; dedup so a user listed twice isn't deleted twice.
+    PURGE_USERS=()
+    if [ "${#MANIFEST_USERS[@]}" -gt 0 ]; then
+      PURGE_USERS=("${MANIFEST_USERS[@]}")
+    else
+      PURGE_USERS=("$KIOSK_USER" "$DESKTOP_USER" "$SVC_USER" "$VW_USER")
+    fi
+    _seen_users=" "
+    for u in "${PURGE_USERS[@]}"; do
+      [ -n "$u" ] || continue
+      case "$_seen_users" in *" $u "*) continue ;; esac
+      _seen_users="$_seen_users$u "
       if id "$u" >/dev/null 2>&1; then
         userdel -r "$u" >/dev/null 2>&1 \
           && did "deleted user $u (and home)" \
@@ -331,7 +391,7 @@ if [ "$PURGE" = "1" ]; then
   fi
 else
   log "Preserving operator data (use --purge to remove):"
-  log "  users $KIOSK_USER/$SVC_USER/$VW_USER, $ETC, vault $VW_DATA"
+  log "  users $USER_LIST, $ETC, vault $VW_DATA"
 fi
 
 # --------------------------------------------------------------------------- #

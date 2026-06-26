@@ -34,6 +34,36 @@ def test_install_mode_threads_into_argv(monkeypatch):
     assert any("INSTALL_MODE=desktop" in a for a in argv)
 
 
+def test_install_threads_shared_user_knobs_via_provision(monkeypatch):
+    """When provision.py is resolvable, the GUI Install threads the SAME env-knob
+    set provision.install_env_knobs() derives (the user names too, not just
+    INSTALL_MODE) and names the SAME install.sh — parity with the CLI deploy."""
+    monkeypatch.setenv("SOC_SYSACTION_CMD", "/bin/true")
+    # Point ROOT at the repo so provision.py is found; reset the lazy cache.
+    monkeypatch.setattr(sysaction, "ROOT", _REPO)
+    monkeypatch.setattr(sysaction, "_PROVISION", None)
+    monkeypatch.setattr(sysaction, "_PROVISION_TRIED", False)
+    argv, how = sysaction.build_argv("install", mode="kiosk")
+    assert how == "fake"
+    assert any("INSTALL_MODE=kiosk" in a for a in argv)
+    # the shared knob set carries the user names too (from install_env_knobs).
+    assert any(a.startswith("KIOSK_USER=") for a in argv), argv
+    assert any(a.startswith("DESKTOP_USER=") for a in argv), argv
+    assert any(a.startswith("SVC_USER=") for a in argv), argv
+
+
+def test_install_script_resolves_via_provision_helper(monkeypatch):
+    """_script_path('install') resolves the deploy engine through the SAME helper
+    the CLI uses (provision.install_sh), so both paths name one file."""
+    if _REPO not in sys.path:
+        sys.path.insert(0, _REPO)
+    import provision  # noqa: PLC0415
+    monkeypatch.setattr(sysaction, "ROOT", _REPO)
+    monkeypatch.setattr(sysaction, "_PROVISION", None)
+    monkeypatch.setattr(sysaction, "_PROVISION_TRIED", False)
+    assert sysaction._script_path("install") == provision.install_sh()
+
+
 def test_uninstall_always_force_purge_optional(monkeypatch):
     monkeypatch.setenv("SOC_SYSACTION_CMD", "/bin/true")
     argv, _ = sysaction.build_argv("uninstall")

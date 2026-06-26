@@ -32,6 +32,7 @@ META|harden|1
 META|kiosk_user|kiosk
 META|svc_user|svc2
 USER|kiosk|kiosk user (preserve unless --purge)
+USER|deskwall|desktop-mode user (preserve unless --purge)
 USER|svc2|service user (preserve unless --purge)
 USER|vaultwarden|vaultwarden user (preserve unless --purge)
 DIR|/opt/soc-display|project root (remove on uninstall)
@@ -40,6 +41,7 @@ DIR|/var/lib/vaultwarden|vaultwarden data (preserve unless --purge)
 FILE|/usr/local/bin/litebw|litebw launcher (remove on uninstall)
 FILE|/etc/systemd/system/getty@tty1.service.d/override.conf|tty1 autologin drop-in (kiosk)
 UNIT|vaultwarden.service|/etc/systemd/system/vaultwarden.service
+UNIT|soc-wall-desktop.service|/etc/systemd/system/soc-wall-desktop.service
 REVERT|orig_default_target|graphical.target
 REVERT|did_set_default|1
 REVERT|did_consoleblank|1
@@ -89,6 +91,10 @@ for k in INSTALL_MODE VW_MODE HARDEN KIOSK_USER SVC_USER VW_USER SOC_ROOT \
          CONSOLEBLANK_ADDED CMDLINE_PATH; do
   eval "printf '%s=%s\\n' \\"$k\\" \\"\\${{$k}}\\""
 done
+# The collected arrays are space-joined so the test can assert membership.
+printf 'MANIFEST_USERS=%s\\n' "${{MANIFEST_USERS[*]:-}}"
+printf 'MANIFEST_UNITS=%s\\n' "${{MANIFEST_UNITS[*]:-}}"
+printf 'MANIFEST_FILES=%s\\n' "${{MANIFEST_FILES[*]:-}}"
 """
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
@@ -114,6 +120,23 @@ def test_kiosk_manifest_round_trips(tmp_path):
     assert v["VW_MODE"] == "native"
     assert v["HARDEN"] == "1"
     assert v["INSTALL_MODE"] == "kiosk"
+    # Every install-created user is collected for the manifest-driven --purge —
+    # including the desktop-mode user, which must NOT be orphaned (the whole point
+    # of the manifest-driven user removal). The vaultwarden user is still also
+    # special-cased into VW_USER for the summary lines.
+    users = v["MANIFEST_USERS"].split()
+    assert "kiosk" in users
+    assert "deskwall" in users      # desktop-mode user survives the round-trip
+    assert "svc2" in users
+    assert "vaultwarden" in users
+    assert v["VW_USER"] == "vaultwarden"
+    # Per-user / extra units the installer recorded are collected for removal too,
+    # so a future desktop-wall unit is disabled+removed without editing uninstall.sh.
+    units = v["MANIFEST_UNITS"].split()
+    assert "vaultwarden.service" in units
+    assert "soc-wall-desktop.service" in units
+    # FILE rows are collected so the file-removal loop is load-bearing.
+    assert "/usr/local/bin/litebw" in v["MANIFEST_FILES"].split()
 
 
 def test_desktop_manifest_no_takeover(tmp_path):

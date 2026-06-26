@@ -576,6 +576,14 @@ class SetupAssistant:
         self.config = config
         self.mastersource = mastersource
         self.secretstore = secretstore
+        # Vault account creation (register the kiosk account when it doesn't yet
+        # exist). Optional — degrades to "create it in the web vault" if the
+        # crypto backend is missing, so it is never a hard dependency.
+        try:
+            from host import vaultsetup  # type: ignore
+            self.vaultsetup = vaultsetup
+        except Exception:  # noqa: BLE001 — never block the wizard on this
+            self.vaultsetup = None
         self._pin_shown = ""        # set after a successful seal, shown on review
         self._status = ""
         self.assistant = None
@@ -1175,6 +1183,19 @@ class SetupAssistant:
         reset_btn.set_tooltip_text(
             "Test the master above against Vaultwarden, then re-seal it host-bound "
             "(replaces the existing sealed master). No plaintext is ever written.")
+        # Create the Vaultwarden account when Test reveals it does not exist yet
+        # (the fresh-box dead-end: kiosk@soc.local was never registered, so login
+        # 400s). Registered off the GTK thread with the entered email + master;
+        # the master stays in-memory (never written to a file). Hidden until a
+        # Test failure signals the account is absent, so an existing vault can't be
+        # accidentally re-registered.
+        create_btn = Gtk.Button(label="Create account")
+        create_btn.get_style_context().add_class("soc-ghost")
+        create_btn.set_tooltip_text(
+            "Register this email + master as a new Vaultwarden account, then "
+            "re-test. Only offered when Test shows the account does not exist.")
+        create_btn.set_no_show_all(True)
+        create_btn.hide()
         test_status = Gtk.Label(xalign=0, wrap=True)
         test_status.set_max_width_chars(56)
 
@@ -1186,7 +1207,7 @@ class SetupAssistant:
         def _set_test(markup):
             test_status.set_markup(markup)
 
-        def _test_done(ok, msg):
+        def _test_done(ok, msg, offer_create=False):
             self._vault_test_running = False
             test_btn.set_sensitive(True)
             self._vault_tested_ok = ok
@@ -1194,6 +1215,19 @@ class SetupAssistant:
             col = self.branding.color("good" if ok else "bad")
             glyph = "● " if ok else "✗ "
             _set_test(f'<span foreground="{col}">{glyph}{_esc(msg)}</span>')
+            # A failed login can mean the account was never created (fresh box) OR
+            # a wrong master for an existing account. Test can't tell them apart
+            # without mutating, so on ANY login failure we reveal "Create account"
+            # — it authoritatively distinguishes (registers -> created, or detects
+            # the account already exists with a different master and says so).
+            if create_btn is not None:
+                if offer_create and self.vaultsetup is not None \
+                        and self.vaultsetup.available():
+                    create_btn.show()
+                    seed_chk.show()
+                else:
+                    create_btn.hide()
+                    seed_chk.hide()
             self._recheck_vault(page)
             return False
 
@@ -1219,10 +1253,18 @@ class SetupAssistant:
                     sess = litebw.ReadSession(url_, email_, master)
                     sess.list_ciphers()      # confirm decrypt, not just login
                     self.GLib.idle_add(_test_done, True,
-                                       "Connected + logged in — vault reachable.")
+                                       "Connected + logged in — vault reachable.",
+                                       False)
                 except Exception as e:  # noqa: BLE001 — surface the message verbatim
                     msg = str(e) or e.__class__.__name__
-                    self.GLib.idle_add(_test_done, False, msg)
+                    # A login failure is the fresh-box dead-end: offer to create
+                    # the account. Pure transport failures (host unreachable) are
+                    # NOT account problems — don't offer create for those.
+                    offer = not self._vault_unreachable(msg)
+                    if offer:
+                        msg = (msg + "  — if this account was never created, "
+                               "use “Create account”.")
+                    self.GLib.idle_add(_test_done, False, msg, offer)
 
             import threading
             threading.Thread(target=_worker, daemon=True).start()
@@ -1294,12 +1336,126 @@ class SetupAssistant:
 
         reset_btn.connect("clicked", on_reset)
 
+        # Offer to seed the configured panels' login items right after creating the
+        # account (so the wall has logins to read). Opt-in via this checkbox.
+        seed_chk = Gtk.CheckButton(
+            label="Seed the configured panels' login items after creating")
+        seed_chk.set_active(False)
+        seed_chk.set_no_show_all(True)
+        seed_chk.hide()
+
+        def _create_done(ok, payload):
+            self._vault_test_running = False
+            dev = m.vault_backend == "dev"
+            test_btn.set_sensitive(not dev)
+            reset_btn.set_sensitive(not dev)
+            create_btn.set_sensitive(True)
+            if ok:
+                create_btn.hide()
+                seed_chk.hide()
+                col = self.branding.color("good")
+                _set_test(f'<span foreground="{col}">● {_esc(payload)} '
+                          f'Re-testing…</span>')
+                self._recheck_vault(page)
+                # Re-run Test so the green gate (and seal) become reachable.
+                on_test(None)
+            else:
+                col = self.branding.color("bad")
+                _set_test(f'<span foreground="{col}">✗ {_esc(payload)}</span>')
+                self._recheck_vault(page)
+            return False
+
+        def _seed_panels(url_, email_, master_):
+            """Best-effort: write each configured panel's login item. Never fatal —
+            a seed failure is reported but the account still exists + tests green."""
+            try:
+                from host import vaultseed  # type: ignore
+            except Exception:  # noqa: BLE001
+                return "(seed skipped — vault writer unavailable)"
+            if not vaultseed.available():
+                return "(seed skipped — 'cryptography' missing)"
+            items = []
+            for p in self.model.cfg().get("panels", []):
+                if p.get("vault_item"):
+                    items.append((p["vault_item"], p.get("url", "")))
+            if not items:
+                return ""
+            seeded = 0
+            for name, uri in items:
+                try:
+                    # Empty user/pass placeholder logins the operator fills in the
+                    # web vault — names match vault_item so the wall finds them.
+                    vaultseed.upsert_login(url_, email_, master_, name, "", "",
+                                           uri=uri or None)
+                    seeded += 1
+                except Exception:  # noqa: BLE001 — seeding is best-effort
+                    pass
+            return f"seeded {seeded}/{len(items)} panel item(s);" if items else ""
+
+        def on_create(_b):
+            be = m.vault_backend
+            if be == "dev":
+                return
+            master = pw.get_text()
+            if not (m.vault_url and m.vault_email and master):
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Enter URL, email and master password first.</span>')
+                return
+            if self.vaultsetup is None or not self.vaultsetup.available():
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Cannot create the account here ('
+                          f'\'cryptography\' missing) — create it in the '
+                          f'Vaultwarden web vault.</span>')
+                return
+            self._vault_test_running = True
+            test_btn.set_sensitive(False)
+            reset_btn.set_sensitive(False)
+            create_btn.set_sensitive(False)
+            _set_test(f'<span foreground="{self.branding.color("text_dim")}">'
+                      f'… registering {_esc(m.vault_email)} at '
+                      f'{_esc(m.vault_url)}</span>')
+            self._recheck_vault(page)
+            url_, email_, master_ = m.vault_url, m.vault_email, master
+            do_seed = seed_chk.get_active()
+
+            def _worker():
+                vs = self.vaultsetup
+                try:
+                    result = vs.ensure_account(url_, email_, master_)
+                except vs.WrongMasterError as e:
+                    # Account EXISTS with a different master — never re-register.
+                    self.GLib.idle_add(_create_done, False, str(e))
+                    return
+                except vs.SignupsDisabledError as e:
+                    self.GLib.idle_add(_create_done, False, str(e))
+                    return
+                except Exception as e:  # noqa: BLE001 — surface the reason
+                    msg = str(e) or e.__class__.__name__
+                    self.GLib.idle_add(_create_done, False,
+                                       f"could not create the account: {msg}")
+                    return
+                verb = ("Account created." if result == "created"
+                        else "Account already existed (master verified).")
+                extra = ""
+                if do_seed and result == "created":
+                    extra = " " + _seed_panels(url_, email_, master_)
+                self.GLib.idle_add(_create_done, True, verb + extra)
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        create_btn.connect("clicked", on_create)
+
         def on_backend(*_):
             be = backend.get_active_text() or "dev"
             m.vault_backend = be
             dev = be == "dev"
-            for w in (email, url, pw, pin, source, test_btn, reset_btn):
+            for w in (email, url, pw, pin, source, test_btn, reset_btn,
+                      create_btn):
                 w.set_sensitive(not dev)
+            if dev:
+                create_btn.hide()
+                seed_chk.hide()
             # A backend change invalidates any prior green test.
             self._vault_tested_ok = False
             self._vault_tested_key = None
@@ -1333,8 +1489,10 @@ class SetupAssistant:
         btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_row.pack_start(test_btn, False, False, 0)
         btn_row.pack_start(reset_btn, False, False, 0)
+        btn_row.pack_start(create_btn, False, False, 0)
         page.pack_start(self._row("", btn_row), False, False, 0)
         page.pack_start(test_status, False, False, 0)
+        page.pack_start(self._row("", seed_chk), False, False, 0)
         page.pack_start(hint, False, False, 0)
 
         on_backend()
@@ -1344,6 +1502,17 @@ class SetupAssistant:
         self.assistant.set_page_type(page, Gtk.AssistantPageType.CONTENT)
         self.assistant.set_page_title(page, "Vault")
         self._recheck_vault(page)
+
+    @staticmethod
+    def _vault_unreachable(msg: str) -> bool:
+        """True if a Test failure looks like a transport problem (server down /
+        DNS / refused) rather than an auth problem. We only offer 'Create account'
+        for auth-shaped failures — a server we can't reach can't be registered
+        against, and showing Create there would mislead."""
+        low = (msg or "").lower()
+        return any(s in low for s in (
+            "could not reach", "connection refused", "name or service",
+            "timed out", "no route to host", "ssl", "certificate"))
 
     def _recheck_vault(self, page):
         """Vault page is complete when the backend is 'dev' (email/URL ignored),

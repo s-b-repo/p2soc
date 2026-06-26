@@ -63,6 +63,10 @@ contents:
     file_info: { mode: 0755 }
   - src: ./setup.py
     dst: /opt/soc-display/setup.py
+  # provision.py — the shared provisioning core setup.py imports (`import provision`)
+  # AND the deploy engine the GUI's Install resolves through; must ship beside setup.py.
+  - src: ./provision.py
+    dst: /opt/soc-display/provision.py
   - src: ./Makefile
     dst: /opt/soc-display/Makefile
   - src: ./README.md

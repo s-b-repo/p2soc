@@ -52,10 +52,59 @@ def _terminal() -> "str | None":
     return next((t for t in _TERMINALS if shutil.which(t)), None)
 
 
+_PROVISION = None
+_PROVISION_TRIED = False
+
+
+def _provision_core():
+    """The shared provisioning core (repo-root provision.py), or None if it can't
+    be imported. Lazy + cached + best-effort so this module still imports headless
+    and on a box that predates provision.py. provision.py is pure-stdlib, so
+    importing it here never drags the venv/host deps in."""
+    global _PROVISION, _PROVISION_TRIED
+    if _PROVISION_TRIED:
+        return _PROVISION
+    _PROVISION_TRIED = True
+    try:
+        import importlib.util
+        # A pre-imported `provision` (e.g. setup.py already loaded it) wins — same
+        # object, no second exec.
+        if "provision" in sys.modules:
+            _PROVISION = sys.modules["provision"]
+            return _PROVISION
+        path = os.path.join(ROOT, "provision.py")
+        if not os.path.exists(path):
+            return None
+        spec = importlib.util.spec_from_file_location("provision", path)
+        mod = importlib.util.module_from_spec(spec)
+        # Register BEFORE exec: provision.py's @dataclass(... = field) definitions
+        # need the module discoverable in sys.modules under its own __module__ name
+        # (PEP 563 deferred annotations), else dataclass() raises on a None module.
+        sys.modules["provision"] = mod
+        spec.loader.exec_module(mod)
+        _PROVISION = mod
+    except Exception:  # noqa: BLE001
+        sys.modules.pop("provision", None)
+        _PROVISION = None
+    return _PROVISION
+
+
 def _script_path(action: str) -> str:
-    """Resolve the REAL script for an action under ROOT (SOC_ROOT or /opt)."""
-    name = "install.sh" if action == "install" else "uninstall.sh"
-    return os.path.join(ROOT, name)
+    """Resolve the REAL script for an action under ROOT (SOC_ROOT or /opt).
+
+    For Install this is install.sh — THE single shared deploy engine. The CLI runs
+    it through provision.step_deploy; this GUI path resolves it through the SAME
+    provision.install_sh() helper so both elevation paths name one file (parity by
+    construction). Falls back to ROOT/install.sh when provision.py is unavailable."""
+    if action == "install":
+        prov = _provision_core()
+        if prov is not None and hasattr(prov, "install_sh"):
+            try:
+                return prov.install_sh()
+            except Exception:  # noqa: BLE001
+                pass
+        return os.path.join(ROOT, "install.sh")
+    return os.path.join(ROOT, "uninstall.sh")
 
 
 def build_argv(action: str, *, mode: "str | None" = None,
@@ -78,10 +127,24 @@ def build_argv(action: str, *, mode: "str | None" = None,
         raise ValueError(f"unknown action: {action!r}")
 
     # env knobs passed via `env K=V` so they survive sudo/pkexec and stay readable.
+    # For Install we thread the SAME knob set provision.install_env_knobs() derives
+    # (INSTALL_MODE + the kiosk/desktop/service usernames), built from the shared
+    # core so the GUI and the CLI's provision.step_deploy pass an identical env to
+    # the one install.sh deploy engine. Falls back to just INSTALL_MODE if the core
+    # is unavailable (the usernames then take install.sh's own defaults).
     envparts = []
     extra_args: "list[str]" = []
     if action == "install":
-        envparts.append(f"INSTALL_MODE={mode or 'desktop'}")
+        knobs = None
+        prov = _provision_core()
+        if prov is not None and hasattr(prov, "install_env_knobs"):
+            try:
+                knobs = prov.install_env_knobs(prov.Opts(mode=mode or "desktop"))
+            except Exception:  # noqa: BLE001
+                knobs = None
+        if knobs is None:
+            knobs = {"INSTALL_MODE": mode or "desktop"}
+        envparts.extend(f"{k}={v}" for k, v in knobs.items())
     else:  # uninstall — no tty for prompts under pkexec/terminal, so force.
         extra_args.append("--force")
         if purge:
