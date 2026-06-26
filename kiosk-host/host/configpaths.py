@@ -342,16 +342,25 @@ def _install_etc() -> int:
         return 2
     body = data[len(PMARK):]
     panels_text, env_text = body.split(EMARK, 1)
-    os.makedirs(ETC_DIR, exist_ok=True)
-    os.chmod(ETC_DIR, 0o755)
     pf = os.path.join(ETC_DIR, PANELS_BASENAME)
     ef = os.path.join(ETC_DIR, ENV_BASENAME)
-    with open(pf, "w", encoding="utf-8") as fh:
-        fh.write(panels_text)
-    os.chmod(pf, 0o644)
-    with open(ef, "w", encoding="utf-8") as fh:
-        fh.write(env_text)
-    os.chmod(ef, 0o640)
+    # Writing /etc requires root; this helper is only ever invoked via pkexec (as
+    # root). If it's run directly by a non-root user the os.makedirs/chmod/open
+    # raise PermissionError — catch it and emit the same clean, actionable error
+    # the secretstore --seal helper uses instead of dumping a traceback.
+    try:
+        os.makedirs(ETC_DIR, exist_ok=True)
+        os.chmod(ETC_DIR, 0o755)
+        with open(pf, "w", encoding="utf-8") as fh:
+            fh.write(panels_text)
+        os.chmod(pf, 0o644)
+        with open(ef, "w", encoding="utf-8") as fh:
+            fh.write(env_text)
+        os.chmod(ef, 0o640)
+    except OSError as e:
+        sys.stderr.write(f"configpaths --install-etc: {e} "
+                         f"(must run as root via pkexec)\n")
+        return 1
     # Best-effort group: leave to install.sh/setfacl for the kiosk user's read access.
     sys.stdout.write(f"wrote {pf} (0644) and {ef} (0640)\n")
     return 0

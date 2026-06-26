@@ -1102,6 +1102,15 @@ class SetupAssistant:
         # OFF the GTK main thread (ReadSession does network I/O); the result returns
         # via GLib.idle_add. A passing test is REQUIRED to leave the page (litebw/rbw).
         test_btn = Gtk.Button(label="Test connection")
+        # RESET / re-seal the master: prove the (new) master against Vaultwarden,
+        # then RE-SEAL it host-bound (replacing any old seal) — so a forgotten or
+        # rotated master can be re-set without a reinstall. On a deployed box whose
+        # secret dir is root-owned, the re-seal escalates via pkexec (system prompt).
+        reset_btn = Gtk.Button(label="Reset / re-seal master")
+        reset_btn.get_style_context().add_class("soc-ghost")
+        reset_btn.set_tooltip_text(
+            "Test the master above against Vaultwarden, then re-seal it host-bound "
+            "(replaces the existing sealed master). No plaintext is ever written.")
         test_status = Gtk.Label(xalign=0, wrap=True)
         test_status.set_max_width_chars(56)
 
@@ -1156,11 +1165,76 @@ class SetupAssistant:
 
         test_btn.connect("clicked", on_test)
 
+        def _reset_done(ok, payload):
+            self._vault_test_running = False
+            dev = m.vault_backend == "dev"
+            test_btn.set_sensitive(not dev)
+            reset_btn.set_sensitive(not dev)
+            if ok:
+                # A fresh seal means the master tested good too: arm the page gate so
+                # Next works, keyed to the params that were proven + sealed.
+                self._vault_tested_ok = True
+                self._vault_tested_key = _vault_key()
+                col = self.branding.color("good")
+                _set_test(f'<span foreground="{col}">● Master re-sealed (host-bound). '
+                          f'ONE-TIME PIN: {_esc(payload)}</span>')
+            else:
+                self._vault_tested_ok = False
+                col = self.branding.color("bad")
+                _set_test(f'<span foreground="{col}">✗ {_esc(payload)}</span>')
+            self._recheck_vault(page)
+            return False
+
+        def on_reset(_b):
+            be = m.vault_backend
+            if be == "dev":
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Reset needs a real vault backend (litebw/rbw).</span>')
+                return
+            master = pw.get_text()
+            if not (m.vault_url and m.vault_email and master):
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Enter URL, email and the NEW master first.</span>')
+                return
+            # Where the re-seal must land — the SAME dir the wall unseals from.
+            sd = self.model.paths.get("secret_dir")
+            if not sd:
+                from host import configpaths  # type: ignore
+                sd = configpaths.resolve_secret_dir()
+            self._vault_test_running = True
+            test_btn.set_sensitive(False)
+            reset_btn.set_sensitive(False)
+            _set_test(f'<span foreground="{self.branding.color("text_dim")}">'
+                      f'… testing the new master, then re-sealing</span>')
+            self._recheck_vault(page)
+            url_, email_, master_, pin_ = m.vault_url, m.vault_email, master, m.master_pin
+
+            def _worker():
+                try:
+                    from host import litebw  # type: ignore
+                    litebw.ReadSession(url_, email_, master_).list_ciphers()
+                except Exception as e:  # noqa: BLE001 — surface the vault's reason
+                    msg = str(e) or e.__class__.__name__
+                    self.GLib.idle_add(_reset_done, False,
+                                       f"vault rejected the master: {msg}")
+                    return
+                try:
+                    used = self._seal_host_bound(master_, pin_, sd)
+                except Exception as e:  # noqa: BLE001 — seal/escalation failure
+                    self.GLib.idle_add(_reset_done, False, f"re-seal failed: {e}")
+                    return
+                self.GLib.idle_add(_reset_done, True, used)
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        reset_btn.connect("clicked", on_reset)
+
         def on_backend(*_):
             be = backend.get_active_text() or "dev"
             m.vault_backend = be
             dev = be == "dev"
-            for w in (email, url, pw, pin, source, test_btn):
+            for w in (email, url, pw, pin, source, test_btn, reset_btn):
                 w.set_sensitive(not dev)
             # A backend change invalidates any prior green test.
             self._vault_tested_ok = False
@@ -1192,7 +1266,10 @@ class SetupAssistant:
         page.pack_start(self._row("Master source", source), False, False, 0)
         page.pack_start(self._row("Master password", pw), False, False, 0)
         page.pack_start(self._row("One-time PIN", pin), False, False, 0)
-        page.pack_start(self._row("", test_btn), False, False, 0)
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_row.pack_start(test_btn, False, False, 0)
+        btn_row.pack_start(reset_btn, False, False, 0)
+        page.pack_start(self._row("", btn_row), False, False, 0)
         page.pack_start(test_status, False, False, 0)
         page.pack_start(hint, False, False, 0)
 
@@ -1486,16 +1563,24 @@ class SetupAssistant:
                 # Escalation declined/failed -> fall back to the per-user dir so the
                 # config STILL reaches the wall (for this login), visibly.
                 from host import configpaths  # type: ignore
-                pw = configpaths.resolve_write("panels", want_etc=False)
-                ew = configpaths.resolve_write("env", want_etc=False)
+                pwrite = configpaths.resolve_write("panels", want_etc=False)
+                ewrite = configpaths.resolve_write("env", want_etc=False)
                 paths = dict(paths)
-                paths.update(panels_out=pw["path"], panels_installed=pw["path"],
-                             soc_env=ew["path"], wall_unit=None,
-                             panels_mode=pw["mode"], env_mode=ew["mode"],
-                             via=pw["via"], marker=pw.get("marker"),
+                paths.update(panels_out=pwrite["path"], panels_installed=pwrite["path"],
+                             soc_env=ewrite["path"], wall_unit=None,
+                             panels_mode=pwrite["mode"], env_mode=ewrite["mode"],
+                             via=pwrite["via"], marker=pwrite.get("marker"),
                              needs_privilege=False,
                              secret_dir=os.path.join(configpaths.user_dir(), "secret"))
                 self.model.paths = paths
+                # Re-render soc.env from the per-user paths so SOC_SECRET_DIR points at
+                # the user-dir seal — NOT the /etc dir we just failed to write. Without
+                # this the wall (run as this user) would hunt for the sealed master in
+                # root-owned /etc and never self-unlock, and the seal below would
+                # needlessly re-prompt for pkexec after the operator already declined.
+                env = self.model.soc_env()
+                env_text = setup.render_soc_env(env)
+                assert "SOC_VAULT_PASSWORD" not in env_text
                 setup.write_file(paths["panels_out"], panels_text, paths["panels_mode"], dry=False)
                 setup.write_file(paths["soc_env"], env_text, paths["env_mode"], dry=False)
         else:
@@ -1519,9 +1604,8 @@ class SetupAssistant:
         backend = self.model.vault_backend
         if pw and backend in ("litebw", "rbw"):
             try:
-                pin = setup.seal_master(
-                    pw, source=src, pin=self.model.master_pin, paths=paths,
-                    soc_env=env, backend=backend, dry=False)
+                pin = self._apply_seal(
+                    pw, src, self.model.master_pin, paths, env, backend)
                 if pin:                       # sealed path -> surface the one-time PIN
                     self._pin_shown = pin
                     self._set_status(f"sealed master (host-bound). ONE-TIME PIN: {pin}")
@@ -1548,6 +1632,84 @@ class SetupAssistant:
         # cause on the status line (and a fatal dialog) when it won't — never silent.
         self._confirm_reaches_wall(paths, env)
 
+    # ---- master sealing (shared by Apply + the Vault-page Reset control) ---- #
+    def _apply_seal(self, pw: str, src: str, pin: str, paths: dict,
+                    env: dict, backend: str) -> str:
+        """Seal/store the master per `src`, ESCALATING the host-bound seal via
+        pkexec when the secret dir is root-owned (a deployed /etc) and this user
+        can't write it. Returns the PIN actually used ('' for secret-service/env).
+        Raises setup.SealMasterError on failure. Never writes the master to a file.
+
+        The writable + the secret-service/env cases delegate to setup.seal_master
+        (the shared TTY-wizard core, so they can't drift); only the root-owned
+        host-bound case takes the pkexec branch (where seal_master would otherwise
+        die with a bare PermissionError after the /etc config was already written)."""
+        eff = "sealed" if src == "auto" else src
+        sd = env.get("SOC_SECRET_DIR") or paths.get("secret_dir") or ""
+        from host import configpaths  # type: ignore
+        if eff == "sealed" and sd and not configpaths._dir_writable(sd):
+            return self._seal_host_bound(pw, pin, sd)
+        return self.setup.seal_master(
+            pw, source=src, pin=pin, paths=paths,
+            soc_env=env, backend=backend, dry=False)
+
+    def _seal_host_bound(self, master: str, pin: str, secret_dir: str) -> str:
+        """Host-bound (AES-GCM) seal of `master` into `secret_dir`, escalating via
+        pkexec when the dir is root-owned. GTK-free, so it is also safe to call from
+        a worker thread (the Reset control). Returns the PIN used; raises
+        setup.SealMasterError on failure."""
+        ss = self.secretstore
+        if not ss.available():
+            raise self.setup.SealMasterError(
+                "the 'cryptography' package is required to seal the master password")
+        if not master:
+            raise self.setup.SealMasterError("no master password entered — nothing sealed")
+        pin = pin or ss.gen_pin()
+        from host import configpaths  # type: ignore
+        if configpaths._dir_writable(secret_dir):
+            try:
+                ss.seal(master, pin, secret_dir)
+                if ss.unseal(secret_dir) != master:
+                    raise ss.SecretStoreError("seal did not unseal to the same value")
+            except ss.SecretStoreError as e:
+                raise self.setup.SealMasterError(f"could not seal: {e}")
+            return pin
+        used = self._seal_via_pkexec(master, pin, secret_dir)
+        if used is None:
+            raise self.setup.SealMasterError(
+                f"could not seal to {secret_dir} (root-owned) — the system-password "
+                f"prompt was declined or pkexec is unavailable")
+        return used
+
+    def _seal_via_pkexec(self, master: str, pin: str, secret_dir: str) -> "str | None":
+        """Seal into a root-owned `secret_dir` via the fixed host.secretstore pkexec
+        helper: master + PIN go over STDIN (never argv, so neither hits the process
+        table), the operator gets the graphical SYSTEM-password prompt, and the seal
+        is written as root. Returns the PIN used on success, or None if pkexec is
+        absent / declined / failed (the caller then surfaces the failure)."""
+        if not shutil.which("pkexec"):
+            return None
+        # Invoke secretstore BY ABSOLUTE PATH, not `-m host.secretstore`: pkexec
+        # sanitises the environment, so PYTHONPATH does NOT cross the privilege
+        # boundary (host.sysaction avoids this by shelling out via `pkexec env`).
+        # Under `-m` the root child would `ModuleNotFoundError: No module named
+        # 'host'` (the GUI runs from $SOC_ROOT, where `host` is not importable),
+        # and the seal would silently fail. By-path needs no PYTHONPATH — the file
+        # runs as __main__ and imports only its own stdlib + lazy crypto.
+        helper = os.path.join(_repo_root(), "kiosk-host", "host", "secretstore.py")
+        py = shutil.which("python3") or sys.executable
+        payload = f"---MASTER---\n{master}\n---PIN---\n{pin}"
+        try:
+            p = subprocess.run(
+                ["pkexec", py, helper, "--seal", "--dir", secret_dir],
+                input=payload, text=True, capture_output=True, timeout=120)
+        except Exception:  # noqa: BLE001 — treat any spawn fault as "declined/failed"
+            return None
+        if p.returncode != 0:
+            return None
+        out = (p.stdout or "").strip()
+        return out or pin
+
     def _install_etc_via_pkexec(self, panels_text: str, env_text: str) -> bool:
         """Write /etc via the fixed pkexec helper. Content over STDIN (not argv) so
         no values/secrets hit the process table; never passes SOC_VAULT_PASSWORD.
@@ -1555,16 +1717,18 @@ class SetupAssistant:
         then falls back to the per-user dir, visibly)."""
         if not shutil.which("pkexec"):
             return False
-        root = _repo_root()
-        kiosk = os.path.join(root, "kiosk-host")
+        # By ABSOLUTE PATH, not `-m host.configpaths`: pkexec strips PYTHONPATH at
+        # the privilege boundary, so `-m` would `ModuleNotFoundError: No module
+        # named 'host'` in the root child (the GUI's cwd is $SOC_ROOT, not
+        # kiosk-host). configpaths is pure stdlib, so by-path runs with no
+        # PYTHONPATH needed.
+        helper = os.path.join(_repo_root(), "kiosk-host", "host", "configpaths.py")
         py = shutil.which("python3") or sys.executable
         payload = f"---PANELS---\n{panels_text}\n---ENV---\n{env_text}"
-        env = dict(os.environ)
-        env["PYTHONPATH"] = kiosk + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         try:
             p = subprocess.run(
-                ["pkexec", py, "-m", "host.configpaths", "--install-etc"],
-                input=payload, text=True, env=env,
+                ["pkexec", py, helper, "--install-etc"],
+                input=payload, text=True,
                 capture_output=True, timeout=120)
         except Exception as e:  # noqa: BLE001
             self._set_status(f"pkexec escalation failed: {e}", bad=True)
