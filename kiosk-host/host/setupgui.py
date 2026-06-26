@@ -632,24 +632,13 @@ class SetupAssistant:
         # subtitle) so the window chrome always reads as the product, not the page.
         # set_title() is kept as a fallback for WMs that ignore client-side headerbars.
         self.assistant.set_title(brand_title)
-        try:
-            hb = Gtk.HeaderBar()
-            hb.set_show_close_button(True)
-            hb.set_title(brand_title)
-            tagline = b.get("tagline") or ""
-            if tagline:
-                hb.set_subtitle(tagline)
-            icon0 = b.icon_path()
-            if icon0:
-                try:
-                    px = self.GdkPixbuf.Pixbuf.new_from_file_at_size(icon0, 20, 20)
-                    hb.pack_start(self.Gtk.Image.new_from_pixbuf(px))
-                except Exception:
-                    pass
-            self.assistant.set_titlebar(hb)
-            self._headerbar = hb
-        except Exception:
-            self._headerbar = None
+        # Do NOT set a custom Gtk.HeaderBar via set_titlebar() here. A Gtk.Assistant
+        # keeps its Back/Next/Cancel/Apply navigation buttons in its OWN header bar;
+        # replacing it removes them, leaving the wizard with no way to advance — that
+        # was the "Next button is broken" bug. The per-page title leak is handled
+        # instead by _clamp_title (notify::title), which resets the WINDOW title the
+        # default header bar shows — so we keep both the branded title AND the buttons.
+        self._headerbar = None
         self._brand_title = brand_title
         # Gtk.Assistant's own 'prepare' default-handler stamps the *current page's*
         # title onto the window every transition (running AFTER our 'prepare'), which
