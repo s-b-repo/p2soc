@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -220,13 +221,52 @@ def normalize_cfg(raw: dict | None, setup) -> dict:
         tunnel.setdefault("identity", "")
         tunnel.setdefault("extra_forwards", [])
 
-    vpn = dict(raw.get("vpn") or {"enabled": False})
-    vpn.setdefault("enabled", False)
+    vpns = _normalize_vpns_gui(raw)
 
     proxy = dict(raw.get("proxy") or {"enabled": False})
     proxy.setdefault("enabled", False)
 
-    return dict(display=display, panels=panels, tunnel=tunnel, vpn=vpn, proxy=proxy)
+    # Keep a back-compat `vpn` mirror (vpns[0] or a disabled stub) so the review
+    # summary and any old single-VPN reader keep working — new code reads `vpns`.
+    vpn = dict(vpns[0]) if vpns else {"enabled": False}
+    return dict(display=display, panels=panels, tunnel=tunnel,
+                vpns=vpns, vpn=vpn, proxy=proxy)
+
+
+# Cap + name charset mirror kiosk-host/host/config.py (MAX_VPNS / _VPN_NAME_RE).
+MAX_VPNS = 8
+_VPN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _def_vpn(idx: int = 0) -> dict:
+    """A fresh, disabled VPN row with a stable unique-ish default name."""
+    return dict(name=("vpn" if idx == 0 else f"vpn{idx + 1}"),
+                enabled=False, type="fortinet", default_route=False,
+                gateway="", port=443, vault_item="", trusted_cert="", config="")
+
+
+def _normalize_vpns_gui(raw: dict) -> list:
+    """Resolve raw `vpns:`/`vpn:` into the authoritative LIST, mirroring
+    config._normalize_vpns: a `vpns:` list wins; else a legacy `vpn:` dict is
+    wrapped as one entry; else []. Each entry gets a stable `name` and a
+    `default_route` default so the GUI rows have something to bind to."""
+    if raw.get("vpns") is not None:
+        src = raw.get("vpns")
+        src = list(src) if isinstance(src, list) else []
+    elif isinstance(raw.get("vpn"), dict) and raw.get("vpn"):
+        src = [raw["vpn"]]
+    else:
+        src = []
+    out = []
+    for i, v in enumerate(src):
+        e = dict(v) if isinstance(v, dict) else {}
+        nm = str(e.get("name", "") or "").strip()
+        e["name"] = nm or ("vpn" if i == 0 else f"vpn{i + 1}")
+        e["enabled"] = bool(e.get("enabled", False))
+        e["type"] = e.get("type", "fortinet") or "fortinet"
+        e["default_route"] = bool(e.get("default_route", False))
+        out.append(e)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1568,100 +1608,265 @@ class SetupAssistant:
             self.assistant.set_page_complete(page, ok)
         return ok
 
-    # ---- Page 5: VPN (+ proxy) ------------------------------------------ #
+    # ---- Page 5: VPNs (a LIST, mirroring the Panels page) --------------- #
     def _page_vpn(self):
         Gtk = self.Gtk
-        page = self._page("VPN (optional)",
-                          "One supervised tunnel so VPN-side panels can use mode: direct.",
+        page = self._page("VPNs (optional)",
+                          "Each row is one independent supervised tunnel. Multiple VPNs "
+                          "split-tunnel by default — each owns only its own routes; mark "
+                          "exactly one as the default-route owner for catch-all traffic.",
                           overline=self._step_overline("vpn"))
-        v = self.model.cfg()["vpn"]
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(300)
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroller.add(listbox)
+
+        btnbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        add = Gtk.Button.new_with_label("Add VPN")
+        rem = Gtk.Button.new_with_label("Remove last")
+        add.get_style_context().add_class("soc-ghost")
+        rem.get_style_context().add_class("soc-ghost")
+        btnbar.pack_start(add, False, False, 0)
+        btnbar.pack_start(rem, False, False, 0)
+
+        self._vpn_page = page
+        self._vpn_listbox = listbox
+
+        def cap():
+            return MAX_VPNS
+
+        def rebuild():
+            for child in listbox.get_children():
+                listbox.remove(child)
+            for i, v in enumerate(self.model.cfg()["vpns"]):
+                listbox.add(self._vpn_row(i, v, page))
+            listbox.show_all()
+            self._revalidate_page(page)
+
+        def on_add(_b):
+            vpns = self.model.cfg()["vpns"]
+            if len(vpns) >= cap():
+                self._set_status(f"at most {cap()} VPNs", bad=True)
+                return
+            vpns.append(_def_vpn(len(vpns)))
+            self.model.set_cfg(self.model.cfg())   # renormalise (refills names/back-compat vpn)
+            rebuild()
+
+        def on_rem(_b):
+            vpns = self.model.cfg()["vpns"]
+            if vpns:
+                vpns.pop()
+                self.model.set_cfg(self.model.cfg())
+                rebuild()
+        add.connect("clicked", on_add)
+        rem.connect("clicked", on_rem)
+
+        page.pack_start(btnbar, False, False, 0)
+        page.pack_start(scroller, True, True, 0)
+        self._rebuild_vpns = rebuild
+        rebuild()
+
+        self.assistant.append_page(page)
+        self.assistant.set_page_type(page, Gtk.AssistantPageType.CONTENT)
+        self.assistant.set_page_title(page, "VPNs")
+        self._revalidate_page(page)
+
+    _VPN_TYPES = ("fortinet", "openvpn", "wireguard", "inode")
+
+    def _vpn_row(self, idx, v, page):
+        """One VPN row: name + enable + type combo + default_route + type-specific
+        fields, all writing into `v` in place. Mirrors _panel_row's structure."""
+        Gtk = self.Gtk
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.get_style_context().add_class("soc-card")
+        box.set_border_width(6)
+
+        thead = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        num = Gtk.Label()
+        num.set_markup(
+            f'<span font_family="monospace" size="13000" weight="bold" '
+            f'foreground="{_mix(self.branding.color("primary"), self.branding.color("surface_top"), 0.30)}">'
+            f'{idx + 1:02d}</span>')
+        title = Gtk.Label(xalign=0)
+        title.set_markup(f'<span weight="bold" letter_spacing="-300" foreground="'
+                         f'{self.branding.color("text")}">VPN {idx + 1}</span>')
+        thead.pack_start(num, False, False, 0)
+        thead.pack_start(title, False, False, 0)
+        box.pack_start(thead, False, False, 0)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(8)
+        grid.set_row_spacing(4)
+        r = 0
+
+        def add_field(label, widget):
+            """Attach a labelled widget; return (label, widget) so a per-type field
+            can toggle BOTH visible/hidden together."""
+            nonlocal r
+            lbl = Gtk.Label(xalign=0, label=label)
+            lbl.set_size_request(150, -1)
+            grid.attach(lbl, 0, r, 1, 1)
+            grid.attach(widget, 1, r, 1, 1)
+            r += 1
+            return (lbl, widget)
+
+        def on_change(*_):
+            self._revalidate_page(page)
+
+        # name — unique identity key; live charset/uniqueness validation
+        name = Gtk.Entry()
+        name.set_text(str(v.get("name", "")))
+        name.set_hexpand(True)
+
+        def _name(e):
+            v["name"] = e.get_text()
+            ctx = e.get_style_context()
+            ctx.remove_class("soc-field-bad")
+            ctx.remove_class("soc-field-good")
+            nm = e.get_text().strip()
+            others = [str(x.get("name", "")).strip().lower()
+                      for j, x in enumerate(self.model.cfg()["vpns"]) if j != idx]
+            if not _VPN_NAME_RE.match(nm):
+                ctx.add_class("soc-field-bad")
+                e.set_tooltip_text("start alphanumeric; letters/digits/._- only (no spaces)")
+            elif nm.lower() in others:
+                ctx.add_class("soc-field-bad")
+                e.set_tooltip_text("name must be unique across VPNs")
+            else:
+                ctx.add_class("soc-field-good")
+                e.set_tooltip_text(None)
+            on_change()
+        name.connect("changed", _name)
+        add_field("name", name)
 
         enable = Gtk.Switch()
         enable.set_active(bool(v.get("enabled")))
         enable.set_halign(Gtk.Align.START)
-        page.pack_start(self._row("Enable VPN", enable), False, False, 0)
 
-        fields = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        page.pack_start(fields, False, False, 0)
-
-        vtype = Gtk.ComboBoxText()
-        _VPN_TYPES = ("fortinet", "openvpn", "wireguard", "inode")
-        for t in _VPN_TYPES:
-            vtype.append_text(t)
-        # Restore the SAVED type (like every other combo on the wizard) instead of
-        # always forcing fortinet. Without this, reopening the wizard on an
-        # openvpn/wireguard/inode box reset the type to fortinet and collect()
-        # (run on init below) then clobbered the saved VPN config with fortinet
-        # defaults — silent data loss for the operator's VPN settings.
+        type_combo = Gtk.ComboBoxText()
+        for t in self._VPN_TYPES:
+            type_combo.append_text(t)
         try:
-            vtype.set_active(_VPN_TYPES.index(v.get("type", "fortinet")))
+            type_combo.set_active(self._VPN_TYPES.index(v.get("type", "fortinet")))
         except ValueError:
-            vtype.set_active(0)
-        fields.pack_start(self._row("VPN type", vtype), False, False, 0)
+            type_combo.set_active(0)
 
+        droute = Gtk.CheckButton.new_with_label("default-route owner (full-tunnel 0.0.0.0/0)")
+        droute.set_active(bool(v.get("default_route")))
+
+        # type-specific field widgets — built once, shown/hidden by type
         gateway = self._entry(v.get("gateway", ""), self.setup.v_host,
-                              lambda val, ok: _set(v, "gateway", val))
+                              lambda val, ok: (_set(v, "gateway", val), on_change()))
         port = Gtk.SpinButton.new_with_range(1, 65535, 1)
-        port.set_value(int(v.get("port", 443)))
+        port.set_value(int(v.get("port", 443) or 443))
         vault = Gtk.Entry()
         vault.set_text(str(v.get("vault_item", "")))
+        vault.set_hexpand(True)
         cert = self._entry(v.get("trusted_cert", ""), self.setup.v_sha256,
-                           lambda val, ok: _set(v, "trusted_cert", val))
+                           lambda val, ok: (_set(v, "trusted_cert", val), on_change()))
         config_path = Gtk.Entry()
         config_path.set_text(str(v.get("config", "")))
+        config_path.set_hexpand(True)
 
-        fields.pack_start(self._row("Gateway host", gateway), False, False, 0)
-        fields.pack_start(self._row("Gateway port", port), False, False, 0)
-        fields.pack_start(self._row("Vault item", vault), False, False, 0)
-        fields.pack_start(self._row("Trusted cert (sha256)", cert), False, False, 0)
-        fields.pack_start(self._row("Config path (ovpn/wg)", config_path), False, False, 0)
-
-        def collect(*_):
-            v = self.model.cfg()["vpn"]
-            if not enable.get_active():
-                v.clear()
-                v["enabled"] = False
-                self._revalidate_page(page)
-                fields.set_sensitive(False)
-                return
-            fields.set_sensitive(True)
-            t = vtype.get_active_text() or "fortinet"
-            v.clear()
-            v["enabled"] = True
+        def _collect_type():
+            """Write the type-specific keys into `v` for its CURRENT type, dropping
+            keys foreign to the chosen type so the rendered YAML stays clean."""
+            t = type_combo.get_active_text() or "fortinet"
+            v["enabled"] = bool(enable.get_active())
             v["type"] = t
-            if t in ("fortinet", "inode"):
+            v["default_route"] = bool(droute.get_active())
+            # strip cross-type leftovers, keep name/enabled/type/default_route
+            for k in ("gateway", "port", "vault_item", "trusted_cert", "realm",
+                      "set_routes", "set_dns", "half_internet_routes", "persistent",
+                      "otp_from_vault", "insecure", "config", "ready_probe",
+                      "health_check_interval", "health_check_failures", "extra_args"):
+                v.pop(k, None)
+            if t == "fortinet":
                 v["gateway"] = gateway.get_text()
                 v["port"] = int(port.get_value())
                 v["vault_item"] = vault.get_text()
                 v["trusted_cert"] = cert.get_text()
-                if t == "fortinet":
-                    v["realm"] = ""
-                    v["set_routes"] = True
-                    v["set_dns"] = False
-                    v["half_internet_routes"] = False
-                    v["persistent"] = 0
-                    v["otp_from_vault"] = False
-                else:
-                    v["insecure"] = False
+                v["realm"] = ""
+                v["set_routes"] = True
+                v["set_dns"] = False
+                v["half_internet_routes"] = False
+                v["persistent"] = 0
+                v["otp_from_vault"] = False
+            elif t == "inode":
+                v["gateway"] = gateway.get_text()
+                v["port"] = int(port.get_value())
+                v["vault_item"] = vault.get_text()
+                v["trusted_cert"] = cert.get_text()
+                v["insecure"] = False
             else:  # openvpn / wireguard
                 v["config"] = config_path.get_text()
                 if t == "openvpn":
                     v["vault_item"] = vault.get_text()
                     v["set_routes"] = True
-            self._revalidate_page(page)
 
-        enable.connect("notify::active", collect)
-        vtype.connect("changed", collect)
-        for w in (gateway, vault, cert, config_path):
-            w.connect("changed", lambda *_: collect())
-        port.connect("value-changed", collect)
-        collect()
+        # rows for each field (built, then visibility toggled per type)
+        add_field("enable", enable)
+        add_field("type", type_combo)
+        add_field("routing", droute)
+        gw_row = add_field("gateway host", gateway)
+        port_row = add_field("gateway port", port)
+        vault_row = add_field("vault item", vault)
+        cert_row = add_field("trusted cert (sha256)", cert)
+        cfg_row = add_field("config path (ovpn/wg)", config_path)
 
-        self.assistant.append_page(page)
-        self.assistant.set_page_type(page, Gtk.AssistantPageType.CONTENT)
-        self.assistant.set_page_title(page, "VPN")
-        self._vpn_page = page
-        self._revalidate_page(page)
+        def _apply_visibility():
+            t = type_combo.get_active_text() or "fortinet"
+            host_type = t in ("fortinet", "inode")
+            file_type = t in ("openvpn", "wireguard")
+            on = bool(enable.get_active())
+            for pair, vis in (
+                (gw_row, on and host_type),
+                (port_row, on and host_type),
+                (cert_row, on and host_type),
+                (cfg_row, on and file_type),
+                # vault: fortinet/inode always; openvpn optional; wireguard never
+                (vault_row, on and t in ("fortinet", "inode", "openvpn")),
+            ):
+                for x in pair:
+                    x.set_visible(vis)
+                    x.set_no_show_all(not vis)
+            type_combo.set_sensitive(on)
+            droute.set_sensitive(on)
+
+        def changed(*_):
+            _collect_type()
+            _apply_visibility()
+            on_change()
+
+        enable.connect("notify::active", changed)
+        type_combo.connect("changed", changed)
+
+        def _droute_toggled(btn):
+            # at-most-one default_route: ticking this one unticks every other row.
+            v["default_route"] = bool(btn.get_active())
+            if btn.get_active():
+                for j, x in enumerate(self.model.cfg()["vpns"]):
+                    if j != idx:
+                        x["default_route"] = False
+                # repaint the other rows so the unticked state is visible
+                if getattr(self, "_rebuild_vpns", None):
+                    self.GLib.idle_add(self._rebuild_vpns)
+            on_change()
+        droute.connect("toggled", _droute_toggled)
+        for w in (vault, config_path):
+            w.connect("changed", lambda *_: changed())
+        port.connect("value-changed", changed)
+
+        box.pack_start(grid, False, False, 0)
+        row.add(box)
+        # seed v from current widgets + set initial visibility after show_all
+        _collect_type()
+        self.GLib.idle_add(_apply_visibility) if hasattr(self, "GLib") else _apply_visibility()
+        return row
 
     # ---- Page 6: review + write ----------------------------------------- #
     def _page_review(self):
@@ -1738,10 +1943,14 @@ class SetupAssistant:
     def _update_review(self):
         cfg = self.model.cfg()
         lines = []
+        en_vpns = [v for v in cfg.get("vpns", []) if v.get("enabled")]
         lines.append(f"{len(cfg['panels'])} panel(s); "
                      f"tunnel {'ON' if cfg['tunnel'].get('enabled') else 'off'}; "
-                     f"VPN {'ON' if cfg['vpn'].get('enabled') else 'off'}; "
+                     f"VPN {len(en_vpns)} enabled; "
                      f"proxy {'ON' if cfg.get('proxy', {}).get('enabled') else 'off'}")
+        for v in en_vpns:
+            owner = "  [default-route]" if v.get("default_route") else ""
+            lines.append(f"  - vpn {v.get('name', '?')} [{v.get('type', 'fortinet')}]{owner}")
         for p in cfg["panels"]:
             tgt = p.get("url") or f"tunnel:{p.get('tunnel', {}).get('local_port')}"
             lines.append(f"  - {p['id']} [{p['engine']}/{p['mode']}] {tgt}  <- {p['vault_item']}")

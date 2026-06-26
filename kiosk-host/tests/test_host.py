@@ -371,7 +371,7 @@ vpn:
   port: 99999
   trusted_cert: "tooshort"
   ready_probe: "noport"
-""", "gateway", "vault_item", "vpn.port", "sha256", "want 'host:port'")
+""", "gateway", "vault_item", "'vpn'.port", "sha256", "want 'host:port'")
 
 
 def test_validation_vpn_health_check_needs_probe():
@@ -382,7 +382,7 @@ vpn:
   gateway: "gw.example"
   vault_item: "VPN"
   health_check_interval: 60
-""", "health_check_interval is set but vpn.ready_probe is empty")
+""", "health_check_interval is set but", "ready_probe is empty")
 
 
 # --- trusted_cert: accept both sha256 (64-hex) and sha1 (40-hex) pins ---------
@@ -1399,7 +1399,7 @@ vpn: {enabled: true, type: wireguard}
     _expect_error("""
 panels: [{id: a, grid: [0,0], url: "http://x/"}]
 vpn: {enabled: true, type: ipsec, config: x}
-""", "vpn.type: must be one of")
+""", "'vpn'.type: must be one of")
 
 
 def test_vpn_validation_openvpn_wireguard_ok():

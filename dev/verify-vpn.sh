@@ -162,6 +162,103 @@ runs = sum(1 for _ in open(os.environ["INODE_RUNS"])) if os.path.exists(os.envir
 check("inode: auto-reconnects after heartbeat death (>=2 attempts)", runs >= 2)
 check("inode: drop classified + reconnect logged", any("reconnecting" in l for l in logs))
 
+# 7) MULTI-VPN MANAGER — drive host/vpnmanager.py over 2-3 distinct-named,
+#    mixed-type entries with the SAME fakes. Assert: one supervisor per ENABLED
+#    entry, distinct names, each connects + reconnects independently, the split-
+#    tunnel routing coercion (only the owner keeps the default route), the wg
+#    0.0.0.0/0 guard, and a full teardown.
+from host import vpnmanager, vpnstatus
+
+print()
+print("--- multi-VPN manager ---")
+
+# distinct names, mixed types; one disabled (must be skipped); 'corp' owns route
+vpns = [
+    {"name":"corp","enabled":True,"type":"fortinet","gateway":"gw","vault_item":"SOC Forti",
+     "default_route":True,"set_routes":True,"half_internet_routes":True},
+    {"name":"lab","enabled":True,"type":"openvpn","config":"/x.ovpn","vault_item":"SOC OVPN",
+     "set_routes":True},
+    {"name":"dmz","enabled":True,"type":"inode","gateway":"vpn.gw","port":3000,
+     "vault_item":"SOC iNode","config":os.environ["INODE_DIR"],"trusted_cert":"AA:BB:CC"},
+    {"name":"off","enabled":False,"type":"fortinet","gateway":"gw","vault_item":"SOC Forti"},
+]
+mlogs = []
+mgr = vpnmanager.VpnManager(vpns, "/x/pinentry.sh", log=lambda m: mlogs.append(m))
+
+# only the 3 enabled entries are prepared, with distinct names
+check("manager: one supervisor per ENABLED entry (3, disabled skipped)",
+      mgr.count == 3 and set(mgr.names) == {"corp","lab","dmz"})
+
+# routing coercion happened at _prepare: the non-owner openvpn 'lab' was forced
+# split-tunnel (set_routes False); the owner 'corp' keeps its full-tunnel config.
+ent = {name: e for name, e, owner in mgr._entries}
+owner = {name: owner for name, e, owner in mgr._entries}
+check("manager: exactly one default-route owner (corp)",
+      owner["corp"] is True and owner["lab"] is False and owner["dmz"] is False)
+check("manager: non-owner openvpn coerced split-tunnel (set_routes False)",
+      ent["lab"].get("set_routes") is False)
+check("manager: owner fortinet keeps full-tunnel (set_routes True)",
+      ent["corp"].get("set_routes") is True)
+
+mgr.start()
+time.sleep(2.0)
+states = mgr.states()
+check("manager: per-name states cover every enabled VPN",
+      set(states) == {"corp","lab","dmz"})
+# every supervisor line is attributable to a name
+check("manager: logs tagged [vpn:<name>] per supervisor",
+      any("[vpn:corp]" in l for l in mlogs)
+      and any("[vpn:lab]" in l for l in mlogs)
+      and any("[vpn:dmz]" in l for l in mlogs))
+check("manager: each tunnel established independently",
+      sum(1 for l in mlogs if "tunnel established" in l) >= 3)
+
+mgr.stop()
+# all three threads joined, supervisor table cleared
+alive = [t for t in threading.enumerate() if t.name.startswith("vpn:")]
+check("manager: clean teardown — no VPN threads left", not alive)
+check("manager: stop() cleared the supervisor table", mgr._supers == {})
+
+# 8) ROUTING SAFETY — two default_route:true entries must NEVER both get the
+#    default route. The manager refuses ALL of them rather than let two fight.
+two_owners = [
+    {"name":"a","enabled":True,"type":"openvpn","config":"/a.ovpn","default_route":True,"set_routes":True},
+    {"name":"b","enabled":True,"type":"openvpn","config":"/b.ovpn","default_route":True,"set_routes":True},
+]
+olog = []
+mgr2 = vpnmanager.VpnManager(two_owners, "/x/pinentry.sh", log=lambda m: olog.append(m))
+e2 = {name: e for name, e, owner in mgr2._entries}
+o2 = {name: owner for name, e, owner in mgr2._entries}
+check("manager: two default_route claims -> NONE owns it (refused)",
+      o2["a"] is False and o2["b"] is False)
+check("manager: both coerced split-tunnel when route is contested",
+      e2["a"].get("set_routes") is False and e2["b"].get("set_routes") is False)
+check("manager: refusal is logged loudly",
+      any("multiple VPNs claim default_route" in l for l in olog))
+
+# 9) WireGuard 0.0.0.0/0 GUARD — a non-owner wg .conf carrying a catch-all
+#    AllowedIPs must be stripped at materialize so it can't hijack the route.
+import json, tempfile
+vault = json.load(open(os.environ["SOC_DEV_VAULT"]))
+vault["WG Catchall"] = {"username":"","password":"x",
+    "notes":"[Interface]\nPrivateKey = K==\nAddress = 10.9.0.2/32\n[Peer]\nAllowedIPs = 0.0.0.0/0, 10.50.0.0/16\n"}
+json.dump(vault, open(os.environ["SOC_DEV_VAULT"],"w"))
+try: os.unlink(os.environ["WG_CONF_SEEN"])
+except OSError: pass
+wgvpns = [
+    {"name":"owner","enabled":True,"type":"fortinet","gateway":"gw","vault_item":"SOC Forti","default_route":True},
+    {"name":"wgnon","enabled":True,"type":"wireguard","config":"wgx","config_from_vault":True,
+     "vault_item":"WG Catchall","health_check_interval":1},
+]
+wlog = []
+mgrw = vpnmanager.VpnManager(wgvpns, "/x/pinentry.sh", log=lambda m: wlog.append(m))
+mgrw.start(); time.sleep(2.0); mgrw.stop()
+seen = open(os.environ["WG_CONF_SEEN"]).read() if os.path.exists(os.environ["WG_CONF_SEEN"]) else ""
+check("manager: non-owner wg catch-all AllowedIPs stripped (no 0.0.0.0/0)",
+      "0.0.0.0/0" not in seen and "10.50.0.0/16" in seen)
+check("manager: wg catch-all refusal logged",
+      any("REFUSED a catch-all" in l for l in wlog))
+
 print()
 print("=== VERIFY-VPN OK ===" if fails==0 else f"=== VERIFY-VPN FAILED ({fails}) ===")
 sys.exit(1 if fails else 0)

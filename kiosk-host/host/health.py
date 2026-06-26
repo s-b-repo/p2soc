@@ -125,8 +125,16 @@ def sync_state() -> dict:
             conf = cfg.load(panels_path)
             panels_count = len(conf.panels)
             panels_valid = True
-            vc = conf.vpn or {}
-            vpn_configured = bool(vc.get("enabled"))
+            # Multi-VPN: configured if ANY entry is enabled. For the single fast
+            # probe, pick a representative enabled entry — prefer one with a
+            # ready_probe (the accurate signal); else the first enabled. This
+            # keeps the launcher health dot cheap (one probe) while honouring the
+            # list (the per-name picture lives in the wall pill, not here).
+            enabled = [v for v in (conf.vpns or [])
+                       if isinstance(v, dict) and v.get("enabled")]
+            vpn_configured = bool(enabled)
+            vc = next((v for v in enabled if (v.get("ready_probe") or "").strip()),
+                      enabled[0] if enabled else {})
             # Only the keys _vpn_state_fast/_expected_iface need; all non-secret
             # (host:port/iface/path/type), so this stays safe to keep in memory.
             vpn = {k: vc.get(k) for k in

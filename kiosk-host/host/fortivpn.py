@@ -731,14 +731,34 @@ def ensure_litebw_session(log):
 ensure_rbw_session = ensure_litebw_session
 
 
+def _vpn_incomplete(vpn: dict) -> bool:
+    """A per-type completeness gate (validation already reported the details).
+    True means the entry is enabled but cannot connect — skip/idle it."""
+    kind = cfg.vpn_kind(vpn)
+    from_vault = bool(vpn.get("config_from_vault"))
+    return (
+        (kind == "fortinet" and (not vpn.get("gateway") or not vpn.get("vault_item")))
+        or (kind == "inode" and (not vpn.get("gateway") or not vpn.get("vault_item")))
+        or (kind in ("openvpn", "wireguard") and not from_vault and not vpn.get("config"))
+        or (kind in ("openvpn", "wireguard") and from_vault and not vpn.get("vault_item")))
+
+
 def main() -> int:
-    """Entry point used by scripts/forti-vpn-connect.py (forti-vpn.service)."""
+    """Entry point used by scripts/forti-vpn-connect.py (forti-vpn.service).
+
+    Single unit, N supervisors: this reads conf.vpns (the authoritative list —
+    a legacy `vpn:{}` is normalized to a one-entry list, so the single-VPN case
+    is byte-for-byte identical behaviour) and fans it out to a VpnManager that
+    runs one independent supervisor thread per enabled entry. The unit stays a
+    SINGLE journald stream tagged [vpn:<name>] per line."""
+    from . import vpnmanager
+
     def log(msg):
         print(f"[forti-vpn] {msg}", file=sys.stderr, flush=True)
 
-    # Tell systemd we are up immediately: the *service* (the supervisor) is
-    # ready even while the tunnel itself is still connecting — tunnel state is
-    # surfaced via STATUS=, and VPN-side consumers gate on vpn.ready_probe.
+    # Tell systemd we are up immediately: the *service* (the manager) is ready
+    # even while the tunnels are still connecting — tunnel state is surfaced via
+    # STATUS=, and VPN-side consumers gate on each vpn.ready_probe.
     sd_notify("READY=1\nSTATUS=starting")
 
     panels = os.environ.get("SOC_PANELS_FILE", "config/panels.yaml")
@@ -754,45 +774,99 @@ def main() -> int:
     for w in conf.warnings:
         log(f"WARNING {w}")
 
-    vpn = conf.vpn or {}
-    kind = cfg.vpn_kind(vpn)
-    driver = vpndrivers.get_driver(vpn)
     pinentry = os.environ.get("SOC_VPN_PINENTRY") or os.path.join(
         os.environ.get("SOC_ROOT", os.getcwd()), "scripts", "forti-pinentry.sh")
-    sup = Supervisor(vpn, pinentry, log=log, driver=driver)
-    sup.install_signal_handlers()
 
-    if not vpn.get("enabled", False):
-        log("VPN disabled in config; idling")
+    # Filter conf.vpns down to the entries that can actually run; idle the rest
+    # (the manager only ever sees runnable entries, so a bad one never thrashes).
+    vpns = list(conf.vpns or [])
+    enabled = [v for v in vpns if isinstance(v, dict) and v.get("enabled")]
+    if not enabled:
+        log("no VPN enabled in config; idling")
         sd_notify("STATUS=disabled in panels.yaml")
-        return sup.idle()
-    log(f"VPN type: {kind}")
+        idler = Supervisor({}, "")
+        idler.install_signal_handlers()
+        return idler.idle()
 
-    # per-type completeness gate (validation already reported details)
-    from_vault = bool(vpn.get("config_from_vault"))
-    incomplete = (
-        (kind == "fortinet" and (not vpn.get("gateway") or not vpn.get("vault_item")))
-        or (kind == "inode" and (not vpn.get("gateway") or not vpn.get("vault_item")))
-        or (kind in ("openvpn", "wireguard") and not from_vault and not vpn.get("config"))
-        or (kind in ("openvpn", "wireguard") and from_vault and not vpn.get("vault_item")))
-    if incomplete:
-        log(f"VPN config incomplete for type '{kind}'; idling (see warnings above)")
-        sd_notify("STATUS=incomplete vpn config — see journal")
-        return sup.idle()
-
-    # a CLI vault session is needed when this VPN reads creds OR its config from
-    # the vault; litebw is the default, rbw stays selectable
+    runnable = []
     backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND).lower()
-    if (driver.needs_creds(vpn) or from_vault) and backend in ("litebw", "rbw"):
+    need_vault_session = False
+    for vpn in enabled:
+        name = vpn.get("name") or "vpn"
+        kind = cfg.vpn_kind(vpn)
+        if _vpn_incomplete(vpn):
+            log(f"[vpn:{name}] config incomplete for type '{kind}'; "
+                f"skipping (see warnings above)")
+            continue
+        log(f"[vpn:{name}] type: {kind}")
+        if kind == "fortinet" and int(vpn.get("persistent", 0) or 0) > 0:
+            log(f"[vpn:{name}] NOTE persistent > 0: openfortivpn reconnects "
+                f"in-process; the supervisor only adds health checks + crash "
+                f"restarts. Set persistent: 0 for the classified backoff.")
+        driver = vpndrivers.get_driver(vpn)
+        if driver.needs_creds(vpn) or bool(vpn.get("config_from_vault")):
+            need_vault_session = True
+        runnable.append(vpn)
+
+    if not runnable:
+        log("no runnable VPN (all enabled entries are incomplete); idling")
+        sd_notify("STATUS=incomplete vpn config — see journal")
+        idler = Supervisor({}, "")
+        idler.install_signal_handlers()
+        return idler.idle()
+
+    # a CLI vault session is needed when ANY VPN reads creds OR its config from
+    # the vault; litebw is the default, rbw stays selectable. One session covers
+    # all supervisors.
+    if need_vault_session and backend in ("litebw", "rbw"):
         try:
             ensure_litebw_session(log)
         except Exception as e:  # noqa: BLE001 — best effort; Vault.open() is the gate
             log(f"litebw session setup warning: {e}")
 
-    if kind == "fortinet" and int(vpn.get("persistent", 0) or 0) > 0:
-        log("NOTE vpn.persistent > 0: openfortivpn reconnects in-process; "
-            "the supervisor only adds health checks + crash restarts. "
-            "Set persistent: 0 to use the supervisor's classified backoff "
-            "(recommended — it avoids hammering a failing login).")
+    mgr = vpnmanager.VpnManager(runnable, pinentry, log=log)
+    stop = threading.Event()
 
-    return sup.run()
+    def on_signal(signum, _frame):
+        log(f"received {signal.Signals(signum).name}; shutting down all VPNs")
+        stop.set()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, on_signal)
+
+    log(f"starting {mgr.count} VPN supervisor(s): {', '.join(mgr.names)}")
+    mgr.start()
+
+    # Dry-run (make vpn-check): each supervisor resolves creds + prints its
+    # command and returns immediately. Give the threads a moment to print, then
+    # tear down and exit 0 — DON'T block in the supervise loop forever.
+    if os.environ.get("SOC_VPN_DRY_RUN") == "1":
+        for name, t in list(mgr._threads.items()):
+            t.join(timeout=cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=1.0) + 5)
+        mgr.stop()
+        return 0
+
+    # Block until stopped, petting the watchdog and aggregating per-name STATUS
+    # so journalctl/`systemctl status` shows the live picture. We keep the
+    # watchdog alive while ANY supervisor thread is healthy (a single wedged
+    # supervisor must not silently mask the whole unit, but it also must not
+    # restart everyone — the manager owns that blast-radius tradeoff).
+    watchdog = SdWatchdog()
+    last_status = ""
+    while not stop.is_set():
+        watchdog.ping()
+        # states() may TCP-probe each ready_probe (bounded per-probe), so pet the
+        # watchdog again right after so N probes can't starve a heartbeat.
+        states = mgr.states()
+        watchdog.ping()
+        agg = vpnmanager.aggregate_state(states)
+        status = (f"STATUS={agg}: "
+                  + ", ".join(f"{n}={s}" for n, s in states.items()))
+        if status != last_status:
+            sd_notify(status)
+            last_status = status
+        stop.wait(5)
+
+    mgr.stop()
+    log("all VPNs stopped")
+    sd_notify("STATUS=stopped")
+    return 0

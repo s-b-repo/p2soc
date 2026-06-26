@@ -88,7 +88,17 @@ VALID_SCHEMES = {"http", "https"}
 VALID_PROXY_SCHEMES = {"http", "https", "socks", "socks4", "socks5"}
 VALID_VPN_TYPES = {"fortinet", "openvpn", "wireguard", "inode"}
 
-_TOP_KEYS = {"display", "panels", "tunnel", "vpn", "proxy", "security"}
+# An upper bound on concurrently-supervised VPNs. N supervisors = N vault
+# unseals + HTTPS syncs at boot on a 1 GB Pi; 8 is a generous-but-sane cap that
+# turns "operator pasted 200 entries" into a clear error instead of a thrash.
+MAX_VPNS = 8
+
+# A VPN `name` is the identity key used everywhere downstream (supervisor key,
+# log tag, pill row) and must stay a clean token so a future per-VPN systemd
+# instance / journald grep cannot be tripped by spaces/slashes/control chars.
+_VPN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+_TOP_KEYS = {"display", "panels", "tunnel", "vpn", "vpns", "proxy", "security"}
 _DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout"}
 _PANEL_KEYS = {"id", "engine", "grid", "mode", "url", "tunnel", "path", "scheme",
                "vault_item", "selectors", "login_marker", "keepalive", "proxy",
@@ -101,7 +111,8 @@ _PROXY_KEYS = {"enabled", "url", "vault_item", "ignore_hosts"}
 _TUNNEL_PANEL_KEYS = {"local_port", "remote_host", "remote_port"}
 _KEEPALIVE_KEYS = {"strategy", "intervalSec", "url", "target"}
 _TUNNEL_KEYS = {"enabled", "jump_host", "identity", "extra_forwards"}
-_VPN_KEYS = {"enabled", "type", "config", "config_from_vault", "gateway", "port",
+_VPN_KEYS = {"name", "default_route",
+             "enabled", "type", "config", "config_from_vault", "gateway", "port",
              "vault_item", "trusted_cert", "ca_file", "realm", "set_routes",
              "set_dns", "half_internet_routes", "persistent", "otp_from_vault",
              "ready_probe", "extra_args", "health_check_interval",
@@ -247,6 +258,11 @@ class Config:
     display: DisplayCfg
     panels: list = field(default_factory=list)
     tunnel: dict = field(default_factory=dict)
+    # vpns is the authoritative LIST of independent VPNs (any supported type),
+    # each a flat dict + a `name`/`default_route`. `vpn` is the back-compat
+    # PRIMARY (vpns[0] if any, else {}) so downstream readers that still take a
+    # single vpn dict keep working — see _normalize_vpns / _parse.
+    vpns: list = field(default_factory=list)
     vpn: dict = field(default_factory=dict)
     proxy: ProxyCfg = field(default_factory=ProxyCfg)
     security: SecurityCfg = field(default_factory=SecurityCfg)
@@ -704,90 +720,186 @@ def _validate_proxy(proxy: dict, errs: list, warns: list):
         errs.append("proxy.ignore_hosts: must be a list of hostnames/patterns")
 
 
-def _validate_vpn(vpn: dict, errs: list, warns: list):
-    if not isinstance(vpn, dict):
-        errs.append("vpn: must be a mapping")
+def _normalize_vpns(raw: dict, warns: list) -> list:
+    """Resolve the `vpn:`/`vpns:` sections of a raw config into the authoritative
+    LIST of VPN dicts, applying the mandatory backward-compat rules:
+
+      * `vpns:` present (a list)  -> use it verbatim (a stray `vpn:` is ignored,
+        with a warning if both are set, so the list form always wins);
+      * else `vpn:` present (a dict) -> wrap it as a one-entry list [that_dict]
+        (every shipped/legacy single-VPN config keeps working unchanged);
+      * else (vpn-less config)    -> [] (stays vpn-less; no VPN service wanted).
+
+    Each entry is left as its raw dict (validation happens in _validate_vpns) but
+    is given a stable, non-empty `name`: an explicit name is kept; otherwise the
+    first entry becomes "vpn" and the rest "vpn2".."vpnN" so a legacy config that
+    never named its VPN still gains a deterministic identity key. Non-dict/garbage
+    entries are passed through untouched for _validate_vpns to reject cleanly.
+    """
+    has_vpns = "vpns" in raw and raw.get("vpns") is not None
+    has_vpn = "vpn" in raw and raw.get("vpn") is not None
+    if has_vpns:
+        if has_vpn:
+            warns.append("config: both 'vpn:' and 'vpns:' are set — using 'vpns:' "
+                         "(the list) and ignoring the stray 'vpn:' block")
+        lst = raw.get("vpns")
+        if not isinstance(lst, list):
+            return lst  # not a list -> let _validate_vpns report it
+        entries = [dict(v) if isinstance(v, dict) else v for v in lst]
+    elif has_vpn:
+        v = raw.get("vpn")
+        entries = [dict(v) if isinstance(v, dict) else v]
+    else:
+        return []
+
+    # Fill stable names for entries that lack one (legacy/unnamed). Keep explicit
+    # names verbatim; duplicate-name detection is _validate_vpns' job.
+    for i, e in enumerate(entries):
+        if isinstance(e, dict):
+            nm = str(e.get("name", "") or "").strip()
+            if not nm:
+                e["name"] = "vpn" if i == 0 else f"vpn{i + 1}"
+    return entries
+
+
+def _validate_vpns(vpns, errs: list, warns: list):
+    """Collect-everything validation of the whole vpns[] list: the cap, unique
+    non-empty names, at-most-one default-route owner, plus every per-entry
+    problem (never short-circuits)."""
+    if not isinstance(vpns, list):
+        errs.append("vpns: must be a list of VPN mappings")
         return
-    _unknown_keys(vpn, _VPN_KEYS, "vpn", warns)
+    if len(vpns) > MAX_VPNS:
+        errs.append(f"vpns: at most {MAX_VPNS} VPNs supported; got {len(vpns)} — "
+                    f"remove some")
+
+    names_seen: dict = {}      # lowercased name -> first label, for dup detection
+    dup_names: list = []
+    route_owners: list = []
+    for i, vpn in enumerate(vpns):
+        label = f"vpns[{i}]"
+        if isinstance(vpn, dict):
+            nm = str(vpn.get("name", "") or "").strip()
+            if nm:
+                label = f"vpns[{i}] {nm!r}"
+            if not nm:
+                errs.append(f"{label}: 'name' is required and must be non-empty "
+                            f"(it is the identity key used for the supervisor, "
+                            f"status pill and logs)")
+            elif not _VPN_NAME_RE.match(nm):
+                errs.append(f"{label}: 'name' must start alphanumeric and contain "
+                            f"only letters/digits/'.'/'_'/'-' (no spaces or "
+                            f"slashes), got {nm!r}")
+            else:
+                key = nm.lower()
+                if key in names_seen:
+                    if nm not in dup_names:
+                        dup_names.append(nm)
+                else:
+                    names_seen[key] = label
+            if vpn.get("default_route"):
+                route_owners.append(nm or label)
+        _validate_vpn(vpn, errs, warns, label)
+
+    if dup_names:
+        errs.append("vpns: duplicate VPN name(s) — each must be unique: "
+                    + ", ".join(repr(n) for n in dup_names))
+    if len(route_owners) > 1:
+        errs.append("vpns: at most one VPN may set 'default_route: true' (the "
+                    "full-tunnel owner); these claim it: "
+                    + ", ".join(str(n) for n in route_owners))
+
+
+def _validate_vpn(vpn: dict, errs: list, warns: list, label: str = "vpn"):
+    """Validate ONE VPN entry. `label` prefixes every message ('vpn' for a legacy
+    single block, "vpns[i] 'name'" for a list entry) so list errors point at the
+    right row. Per-type checks are unchanged; only the prefix differs."""
+    if not isinstance(vpn, dict):
+        errs.append(f"{label}: must be a mapping")
+        return
+    _unknown_keys(vpn, _VPN_KEYS, label, warns)
+    if "default_route" in vpn and not isinstance(vpn["default_route"], bool):
+        errs.append(f"{label}.default_route: must be true or false, got "
+                    f"{vpn['default_route']!r}")
     if not vpn.get("enabled"):
         return
 
     kind = str(vpn.get("type", "fortinet") or "fortinet").lower()
     if kind not in VALID_VPN_TYPES:
-        errs.append(f"vpn.type: must be one of {sorted(VALID_VPN_TYPES)}, got "
+        errs.append(f"{label}.type: must be one of {sorted(VALID_VPN_TYPES)}, got "
                     f"{vpn.get('type')!r}")
         kind = "fortinet"
 
     # shared numeric / probe checks (all types)
     for k in ("persistent", "health_check_interval", "health_check_failures"):
         if k in vpn and (not _is_int(vpn[k]) or vpn[k] < 0):
-            errs.append(f"vpn.{k}: must be an integer >= 0, got {vpn[k]!r}")
+            errs.append(f"{label}.{k}: must be an integer >= 0, got {vpn[k]!r}")
     probe = (vpn.get("ready_probe") or "").strip()
     if probe and not _probe_ok(probe):
-        errs.append(f"vpn.ready_probe: want 'host:port', got {probe!r}")
+        errs.append(f"{label}.ready_probe: want 'host:port', got {probe!r}")
     # fortinet/openvpn health-check needs a TCP probe; wireguard can fall back to
     # the peer's last-handshake age, so a probe is optional there.
     if vpn.get("health_check_interval") and not probe and kind != "wireguard":
-        errs.append("vpn.health_check_interval is set but vpn.ready_probe is empty — "
-                    "the health check needs a host:port to probe")
+        errs.append(f"{label}.health_check_interval is set but {label}.ready_probe "
+                    f"is empty — the health check needs a host:port to probe")
 
     if kind == "fortinet":
         if not vpn.get("gateway"):
-            errs.append("vpn: type 'fortinet' but 'gateway' is not set")
+            errs.append(f"{label}: type 'fortinet' but 'gateway' is not set")
         elif not _is_gateway_host(vpn["gateway"]):
-            errs.append(f"vpn.gateway: not a valid hostname or IP address, "
+            errs.append(f"{label}.gateway: not a valid hostname or IP address, "
                         f"got {vpn['gateway']!r}")
         if not vpn.get("vault_item"):
-            errs.append("vpn: type 'fortinet' but 'vault_item' is not set "
+            errs.append(f"{label}: type 'fortinet' but 'vault_item' is not set "
                         "(the vault login holding the FortiGate credentials)")
         if "port" in vpn and (not _is_int(vpn["port"]) or not (0 < vpn["port"] < 65536)):
-            errs.append(f"vpn.port: must be a port number (1-65535), got {vpn['port']!r}")
+            errs.append(f"{label}.port: must be a port number (1-65535), got {vpn['port']!r}")
         cert = vpn.get("trusted_cert", "")
         if cert and not _is_cert_pin(cert):
-            errs.append(f"vpn.trusted_cert: expected a sha256 (64-char) or sha1 "
+            errs.append(f"{label}.trusted_cert: expected a sha256 (64-char) or sha1 "
                         f"(40-char) hex digest, got {len(str(cert))} chars")
         if not cert and not vpn.get("ca_file"):
-            warns.append("vpn: no trusted_cert / ca_file pinned — the connection "
+            warns.append(f"{label}: no trusted_cert / ca_file pinned — the connection "
                          "relies on system CAs; if the gateway uses a self-signed "
                          "cert the VPN will refuse to connect (see "
                          "docs/CONFIGURATION.md to pin it)")
     elif kind == "openvpn":
         from_vault = bool(vpn.get("config_from_vault"))
         if from_vault and not vpn.get("vault_item"):
-            errs.append("vpn: openvpn with config_from_vault needs 'vault_item' "
+            errs.append(f"{label}: openvpn with config_from_vault needs 'vault_item' "
                         "(its Notes hold the .ovpn profile)")
         elif not from_vault and not vpn.get("config"):
-            errs.append("vpn: type 'openvpn' requires 'config' (path to the .ovpn "
+            errs.append(f"{label}: type 'openvpn' requires 'config' (path to the .ovpn "
                         "profile), or config_from_vault: true")
         if not from_vault and not vpn.get("vault_item"):
-            warns.append("vpn: openvpn with no vault_item — assuming certificate-only "
+            warns.append(f"{label}: openvpn with no vault_item — assuming certificate-only "
                          "auth (the .ovpn must carry the client cert/key). Set "
                          "vault_item for a username/password login.")
     elif kind == "wireguard":
         from_vault = bool(vpn.get("config_from_vault"))
         if from_vault and not vpn.get("vault_item"):
-            errs.append("vpn: wireguard with config_from_vault needs 'vault_item' "
+            errs.append(f"{label}: wireguard with config_from_vault needs 'vault_item' "
                         "(its Notes hold the .conf — keys included)")
         elif not from_vault and not vpn.get("config"):
-            errs.append("vpn: type 'wireguard' requires 'config' (a .conf path or an "
+            errs.append(f"{label}: type 'wireguard' requires 'config' (a .conf path or an "
                         "interface name under /etc/wireguard), or config_from_vault: true")
         if vpn.get("vault_item") and not from_vault:
-            warns.append("vpn: wireguard ignores vault_item unless config_from_vault "
+            warns.append(f"{label}: wireguard ignores vault_item unless config_from_vault "
                          "is set — otherwise its keys live in the .conf file (0600)")
     elif kind == "inode":
         if not vpn.get("gateway"):
-            errs.append("vpn: type 'inode' but 'gateway' is not set (the H3C "
+            errs.append(f"{label}: type 'inode' but 'gateway' is not set (the H3C "
                         "SSL-VPN gateway host)")
         elif not _is_gateway_host(vpn["gateway"]):
-            errs.append(f"vpn.gateway: not a valid hostname or IP address, "
+            errs.append(f"{label}.gateway: not a valid hostname or IP address, "
                         f"got {vpn['gateway']!r}")
         if not vpn.get("vault_item"):
-            errs.append("vpn: type 'inode' but 'vault_item' is not set (the vault "
+            errs.append(f"{label}: type 'inode' but 'vault_item' is not set (the vault "
                         "login holding the SSL-VPN username + password)")
         if "port" in vpn and (not _is_int(vpn["port"]) or not (0 < vpn["port"] < 65536)):
-            errs.append(f"vpn.port: must be a port number (1-65535), got {vpn['port']!r}")
+            errs.append(f"{label}.port: must be a port number (1-65535), got {vpn['port']!r}")
         if "insecure" in vpn and not isinstance(vpn["insecure"], bool):
-            errs.append(f"vpn.insecure: must be true or false, got {vpn['insecure']!r}")
+            errs.append(f"{label}.insecure: must be true or false, got {vpn['insecure']!r}")
         # The iNode pin flows into --pin-sha256 and is compared (in transport.py)
         # against sha256(cert).hexdigest() after stripping ':'/' ' — i.e. it must
         # normalise to a 64-hex (or 40-hex sha1) digest. A typo'd/truncated pin
@@ -797,14 +909,14 @@ def _validate_vpn(vpn: dict, errs: list, warns: list):
         # error) — existing configs use placeholder pins like 'AA:BB'.
         cert = str(vpn.get("trusted_cert", "") or "").strip()
         if cert and not _is_cert_pin(cert.replace(":", "").replace(" ", "")):
-            warns.append(f"vpn.trusted_cert: does not look like a sha256/sha1 "
+            warns.append(f"{label}.trusted_cert: does not look like a sha256/sha1 "
                          f"cert pin (expected 64- or 40-hex digits, ':'-separated "
                          f"ok) — it will only fail at connect time if wrong, "
                          f"got {vpn.get('trusted_cert')!r}")
         if not vpn.get("trusted_cert") and not vpn.get("insecure"):
-            warns.append("vpn: iNode with no trusted_cert pin and insecure not set — a "
+            warns.append(f"{label}: iNode with no trusted_cert pin and insecure not set — a "
                          "self-signed gateway will fail TLS. Pin its sha256 in "
-                         "vpn.trusted_cert (the AA:BB:.. --pin-sha256 form), or set "
+                         f"{label}.trusted_cert (the AA:BB:.. --pin-sha256 form), or set "
                          "insecure: true (trusted LAN only)")
 
 
@@ -870,7 +982,8 @@ def _parse(raw, path: str) -> Config:
     for i, p in enumerate(panels_raw):
         _validate_panel(i, p if isinstance(p, dict) else {}, disp, errs, warns)
     _validate_cross(raw, disp, panels_raw, errs, warns)
-    _validate_vpn(raw.get("vpn", {}) or {}, errs, warns)
+    vpns_norm = _normalize_vpns(raw, warns)
+    _validate_vpns(vpns_norm, errs, warns)
     _validate_proxy(raw.get("proxy", {}) or {}, errs, warns)
     _validate_security(raw.get("security", {}) or {}, errs, warns)
 
@@ -926,12 +1039,58 @@ def _parse(raw, path: str) -> Config:
         sso_allow=tuple(sc.get("sso_allow") or ()),
     )
 
+    # vpns_norm is the validated authoritative list; conf.vpn is the back-compat
+    # PRIMARY (first entry, else {}) so downstream readers that still take one vpn
+    # dict see the primary VPN instead of breaking. New code must read conf.vpns.
     return Config(display=disp, panels=panels,
                   tunnel=raw.get("tunnel", {}) or {},
-                  vpn=raw.get("vpn", {}) or {},
+                  vpns=vpns_norm if isinstance(vpns_norm, list) else [],
+                  vpn=(vpns_norm[0] if isinstance(vpns_norm, list) and vpns_norm
+                       else {}),
                   proxy=proxy,
                   security=security,
                   warnings=warns)
+
+
+def _vpn_is_plain_single(vpn: dict) -> bool:
+    """True when a one-entry list can round-trip as a legacy `vpn: {}` block:
+    its only added keys (name/default_route) are the parse-time defaults
+    (name=='vpn', default_route falsey). Anything richer must emit `vpns: [...]`."""
+    if not isinstance(vpn, dict):
+        return False
+    if vpn.get("default_route"):
+        return False
+    nm = str(vpn.get("name", "") or "").strip()
+    return nm in ("", "vpn")
+
+
+def _vpn_emit_dict(vpn: dict, *, with_name: bool) -> dict:
+    """A VPN dict ready for YAML: drop a parse-time-default `name`/falsey
+    `default_route` so single-block configs stay byte-stable; keep them in the
+    list form so each entry's identity/owner round-trips."""
+    out = dict(vpn) if isinstance(vpn, dict) else {}
+    if not with_name:
+        out.pop("name", None)
+    if not out.get("default_route"):
+        out.pop("default_route", None)
+    return out
+
+
+def _emit_vpns(conf: "Config", out: dict):
+    """Serialise conf.vpns back to YAML. A single, plainly-named, non-default-route
+    VPN emits a legacy `vpn: {}` block (byte-stable with existing one-VPN tooling);
+    anything multi / named / default-route-owning emits a `vpns: [...]` list."""
+    vpns = list(conf.vpns or [])
+    if not vpns:
+        # No vpns[]; fall back to the back-compat primary if something only set
+        # conf.vpn directly (e.g. a hand-built Config).
+        if conf.vpn:
+            out["vpn"] = conf.vpn
+        return
+    if len(vpns) == 1 and _vpn_is_plain_single(vpns[0]):
+        out["vpn"] = _vpn_emit_dict(vpns[0], with_name=False)
+    else:
+        out["vpns"] = [_vpn_emit_dict(v, with_name=True) for v in vpns]
 
 
 def to_yaml(conf: "Config") -> str:
@@ -991,8 +1150,7 @@ def to_yaml(conf: "Config") -> str:
         out["panels"].append(pd)
     if conf.tunnel:
         out["tunnel"] = conf.tunnel
-    if conf.vpn:
-        out["vpn"] = conf.vpn
+    _emit_vpns(conf, out)
     sec = conf.security
     # Emit the security block only when it deviates from the all-safe defaults,
     # so existing minimal configs round-trip unchanged.

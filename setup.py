@@ -411,6 +411,92 @@ def envq(v) -> str:
     return "'" + v.replace("'", "'\\''") + "'"
 
 
+# Cap mirrors kiosk-host/host/config.py MAX_VPNS; a name must start alphanumeric
+# (it becomes the supervisor key / status-pill row / log tag downstream).
+MAX_VPNS = 8
+_VPN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def cfg_vpns(cfg: dict) -> list:
+    """The authoritative vpns[] list for a setup cfg, normalising a legacy single
+    `vpn: {}` (back-compat) into a one-entry list. Mirrors config._normalize_vpns
+    so the CLI/GUI agree with what the wall actually parses."""
+    if cfg.get("vpns") is not None:
+        v = cfg.get("vpns")
+        return list(v) if isinstance(v, list) else []
+    single = cfg.get("vpn")
+    if isinstance(single, dict) and single:
+        return [single]
+    return []
+
+
+def _vpn_is_plain_single(v: dict) -> bool:
+    """True when a lone VPN can round-trip as a legacy `vpn: {}` block: its only
+    extra keys (name/default_route) are the parse-time defaults. Mirrors
+    config._vpn_is_plain_single so single-VPN configs stay byte-stable."""
+    if not isinstance(v, dict):
+        return False
+    if v.get("default_route"):
+        return False
+    nm = str(v.get("name", "") or "").strip()
+    return nm in ("", "vpn")
+
+
+def _emit_vpn_body(L: list, v: dict, *, with_name: bool, pad: str):
+    """Append the body of ONE VPN entry, each key prefixed with `pad` (two spaces
+    for a single `vpn:` block, four for a `vpns:` list item). `with_name` emits the
+    `name`/`default_route` identity keys (list form only)."""
+    vtype = v.get("type", "fortinet")
+    if with_name:
+        L.append(f"{pad}name: {yq(v.get('name', ''))}")
+    L.append(f"{pad}enabled: {str(bool(v.get('enabled'))).lower()}")
+    if not v.get("enabled"):
+        return
+    L.append(f"{pad}type: {vtype}")
+    if with_name and v.get("default_route"):
+        L.append(f"{pad}default_route: true")
+    if vtype == "openvpn":
+        L.append(f"{pad}config: {yq(v['config'])}")
+        L.append(f"{pad}vault_item: {yq(v.get('vault_item', ''))}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}set_routes: {str(bool(v.get('set_routes', True))).lower()}")
+        L.append(f"{pad}extra_args: []")
+    elif vtype == "wireguard":
+        L.append(f"{pad}config: {yq(v['config'])}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}health_check_interval: {v.get('health_check_interval', 30)}")
+        L.append(f"{pad}health_check_failures: {v.get('health_check_failures', 3)}")
+    elif vtype == "inode":
+        L.append(f"{pad}gateway: {yq(v['gateway'])}")
+        L.append(f"{pad}port: {v.get('port', 443)}")
+        L.append(f"{pad}vault_item: {yq(v['vault_item'])}")
+        if v.get("config"):
+            L.append(f"{pad}config: {yq(v['config'])}")
+        if v.get("domain"):
+            L.append(f"{pad}domain: {yq(v['domain'])}")
+        L.append(f"{pad}trusted_cert: {yq(v.get('trusted_cert', ''))}")
+        L.append(f"{pad}insecure: {str(bool(v.get('insecure', False))).lower()}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}health_check_interval: {v.get('health_check_interval', 0)}")
+        L.append(f"{pad}health_check_failures: {v.get('health_check_failures', 3)}")
+        L.append(f"{pad}extra_args: []")
+    else:  # fortinet
+        L.append(f"{pad}gateway: {yq(v['gateway'])}")
+        L.append(f"{pad}port: {v['port']}")
+        L.append(f"{pad}vault_item: {yq(v['vault_item'])}")
+        L.append(f"{pad}trusted_cert: {yq(v.get('trusted_cert', ''))}")
+        L.append(f"{pad}realm: {yq(v.get('realm', ''))}")
+        L.append(f"{pad}set_routes: {str(bool(v['set_routes'])).lower()}")
+        L.append(f"{pad}set_dns: {str(bool(v['set_dns'])).lower()}")
+        L.append(f"{pad}half_internet_routes: {str(bool(v['half_internet_routes'])).lower()}")
+        L.append(f"{pad}persistent: {v['persistent']}")
+        L.append(f"{pad}otp_from_vault: {str(bool(v['otp_from_vault'])).lower()}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}health_check_interval: {v.get('health_check_interval', 0)}")
+        L.append(f"{pad}health_check_failures: {v.get('health_check_failures', 3)}")
+        L.append(f"{pad}extra_args: []")
+
+
 def render_panels_yaml(cfg: dict) -> str:
     d = cfg["display"]
     L = []
@@ -470,54 +556,27 @@ def render_panels_yaml(cfg: dict) -> str:
         L.append(f"  identity: {yq(t['identity'])}")
         L.append("  extra_forwards: []")
     L.append("")
-    # vpn
-    v = cfg["vpn"]
-    vtype = v.get("type", "fortinet")
-    L.append("# VPN — supervised tunnel (Fortinet / OpenVPN / WireGuard / iNode), run as root")
-    L.append("vpn:")
-    L.append(f"  enabled: {str(bool(v['enabled'])).lower()}")
-    if v["enabled"]:
-        L.append(f"  type: {vtype}")
-        if vtype == "openvpn":
-            L.append(f"  config: {yq(v['config'])}")
-            L.append(f"  vault_item: {yq(v.get('vault_item', ''))}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  set_routes: {str(bool(v.get('set_routes', True))).lower()}")
-            L.append("  extra_args: []")
-        elif vtype == "wireguard":
-            L.append(f"  config: {yq(v['config'])}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  health_check_interval: {v.get('health_check_interval', 30)}")
-            L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
-        elif vtype == "inode":
-            L.append(f"  gateway: {yq(v['gateway'])}")
-            L.append(f"  port: {v.get('port', 443)}")
-            L.append(f"  vault_item: {yq(v['vault_item'])}")
-            if v.get("config"):
-                L.append(f"  config: {yq(v['config'])}")
-            if v.get("domain"):
-                L.append(f"  domain: {yq(v['domain'])}")
-            L.append(f"  trusted_cert: {yq(v.get('trusted_cert', ''))}")
-            L.append(f"  insecure: {str(bool(v.get('insecure', False))).lower()}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  health_check_interval: {v.get('health_check_interval', 0)}")
-            L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
-            L.append("  extra_args: []")
-        else:  # fortinet
-            L.append(f"  gateway: {yq(v['gateway'])}")
-            L.append(f"  port: {v['port']}")
-            L.append(f"  vault_item: {yq(v['vault_item'])}")
-            L.append(f"  trusted_cert: {yq(v.get('trusted_cert', ''))}")
-            L.append(f"  realm: {yq(v.get('realm', ''))}")
-            L.append(f"  set_routes: {str(bool(v['set_routes'])).lower()}")
-            L.append(f"  set_dns: {str(bool(v['set_dns'])).lower()}")
-            L.append(f"  half_internet_routes: {str(bool(v['half_internet_routes'])).lower()}")
-            L.append(f"  persistent: {v['persistent']}")
-            L.append(f"  otp_from_vault: {str(bool(v['otp_from_vault'])).lower()}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  health_check_interval: {v.get('health_check_interval', 0)}")
-            L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
-            L.append("  extra_args: []")
+    # vpn / vpns — emit a single `vpn:` block when there is exactly one plainly
+    # named, non-default-route VPN (byte-stable with legacy one-VPN tooling), else
+    # a `vpns:` list. Mirrors config._emit_vpns so the wall re-parses it identically.
+    vpns = cfg_vpns(cfg)
+    if len(vpns) == 1 and _vpn_is_plain_single(vpns[0]):
+        L.append("# VPN — supervised tunnel (Fortinet / OpenVPN / WireGuard / iNode), run as root")
+        L.append("vpn:")
+        _emit_vpn_body(L, vpns[0], with_name=False, pad="  ")
+    elif vpns:
+        L.append("# VPNs — N supervised tunnels; each VPN owns its own (split-tunnel) routes.")
+        L.append("# Mark exactly one default_route: true to give it the catch-all 0.0.0.0/0 route.")
+        L.append("vpns:")
+        for v in vpns:
+            start = len(L)
+            _emit_vpn_body(L, v, with_name=True, pad="    ")
+            # turn the first body line of this entry into the `- ` list item
+            L[start] = "  - " + L[start][4:]
+    else:
+        # vpn-less config stays vpn-less — emit NO vpn:/vpns: block so the wall
+        # parses conf.vpns == [] (no VPN service wanted), not a disabled stub.
+        L.append("# VPN — none configured.")
     L.append("")
     # proxy
     pr = cfg.get("proxy") or {"enabled": False}
@@ -775,12 +834,75 @@ def _fetch_cert_digest(host: str, port: int) -> str:
     return ""
 
 
-def section_vpn(prev) -> dict:
-    step(4, 7, "VPN (Fortinet / OpenVPN / WireGuard / iNode)")
-    note("One supervised tunnel so VPN-side panels can use mode: direct.")
-    pv = (prev or {}).get("vpn", {}) if prev else {}
-    if not ask_bool("Enable a VPN?", bool(pv.get("enabled", False))):
-        return dict(enabled=False)
+def section_vpns(prev) -> list:
+    """Configure the vpns[] LIST: add up to MAX_VPNS independent VPNs (any mix of
+    types), each named, validated, with an at-most-one default_route owner. Returns
+    a list of per-entry dicts. Back-compat: a legacy single `vpn: {}` in `prev` is
+    surfaced as the first entry's defaults via cfg_vpns()."""
+    step(4, 7, "VPNs (Fortinet / OpenVPN / WireGuard / iNode)")
+    note("Each VPN is an independent supervised tunnel; VPN-side panels use mode: direct.")
+    note("Multiple VPNs split-tunnel by default — each owns only its own routes.")
+    prev_vpns = cfg_vpns(prev or {})
+    if not prev_vpns:
+        if not ask_bool("Enable a VPN?", False):
+            return []
+    else:
+        note(f"{len(prev_vpns)} VPN(s) configured previously.")
+        if not ask_bool("Keep VPN(s) enabled?", True):
+            return []
+
+    out: list = []
+    used_names: set = set()
+    # default_route is re-decided fresh below so the at-most-one guard is honest.
+    route_taken = False
+    i = 0
+    while len(out) < MAX_VPNS:
+        pv = prev_vpns[i] if i < len(prev_vpns) else {}
+        print()
+        print(cyan(f"   ── VPN {len(out) + 1} ──"))
+        # name — unique, identity key for the supervisor/pill/logs
+        default_name = str(pv.get("name", "") or "").strip() or (
+            "vpn" if not out else f"vpn{len(out) + 1}")
+
+        def _v_name(s, _used=used_names):
+            s = s.strip()
+            if not _VPN_NAME_RE.match(s):
+                return "name must start alphanumeric (letters/digits/._- only, no spaces)"
+            if s.lower() in _used:
+                return f"name {s!r} already used — each VPN name must be unique"
+            return None
+        name = ask("VPN name (identity key)", default_name, allow_empty=False,
+                   validate=_v_name)
+        used_names.add(name.lower())
+
+        entry = _prompt_one_vpn(pv)
+        entry["name"] = name
+        # default_route — at most one owner; suppress the prompt once taken
+        if not route_taken:
+            if ask_bool("Make this the default-route owner (full-tunnel 0.0.0.0/0)?",
+                        bool(pv.get("default_route", False))):
+                entry["default_route"] = True
+                route_taken = True
+            else:
+                entry["default_route"] = False
+        else:
+            entry["default_route"] = False
+        out.append(entry)
+        ok(f"VPN {name} configured")
+
+        i += 1
+        if len(out) >= MAX_VPNS:
+            note(f"reached the {MAX_VPNS}-VPN cap.")
+            break
+        if not ask_bool("Add another VPN?", i < len(prev_vpns)):
+            break
+    return out
+
+
+def _prompt_one_vpn(pv: dict) -> dict:
+    """Prompt the per-type fields for ONE VPN (the body shared by the list loop).
+    Returns the type-specific dict with enabled=True (no name/default_route — the
+    caller adds those)."""
     vtype = ask_choice("VPN type", ["fortinet", "openvpn", "wireguard", "inode"],
                        pv.get("type", "fortinet"))
     if vtype == "openvpn":
@@ -981,7 +1103,7 @@ def validate_panels(panels_path: str):
                  for p in conf.panels]
         ok(f"config parses — {len(conf.panels)} panels, "
            f"tunnel={'on' if conf.tunnel.get('enabled') else 'off'}, "
-           f"vpn={'on' if (conf.vpn or {}).get('enabled') else 'off'}")
+           f"vpn={sum(1 for v in (conf.vpns or []) if v.get('enabled'))} enabled")
         note("geometry: " + "  ".join(geoms))
     except Exception as e:  # noqa: BLE001
         err(f"generated config did NOT parse: {e}")
@@ -1008,7 +1130,7 @@ def post_actions(env: Env, cfg: dict, target: str, dry: bool):
     if target == "dev":
         if ask_bool("Seed the dev vault (make dev-vault)?", True):
             _run(["make", "dev-vault"])
-        if cfg["vpn"].get("enabled") and ask_bool("Dry-run the VPN wiring (make vpn-check)?", True):
+        if any(v.get("enabled") for v in cfg_vpns(cfg)) and ask_bool("Dry-run the VPN wiring (make vpn-check)?", True):
             _run(["make", "vpn-check"])
         if ask_bool("Run the headless end-to-end check (make verify)?", False):
             _run(["make", "verify"])
@@ -1029,9 +1151,10 @@ def _vault_items(cfg: dict):
     for p in cfg.get("panels", []):
         if p.get("vault_item"):
             items.append(("panel", p["vault_item"], p.get("url", "")))
-    v = cfg.get("vpn") or {}
-    if v.get("enabled") and v.get("vault_item"):
-        items.append(("vpn", v["vault_item"], ""))
+    for v in cfg_vpns(cfg):
+        if v.get("enabled") and v.get("vault_item"):
+            label = "vpn:" + str(v.get("name", "")) if v.get("name") else "vpn"
+            items.append((label, v["vault_item"], ""))
     pr = cfg.get("proxy") or {}
     if pr.get("enabled") and pr.get("vault_item"):
         items.append(("proxy", pr["vault_item"], pr.get("url", "")))
@@ -1230,24 +1353,28 @@ def cmd_doctor(args) -> int:
         d.check("panels.yaml parses", lambda: (
             "OK", f"{len(conf.panels)} panels"
             + (f", {len(conf.warnings)} warning(s)" if conf.warnings else ""), ""))
-        vpn = conf.vpn or {}
-        if vpn.get("enabled"):
+        # Per-VPN client checks — iterate the WHOLE vpns[] list so a missing client
+        # for the 3rd VPN is caught, not just the primary (conf.vpns[0]).
+        for vpn in (conf.vpns or []):
+            if not vpn.get("enabled"):
+                continue
             kind = hostcfg.vpn_kind(vpn)
+            nm = str(vpn.get("name", "") or "vpn")
             if kind == "inode":
                 script = hostcfg.inode_script(vpn)
-                d.check("iNode client (svpn-connect.sh)", lambda: (
+                d.check(f"iNode client (svpn-connect.sh) [{nm}]", lambda script=script: (
                     ("OK", script, "")
                     if os.path.isfile(script) and os.access(script, os.X_OK)
                     else ("FAIL", f"missing/not executable: {script}",
                           "ship vendor/iNode-VPN-Client or set vpn.config")))
-                d.check("tesseract (iNode login CAPTCHA)", lambda: (
+                d.check(f"tesseract (iNode login CAPTCHA) [{nm}]", lambda: (
                     ("OK", "on PATH", "") if _have("tesseract")
                     else ("WARN", "not installed", "install tesseract-ocr — the "
                           "gateway CAPTCHA cannot be auto-solved without it")))
             else:
                 need = {"fortinet": "openfortivpn", "openvpn": "openvpn",
                         "wireguard": "wg-quick"}[kind]
-                d.check(f"VPN client ({kind})", lambda: (
+                d.check(f"VPN client ({kind}) [{nm}]", lambda need=need: (
                     ("OK", f"{need} present", "") if _have(need)
                     else ("FAIL", f"{need} not installed",
                           f"install {need} (setup.py repair)")))
@@ -2515,21 +2642,28 @@ def cmd_wizard(args) -> int:
     cfg["display"] = section_display(prev) if args.section in ("all", "display") else (prev or {}).get("display", _def_display())
     cfg["panels"] = section_panels(cfg["display"], prev) if args.section in ("all", "panels") else (prev or {}).get("panels", [])
     cfg["tunnel"] = section_tunnel(cfg["panels"], prev) if args.section in ("all", "tunnel") else (prev or {}).get("tunnel", {"enabled": False})
-    cfg["vpn"] = section_vpn(prev) if args.section in ("all", "vpn") else (prev or {}).get("vpn", {"enabled": False})
+    cfg["vpns"] = (section_vpns(prev) if args.section in ("all", "vpn")
+                   else cfg_vpns(prev or {}))
     cfg["proxy"] = section_proxy(prev) if args.section in ("all", "proxy") else (prev or {}).get("proxy", {"enabled": False})
 
+    cfg_vpn_list = cfg_vpns(cfg)
+    any_vpn = any(v.get("enabled") for v in cfg_vpn_list)
     soc_env = None
     if args.section in ("all", "vault"):
-        soc_env = section_vault(paths, load_env_file(paths["soc_env"]), cfg["vpn"].get("enabled"))
+        soc_env = section_vault(paths, load_env_file(paths["soc_env"]), any_vpn)
     if args.section in ("all", "server"):
         section_server(paths, args.dry_run)   # guidance only — Vaultwarden has no .env
 
     # Summary
     banner("Review")
+    enabled_vpns = [v for v in cfg_vpn_list if v.get("enabled")]
     print(f"   {len(cfg['panels'])} panel(s); "
           f"tunnel {'ON' if cfg['tunnel'].get('enabled') else 'off'}; "
-          f"VPN {'ON' if cfg['vpn'].get('enabled') else 'off'}; "
+          f"VPN {len(enabled_vpns)} enabled; "
           f"proxy {'ON' if cfg.get('proxy', {}).get('enabled') else 'off'}")
+    for v in enabled_vpns:
+        owner = "  [default-route]" if v.get("default_route") else ""
+        print(dim(f"     - vpn {v.get('name', '?')} [{v.get('type', 'fortinet')}]{owner}"))
     for p in cfg["panels"]:
         tgt = p.get("url") or f"tunnel:{p.get('tunnel', {}).get('local_port')}"
         print(dim(f"     - {p['id']} [{p['engine']}/{p['mode']}] {tgt}  <- {p['vault_item']}"))

@@ -610,7 +610,17 @@ fi
 # --------------------------------------------------------------------------- #
 # has panels.yaml configured tunnels / a VPN? (used to enable services)
 want_tunnel(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;c=config.load('$ETC/panels.yaml');sys.exit(0 if any(p.mode=='tunnel' for p in c.panels) and c.tunnel.get('enabled',True) else 1)"; }
-want_vpn(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config;v=config.load('$ETC/panels.yaml').vpn or {};k=config.vpn_kind(v);ok=bool(v.get('enabled')) and ((k=='fortinet' and v.get('gateway')) or (k in ('openvpn','wireguard') and v.get('config')));sys.exit(0 if ok else 1)"; }
+# want_vpn: enable forti-vpn.service if ANY vpns[] entry is enabled + complete
+# (the single unit fans out to N supervisors). Iterates conf.vpns so a multi-VPN
+# config — or a legacy vpn:{} normalized to one entry — is handled the same way.
+want_vpn(){ "$SOC_ROOT/.venv/bin/python" -c "import sys;sys.path.insert(0,'$SOC_ROOT/kiosk-host');from host import config
+def complete(v):
+    k=config.vpn_kind(v); fv=bool(v.get('config_from_vault'))
+    if k in ('fortinet','inode'): return bool(v.get('gateway') and v.get('vault_item'))
+    return bool(v.get('vault_item') if fv else v.get('config'))
+vs=config.load('$ETC/panels.yaml').vpns or []
+ok=any(isinstance(v,dict) and v.get('enabled') and complete(v) for v in vs)
+sys.exit(0 if ok else 1)"; }
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
   log "Installing systemd services (vaultwarden, autossh-tunnel, forti-vpn, soc-wall, soc-tarpit)"

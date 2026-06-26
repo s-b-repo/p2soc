@@ -143,3 +143,77 @@ def test_validate_catches_broken_cfg(tmp_path):
     if len(cfg["panels"]) >= 2:
         cfg["panels"][1]["id"] = cfg["panels"][0]["id"]
         assert model.validate() != []
+
+
+# --------------------------------------------------------------------------- #
+# Multi-VPN: the wizard/CLI vpns[] LIST (config + GUI normalize must agree)
+# --------------------------------------------------------------------------- #
+def test_gui_normalize_legacy_single_vpn():
+    """A legacy `vpn: {}` (single dict) normalizes to a one-entry vpns[] with a
+    stable default name, and the back-compat `vpn` mirror tracks vpns[0]."""
+    setup = setupgui._load_setup()
+    n = setupgui.normalize_cfg(
+        {"vpn": {"enabled": True, "type": "wireguard", "config": "/x.conf"}}, setup)
+    assert [v["name"] for v in n["vpns"]] == ["vpn"]
+    assert n["vpns"][0]["type"] == "wireguard"
+    assert n["vpn"]["type"] == "wireguard"   # back-compat mirror
+
+
+def test_gui_normalize_vpns_list_and_vpnless():
+    setup = setupgui._load_setup()
+    n = setupgui.normalize_cfg({"vpns": [
+        {"name": "corp", "enabled": True, "type": "fortinet"},
+        {"enabled": True, "type": "wireguard", "config": "/lab.conf"},
+    ]}, setup)
+    # names: explicit kept; unnamed second gets a deterministic fill
+    assert [v["name"] for v in n["vpns"]] == ["corp", "vpn2"]
+    # vpn-less stays vpn-less
+    n2 = setupgui.normalize_cfg({}, setup)
+    assert n2["vpns"] == []
+    assert n2["vpn"] == {"enabled": False}
+
+
+def test_gui_def_vpn_unique_names():
+    a, b = setupgui._def_vpn(0), setupgui._def_vpn(1)
+    assert a["name"] == "vpn" and b["name"] == "vpn2"
+    assert a["enabled"] is False and a["default_route"] is False
+
+
+def test_model_multi_vpn_round_trips_and_validates(tmp_path):
+    """A multi-VPN cfg renders to vpns:[] YAML and re-parses to N entries; a single
+    plain VPN stays a byte-stable `vpn:` block."""
+    setup = setupgui._load_setup()
+    model = setupgui.WizardModel(setup, setup.resolve_paths("dev"))
+    cfg = model.cfg()
+    cfg["vpns"] = [
+        {"name": "corp", "enabled": True, "type": "fortinet", "gateway": "g.example.com",
+         "port": 443, "vault_item": "Corp VPN", "trusted_cert": "", "realm": "",
+         "set_routes": True, "set_dns": False, "half_internet_routes": False,
+         "persistent": 0, "otp_from_vault": False, "default_route": True},
+        {"name": "lab", "enabled": True, "type": "wireguard", "config": "/etc/wireguard/lab.conf"},
+        {"name": "dc", "enabled": True, "type": "openvpn", "config": "/etc/openvpn/dc.ovpn",
+         "vault_item": "DC VPN", "set_routes": True},
+    ]
+    model.set_cfg(cfg)
+    assert model.validate() == []
+    y = model.panels_yaml()
+    assert "vpns:" in y and "\nvpn:\n" not in y
+    conf = config.load_str(y)
+    assert [v.get("name") for v in conf.vpns] == ["corp", "lab", "dc"]
+    assert [v.get("name") for v in conf.vpns if v.get("default_route")] == ["corp"]
+
+
+def test_model_rejects_duplicate_names_and_two_default_routes():
+    setup = setupgui._load_setup()
+    model = setupgui.WizardModel(setup, setup.resolve_paths("dev"))
+    cfg = model.cfg()
+    cfg["vpns"] = [
+        {"name": "dup", "enabled": True, "type": "wireguard", "config": "/a.conf",
+         "default_route": True},
+        {"name": "dup", "enabled": True, "type": "wireguard", "config": "/b.conf",
+         "default_route": True},
+    ]
+    model.set_cfg(cfg)
+    problems = "\n".join(model.validate())
+    assert "duplicate" in problems
+    assert "at most one" in problems
