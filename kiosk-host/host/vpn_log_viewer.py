@@ -38,6 +38,8 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk     # noqa: E402
 
+from . import style                          # noqa: E402
+
 
 # The single VPN supervisor unit (this tree is single-VPN; the unit drives
 # Fortinet/OpenVPN/WireGuard internally based on vpn.type).
@@ -123,7 +125,15 @@ class VpnLogViewer:
 
     # ---- window construction ------------------------------------------ #
     def _build(self):
+        # Install the wall palette so this window's labels/buttons get the
+        # explicit light-on-dark colours. Without this, the screen-wide CSS
+        # still forces the window background dark (#0b1020) while bare
+        # Gtk.Labels keep the operator desktop theme's near-black text — i.e.
+        # dark-on-dark, ~1.5:1 contrast on a light GTK theme. Tagging the
+        # window + labels with the soc-config-* classes fixes the contrast.
+        style.apply_css()
         self._win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self._win.get_style_context().add_class("soc-config")
         self._win.set_title("SOC wall — VPN log")
         self._expanded_size = (720, 460)
         self._win.set_default_size(*self._expanded_size)
@@ -143,6 +153,7 @@ class VpnLogViewer:
             "tap Expand to see the log again. Esc closes the window.")
         self._collapse_btn.connect("clicked", lambda *_: self.toggle_collapsed())
         self._summary = Gtk.Label(label=f"VPN log — {_VPN_UNIT} (streaming)")
+        self._summary.get_style_context().add_class("soc-config-sub")
         self._summary.set_xalign(0.0)
         self._summary.set_hexpand(True)
         close_btn = Gtk.Button(label="✕")
@@ -155,6 +166,7 @@ class VpnLogViewer:
 
         if not self._sudo:
             warn = Gtk.Label()
+            warn.get_style_context().add_class("soc-config-error")
             warn.set_xalign(0.0)
             warn.set_line_wrap(True)
             warn.set_markup(
@@ -169,6 +181,7 @@ class VpnLogViewer:
         # Action row: Reconnect + Clear.
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         unit_lbl = Gtk.Label()
+        unit_lbl.get_style_context().add_class("soc-config-sub")
         unit_lbl.set_xalign(0.0)
         unit_lbl.set_markup(f"<tt>{GLib.markup_escape_text(_VPN_UNIT)}</tt>")
         head.pack_start(unit_lbl, True, True, 0)
@@ -250,6 +263,15 @@ class VpnLogViewer:
                 f"  host as root, or add a sudoers drop-in permitting\n"
                 f"  `journalctl -u {_VPN_UNIT} *`.\n")
             return
+        # Empty-state placeholder: if the VPN unit has never run on this box,
+        # `-n 100` yields zero lines and the view sits blank with no
+        # explanation. Seed one waiting line so the operator always sees that
+        # the stream is live and just has nothing to show yet (real journal
+        # lines append after it).
+        self._append(
+            f"[viewer] waiting for {_VPN_UNIT} log output…\n"
+            f"[viewer] (no lines yet means the VPN service has not run, or "
+            f"has produced no journal entries on this host)\n")
         # Watch the subprocess's stdout fd for new data. GLib invokes
         # _on_io on the GTK thread, so we can append without locks.
         fd = self._proc.stdout.fileno()

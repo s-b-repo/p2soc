@@ -1551,9 +1551,18 @@ class SetupAssistant:
         page.pack_start(fields, False, False, 0)
 
         vtype = Gtk.ComboBoxText()
-        for t in ("fortinet", "openvpn", "wireguard", "inode"):
+        _VPN_TYPES = ("fortinet", "openvpn", "wireguard", "inode")
+        for t in _VPN_TYPES:
             vtype.append_text(t)
-        vtype.set_active(0)
+        # Restore the SAVED type (like every other combo on the wizard) instead of
+        # always forcing fortinet. Without this, reopening the wizard on an
+        # openvpn/wireguard/inode box reset the type to fortinet and collect()
+        # (run on init below) then clobbered the saved VPN config with fortinet
+        # defaults — silent data loss for the operator's VPN settings.
+        try:
+            vtype.set_active(_VPN_TYPES.index(v.get("type", "fortinet")))
+        except ValueError:
+            vtype.set_active(0)
         fields.pack_start(self._row("VPN type", vtype), False, False, 0)
 
         gateway = self._entry(v.get("gateway", ""), self.setup.v_host,
