@@ -57,26 +57,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-
-      - name: Install test dependencies
+      # The GUI host imports PyGObject (gi) at module scope, so the suite needs
+      # system GTK + a display — mirror the Pi/dev environment with distro
+      # packages + Xvfb rather than actions/setup-python (whose interpreter can't
+      # see apt's gi typelibs). cryptography/PyYAML/websocket come from apt too.
+      - name: Install GTK + Python test deps (system python)
         run: |
-          python -m pip install --upgrade pip
-          # cryptography from a wheel only — never source-build (Rust ext.),
-          # mirroring the Makefile's --only-binary policy.
-          python -m pip install --only-binary=:all: \
-            PyYAML websocket-client cryptography pytest
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-gi gir1.2-gtk-3.0 \
+            python3-yaml python3-cryptography python3-pytest xvfb
+          sudo apt-get install -y --no-install-recommends gir1.2-webkit2-4.1 || true
+          sudo apt-get install -y --no-install-recommends python3-websocket \
+            || python3 -m pip install --break-system-packages websocket-client
 
-      - name: Run unit tests
+      - name: Run unit tests (headless display via Xvfb)
         env:
           SOC_VAULT_BACKEND: dev
         run: |
           cd kiosk-host
-          python -m pytest tests/ -q
+          xvfb-run -a python3 -m pytest tests/ -q
 
   # ---------------------------------------------------------------------------
   # arm-gate — assert no compile-on-Pi / wrong-arch regression. Skips cleanly
