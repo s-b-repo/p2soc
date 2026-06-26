@@ -42,6 +42,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
 from . import totp as _totp  # noqa: E402
+from . import style as _style  # noqa: E402
 
 try:
     from . import secretstore as _secretstore  # noqa: E402
@@ -170,6 +171,16 @@ class KioskLocker:
 
     # --- internals -----
     def _build(self):
+        # Install the screen-wide wall CSS so the lock card's soc-config-* classes
+        # resolve. The live wall (main.py) only installs scoped providers for the
+        # unlock dialog, never style.apply_css(); without this the lock overlay's
+        # title/hint/error labels fall back to the operator's GTK stock theme —
+        # near-black text on the 55%-black overlay (dark-on-dark, unreadable).
+        # apply_css() is idempotent + GTK-only, safe to call here on the main loop.
+        try:
+            _style.apply_css()
+        except Exception:                          # noqa: BLE001 — never block lock
+            pass
         win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         win.set_decorated(False)
         win.set_resizable(False)
@@ -206,8 +217,11 @@ class KioskLocker:
         # Esc/F11 must not bypass the lock.
         win.connect("key-press-event", self._on_key)
 
-        # Centered unlock card.
+        # Centered unlock card. Tag it soc-config so it gets the solid dark panel
+        # background (#0b1020) — otherwise the card is a transparent frame and the
+        # entry/labels float on the dim overlay with no readable card surface.
         card = Gtk.Frame()
+        card.get_style_context().add_class("soc-config")
         card.set_halign(Gtk.Align.CENTER)
         card.set_valign(Gtk.Align.CENTER)
         card.set_size_request(380, 230)

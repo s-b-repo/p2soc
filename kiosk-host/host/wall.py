@@ -241,6 +241,7 @@ class WallWindow:
                 area.pack_start(link, False, False, 0)
             except Exception:                          # noqa: BLE001
                 fall = Gtk.Label(label=url)
+                fall.get_style_context().add_class("soc-config-sub")
                 fall.set_xalign(0.0)
                 area.pack_start(fall, False, False, 0)
 
@@ -248,6 +249,11 @@ class WallWindow:
             if not items:
                 return
             hdr = Gtk.Label()
+            # soc-config-sub gives the explicit light palette colour: without a
+            # theme class the bold title inherits the operator desktop theme's
+            # near-black text, which is ~1.5:1 on the dark dialog bg (#0b1020)
+            # under a light GTK theme — dark-on-dark.
+            hdr.get_style_context().add_class("soc-config-sub")
             hdr.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>  "
                            f"<span color='#888'>({len(items)})</span>")
             hdr.set_xalign(0.0)

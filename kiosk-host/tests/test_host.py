@@ -1016,10 +1016,16 @@ def _run_restart_vpn_service(hostmain, monkeypatch, *, fail):
     monkeypatch.setattr(_sub, "run", fake_run)
     monkeypatch.setattr(_thr, "Thread", InlineThread)
     monkeypatch.setattr(hostmain, "log", logs.append)
+    # on_done is now marshalled to the GTK main thread via GLib.idle_add (it may
+    # touch widgets); run it inline so the synchronous test still sees it fire.
+    monkeypatch.setattr(hostmain.GLib, "idle_add",
+                        lambda fn, *a: fn(*a))
 
     app = object.__new__(hostmain.KioskHost)        # no GTK app/window needed
     done = []
-    app._restart_vpn_service("ok!", "bad!", on_done=lambda: done.append(True))
+    # on_done now receives (ok, info) so the caller can surface the outcome.
+    app._restart_vpn_service("ok!", "bad!",
+                             on_done=lambda ok, info: done.append((ok, info)))
     return calls, logs, done
 
 
@@ -1036,7 +1042,7 @@ def test_restart_vpn_service_shape_and_on_done(monkeypatch):
     assert calls["kw"]["stdout"] == subprocess.PIPE
     assert calls["kw"]["stderr"] == subprocess.PIPE
     assert logs == ["ok!"]                           # success message
-    assert done == [True]                            # on_done ran
+    assert done == [(True, "ok")]                    # on_done ran with (ok, info)
 
 
 def test_restart_vpn_service_failure_surfaces_stderr_and_runs_on_done(monkeypatch):
@@ -1047,7 +1053,40 @@ def test_restart_vpn_service_failure_surfaces_stderr_and_runs_on_done(monkeypatc
     # fail message now carries the systemctl stderr (no longer swallowed)
     assert len(logs) == 1 and logs[0].startswith("bad!")
     assert "access denied" in logs[0]
-    assert done == [True]                                  # on_done still runs
+    assert len(done) == 1 and done[0][0] is False          # on_done ran, ok=False
+    assert "access denied" in done[0][1]                   # info carries stderr
+
+
+def test_vpn_reconnect_done_surfaces_privilege_guidance(monkeypatch):
+    """A refused reconnect (no NOPASSWD sudo) must put an actionable reason on the
+    pill tooltip — not just snap the pill back to 'down' with the cause hidden in
+    a log the kiosk operator never sees."""
+    from host import main as hostmain
+
+    monkeypatch.setattr(hostmain.GLib, "timeout_add_seconds",
+                        lambda *a, **k: 0)
+
+    class _Pill:
+        def __init__(self):
+            self.tip = None
+
+        def set_tooltip_text(self, t):
+            self.tip = t
+
+    class _Wall:
+        def __init__(self):
+            self.vpn_pill = _Pill()
+
+    app = object.__new__(hostmain.KioskHost)
+    app.wall = _Wall()
+
+    app._vpn_reconnect_done(False, "no NOPASSWD sudo for systemctl")
+    tip = app.wall.vpn_pill.tip
+    assert tip and "privilege" in tip and "VPN-log" in tip   # guidance, not silence
+
+    # Success clears the guidance back to the neutral hint.
+    app._vpn_reconnect_done(True, "ok")
+    assert "re-check / reconnect" in app.wall.vpn_pill.tip
 
 
 def test_can_systemctl_restart_root_is_true(monkeypatch):

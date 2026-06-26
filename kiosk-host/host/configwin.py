@@ -457,24 +457,32 @@ class ConfigWindow(Gtk.Window):
             return
         url = os.environ.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
         email = os.environ.get("SOC_VAULT_EMAIL", "")
-        # Prefer the host-bound sealed master; fall back to the at-the-glass entry
-        # only when the wall isn't sealed. Never read a plaintext SOC_VAULT_PASSWORD.
-        from . import secretstore
         sd = os.environ.get("SOC_SECRET_DIR")
-        try:
-            master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
-        except Exception:  # noqa: BLE001 — fall back to the manual entry below
-            master = ""
-        if not master and self._cred_master:
-            master = self._cred_master.get_text()
-        if not (email and master):
-            self._cred_msg.set_text("need the vault email + master password to write")
-            return
+        # Read the at-the-glass entry NOW (GTK widget access must stay on the main
+        # thread); the host-bound unseal — scrypt KDF, ~100-300ms on the 1GB Pi —
+        # is deferred into the worker so it can't freeze the wall's UI on Save.
+        typed_master = self._cred_master.get_text() if self._cred_master else ""
         self._cred_msg.set_text(f"writing '{name}' …")
         import threading
 
         def work():
+            master = ""
             try:
+                # Prefer the host-bound sealed master; fall back to the at-the-glass
+                # entry only when the wall isn't sealed. Never read a plaintext
+                # SOC_VAULT_PASSWORD.
+                from . import secretstore
+                try:
+                    master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
+                except Exception:  # noqa: BLE001 — fall back to the manual entry
+                    master = ""
+                if not master:
+                    master = typed_master
+                if not (email and master):
+                    GLib.idle_add(self._cred_done,
+                                  "need the vault email + master password to write",
+                                  pass_e)
+                    return
                 from . import vaultseed
                 if not vaultseed.available():
                     msg = "'cryptography' not installed — add the login in the web vault"
@@ -483,7 +491,12 @@ class ConfigWindow(Gtk.Window):
                                                     secret, uri=uri or None)
                     msg = f"{action} '{name}' in Vaultwarden ✓"
             except Exception as e:  # noqa: BLE001
-                msg = f"{name}: {e}"
+                # Raw cause + a remedy: the usual failures are a wrong master,
+                # a down/unreachable Vaultwarden, or a rejected login payload.
+                msg = (f"{name}: {e} — check the vault master is correct and "
+                       f"Vaultwarden is reachable at {url}, then retry")
+            finally:
+                master = ""
             GLib.idle_add(self._cred_done, msg, pass_e)
         threading.Thread(target=work, daemon=True).start()
 
@@ -683,7 +696,13 @@ class ConfigWindow(Gtk.Window):
         if not r.ok:
             self._sec_state.set_text("PIN rejected — " + "; ".join(r.issues))
             return
-        set_pin(pin)
+        try:
+            set_pin(pin)
+        except OSError as e:
+            self._sec_state.set_text(
+                f"could not save the PIN: {e} — check that {state_dir()} is "
+                f"writable (disk space / permissions).")
+            return
         self._newpin.set_text("")
         self._sec_state.set_text("PIN updated — it will be required next time.")
 
@@ -752,7 +771,13 @@ class ConfigWindow(Gtk.Window):
         if not r.ok:
             self._pl_state.set_text("PIN rejected — " + "; ".join(r.issues))
             return
-        _lk.set_pin(state_dir(), pin)
+        try:
+            _lk.set_pin(state_dir(), pin)
+        except OSError as e:
+            self._pl_state.set_text(
+                f"could not save the lock PIN: {e} — check that {state_dir()} "
+                f"is writable (disk space / permissions).")
+            return
         self._pl_pin.set_text("")
         self._pl_state.set_text(self._panel_lock_status_text())
 
@@ -835,7 +860,13 @@ class ConfigWindow(Gtk.Window):
             overrides["_vpn"] = vpncfg
             changes["_vpn"] = vpncfg
 
-        save_overrides(overrides)
+        try:
+            save_overrides(overrides)
+        except OSError as e:  # noqa: BLE001 — disk full / dir not writable
+            self._msg(f"could not save settings: {e} — check that "
+                      f"{state_dir()} is writable (disk space / permissions)",
+                      error=True)
+            return
         try:
             self.on_apply(changes)
         except Exception as e:  # noqa: BLE001 — never let a bad apply kill the window

@@ -508,7 +508,8 @@ class KioskHost:
         path (root, or the NOPASSWD sudoers drop-in install.sh writes). The
         single unit supervises Fortinet/OpenVPN/WireGuard. On failure the
         systemctl stderr is surfaced (no longer swallowed) so the operator
-        knows why the reconnect didn't take. Schedules on_done() if given."""
+        knows why the reconnect didn't take. Schedules on_done(ok, info) if
+        given so the caller can surface the outcome on-screen (not just log it)."""
         import threading
 
         def work():
@@ -518,8 +519,32 @@ class KioskHost:
             else:
                 log(f"{fail_msg} ({info})")
             if on_done is not None:
-                on_done()
+                # on_done may touch GTK widgets (pill tooltip), so hop to the
+                # main thread — work() is on a daemon worker.
+                GLib.idle_add(on_done, ok, info)
         threading.Thread(target=work, daemon=True).start()
+
+    def _vpn_reconnect_done(self, ok, info):
+        """Reconnect finished. On a privilege refusal the pill would otherwise
+        just snap back to 'down' with the reason buried in a log the kiosk
+        operator never sees — surface it as a pill tooltip pointing at the VPN
+        log viewer, so the click isn't a silent dead-end. Then re-poll."""
+        if self.wall is not None and self.wall.vpn_pill is not None:
+            if ok:
+                tip = "VPN status — click to re-check / reconnect"
+            elif "no NOPASSWD sudo" in (info or ""):
+                tip = ("Reconnect needs privilege this user doesn't have. Run the "
+                       "wall as root, or let install.sh add the NOPASSWD systemctl "
+                       "sudoers rule. Click the \U0001f4dc VPN-log button for details.")
+            else:
+                tip = (f"Reconnect failed: {info}\nClick the \U0001f4dc VPN-log "
+                       f"button to see the supervisor output.")
+            try:
+                self.wall.vpn_pill.set_tooltip_text(tip)
+            except Exception:  # noqa: BLE001 — tooltip is a nicety, never fatal
+                pass
+        GLib.timeout_add_seconds(2, self._poll_vpn)
+        return False
 
     def vpn_action(self):
         """Pill click: show 'checking', best-effort reconnect, then re-poll. The
@@ -532,7 +557,7 @@ class KioskHost:
         self._restart_vpn_service(
             "VPN reconnect requested (systemctl restart forti-vpn)",
             "VPN reconnect not permitted from the wall; re-checking",
-            on_done=lambda: GLib.timeout_add_seconds(2, self._poll_vpn))
+            on_done=self._vpn_reconnect_done)
 
     # ---- on-screen configuration ------------------------------------------
     def open_config(self):

@@ -144,10 +144,30 @@ def _cli(argv) -> int:
     return 2
 
 
+def _perm_remedy(op: str, e: PermissionError) -> str:
+    """Turn a raw PermissionError into an actionable line. The Vaultwarden data
+    dir (/var/lib/vaultwarden) is root-owned, so a non-root desktop operator
+    running this directly hits EACCES — tell them HOW to proceed instead of
+    dumping a traceback (the 'never strand the operator' guarantee)."""
+    return (
+        f"error: {op} failed: {e}\n"
+        "  The Vaultwarden data dir is owned by root, so this must run with\n"
+        "  privilege. Re-run with sudo, preserving the passphrase via STDIN/env\n"
+        "  (never on argv), e.g.:\n"
+        "    SOC_BACKUP_PASSPHRASE=… sudo -E scripts/vault-backup.sh "
+        f"{op} …\n"
+        "  or pick a destination/source your user can read+write."
+    )
+
+
 if __name__ == "__main__":
     import sys
     try:
         sys.exit(_cli(sys.argv))
     except BackupError as e:
         print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except PermissionError as e:
+        op = sys.argv[1] if len(sys.argv) > 1 else "backup"
+        print(_perm_remedy(op, e), file=sys.stderr)
         sys.exit(1)
