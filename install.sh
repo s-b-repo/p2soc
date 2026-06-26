@@ -783,17 +783,16 @@ fi
 # desktop mode. Guarded so a repo that hasn't shipped the asset yet (or a trimmed
 # deploy) degrades gracefully.
 #
-# The setup + appearance companion entries are still installed (the control center's
-# scripts exec them, and SOC_RETURN_TO_MENU re-execs setup) but they ship with
-# NoDisplay=true so only "SOC Video Wall" shows in application menus.
+# Single advertised entry: only "SOC Video Wall" (soc-wall.desktop) ships. The
+# control center launches Setup + Appearance via scripts/soc-wall-setup-gui.sh /
+# soc-wall-appearance.sh (not via separate .desktop files), so we chmod +x those
+# helpers below but install no companion XDG entries.
 #
 # Rebrand-aware: the control-center .desktop entry is GENERATED from branding
 # (host.branding) so an operator's name/tagline/icon flow into the launcher, and the
 # branding source is installed under $ETC for in-place editing. Falls back to the
 # static asset when branding/python isn't available (trimmed deploy / pre-venv).
 DESKTOP_FILE=""
-SETUP_DESKTOP_FILE=""
-APPEARANCE_DESKTOP_FILE=""
 ICON_FILE=""
 BRANDING_FILE=""
 VENV_PY="$SOC_ROOT/.venv/bin/python"
@@ -851,36 +850,12 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
     fi
   fi
 
-  # Companion entry: "SOC Wall Setup" — the graphical config wizard. SECONDARY +
-  # HIDDEN (the source ships NoDisplay=true): the control center launches Setup, so
-  # this entry exists only so its .sh stays installed + reachable by path. Static
-  # copy (product-neutral name, NOT regenerated from branding); chmod +x the gui
-  # launcher so the entry works.
-  SETUP_DESKTOP_DST="/usr/share/applications/soc-wall-setup.desktop"
-  if [ -f "$SOC_ROOT/soc-wall-setup.desktop" ]; then
-    install -Dm0644 "$SOC_ROOT/soc-wall-setup.desktop" "$SETUP_DESKTOP_DST"
-    SETUP_DESKTOP_FILE="$SETUP_DESKTOP_DST"
-    log "installed setup launcher -> $SETUP_DESKTOP_DST"
-    [ -f "$SOC_ROOT/scripts/soc-wall-setup-gui.sh" ] && \
-      chmod +x "$SOC_ROOT/scripts/soc-wall-setup-gui.sh" 2>/dev/null || true
-  else
-    warn "no $SOC_ROOT/soc-wall-setup.desktop — skipping setup launcher entry"
-  fi
-
-  # Companion entry: "SOC Wall Appearance" — the graphical theme editor. SECONDARY +
-  # HIDDEN (the source ships NoDisplay=true): the control center opens Appearance
-  # in-process, so this entry exists only so its .sh stays installed. Static copy
-  # (product-neutral name, NOT regenerated from branding); chmod +x the launcher.
-  APPEARANCE_DESKTOP_DST="/usr/share/applications/soc-wall-appearance.desktop"
-  if [ -f "$SOC_ROOT/soc-wall-appearance.desktop" ]; then
-    install -Dm0644 "$SOC_ROOT/soc-wall-appearance.desktop" "$APPEARANCE_DESKTOP_DST"
-    APPEARANCE_DESKTOP_FILE="$APPEARANCE_DESKTOP_DST"
-    log "installed appearance launcher -> $APPEARANCE_DESKTOP_DST"
-    [ -f "$SOC_ROOT/scripts/soc-wall-appearance.sh" ] && \
-      chmod +x "$SOC_ROOT/scripts/soc-wall-appearance.sh" 2>/dev/null || true
-  else
-    warn "no $SOC_ROOT/soc-wall-appearance.desktop — skipping appearance launcher entry"
-  fi
+  # The control center execs these helpers by path (bash <sh>); chmod +x so direct
+  # exec works too. No companion .desktop entries — soc-wall.desktop is the sole entry.
+  [ -f "$SOC_ROOT/scripts/soc-wall-setup-gui.sh" ] && \
+    chmod +x "$SOC_ROOT/scripts/soc-wall-setup-gui.sh" 2>/dev/null || true
+  [ -f "$SOC_ROOT/scripts/soc-wall-appearance.sh" ] && \
+    chmod +x "$SOC_ROOT/scripts/soc-wall-appearance.sh" 2>/dev/null || true
 
   # refresh the desktop + icon caches best-effort (absent on headless/minimal)
   command -v update-desktop-database >/dev/null 2>&1 && \
@@ -963,8 +938,6 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
   [ "$SOC_TARPIT_ENABLE" = "1" ] && \
     printf 'FILE|%s/tarpit.env|tarpit arm-flag (remove on uninstall)\n' "$ETC"
   [ -n "$DESKTOP_FILE" ] && printf 'FILE|%s|XDG desktop launcher (rebrand-generated; remove on uninstall)\n' "$DESKTOP_FILE"
-  [ -n "$SETUP_DESKTOP_FILE" ] && printf 'FILE|%s|XDG setup launcher (remove on uninstall)\n' "$SETUP_DESKTOP_FILE"
-  [ -n "$APPEARANCE_DESKTOP_FILE" ] && printf 'FILE|%s|XDG appearance launcher (remove on uninstall)\n' "$APPEARANCE_DESKTOP_FILE"
   [ -n "$ICON_FILE" ]    && printf 'FILE|%s|app icon (remove on uninstall)\n' "$ICON_FILE"
   # branding source lives under $ETC -> operator data, preserved unless --purge
   [ -n "$BRANDING_FILE" ] && printf 'FILE|%s|branding source (preserve unless --purge; edit to rebrand)\n' "$BRANDING_FILE"

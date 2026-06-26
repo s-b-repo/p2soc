@@ -61,15 +61,9 @@ desktop-dev: .venv  ## install user-level app icons pointing at THIS checkout (n
 	@install -m0644 share/icons/soc-wall.svg $(HOME)/.local/share/icons/hicolor/scalable/apps/soc-wall.svg
 	@PYTHONPATH=kiosk-host SOC_ROOT="$(CURDIR)" $(PY) -m host.branding desktop \
 	  "$(CURDIR)/scripts/soc-wall-menu" soc-wall > $(HOME)/.local/share/applications/soc-wall.desktop
-	@printf '%s\n' '[Desktop Entry]' 'Name=SOC Wall Setup' 'Comment=Configure the SOC video wall' \
-	  'Exec=$(CURDIR)/scripts/soc-wall-setup-gui.sh' 'Icon=soc-wall' 'Terminal=false' \
-	  'Type=Application' 'NoDisplay=true' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-setup.desktop
-	@printf '%s\n' '[Desktop Entry]' 'Name=SOC Wall Appearance' 'Comment=Theme colours and presets' \
-	  'Exec=$(CURDIR)/scripts/soc-wall-appearance.sh' 'Icon=soc-wall' 'Terminal=false' \
-	  'Type=Application' 'NoDisplay=true' 'Categories=Settings;' > $(HOME)/.local/share/applications/soc-wall-appearance.desktop
 	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
 	@command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
-	@echo "dev app icons installed -> $(HOME)/.local/share/applications (only 'SOC Video Wall' is advertised; Setup + Appearance are NoDisplay, reached via the control center)"
+	@echo "dev app icons installed -> $(HOME)/.local/share/applications (only 'SOC Video Wall' ships; Setup + Appearance are reached from inside the control center)"
 
 .PHONY: verify
 verify: .venv dev-vault  ## headless end-to-end check (Xvfb) — asserts logins + tunnel + screenshot

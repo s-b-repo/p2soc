@@ -725,6 +725,142 @@ def load_config(vault: Vault) -> cfg.Config:
     return cfg.load(panels_file)
 
 
+def _unlock_dialog(email: str, url: str, timeout: float = 180.0):
+    """Themed, time-boxed 'Unlock Vaultwarden' prompt shown at startup when the
+    host is not sealed (no usable master) or the vault is locked — instead of the
+    cryptic 'no vault master password' fatal. Runs on the GTK main thread (startup
+    is single-threaded, pre-Gtk.main), so a plain nested dialog loop is correct.
+
+    Returns (master, seal_it): the entered master (kept in RAM only — NEVER written
+    to a file) and whether the operator asked to seal it host-bound for next boot.
+    Returns (None, False) on Cancel/close/timeout so the caller falls through to the
+    fail-safe screen. The 'Seal for next boot' check defaults ON for unattended use,
+    but the master is only ever sealed via secretstore (AES-GCM, host-bound) — the
+    plaintext never touches soc.env or any file, preserving no-plaintext-master."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return (None, False)  # headless: can't prompt; let the fatal path log it
+    try:
+        from gi.repository import GLib as _GLib
+        try:
+            from . import branding
+            c = branding.load().get("colors", {})
+        except Exception:  # noqa: BLE001 — theming is best-effort
+            c = {}
+        bg, text = c.get("background", "#FFFFFF"), c.get("text", "#0B1F14")
+        dim = c.get("text_dim", "#5B7567")
+        primary = c.get("primary", "#1FA463")
+        bad = c.get("bad", "#C0341D")
+        prov = Gtk.CssProvider()
+        prov.load_from_data(
+            (f"dialog, window {{ background-color: {bg}; color: {text}; }}"
+             f".u-title {{ color: {text}; }} .u-sub {{ color: {dim}; }}"
+             f".u-err {{ color: {bad}; }}"
+             f"entry {{ caret-color: {primary}; }}").encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        dlg = Gtk.Dialog(title="Unlock Vaultwarden")
+        dlg.set_default_size(460, -1)
+        if os.environ.get("SOC_WINDOW_MODE") != "window":
+            dlg.set_keep_above(True)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        ok_btn = dlg.add_button("Unlock", Gtk.ResponseType.OK)
+        ok_btn.get_style_context().add_class("suggested-action")
+        dlg.set_default_response(Gtk.ResponseType.OK)
+
+        box = dlg.get_content_area()
+        box.set_spacing(10)
+        box.set_margin_top(18)
+        box.set_margin_bottom(8)
+        box.set_margin_start(22)
+        box.set_margin_end(22)
+
+        esc = (lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        title = Gtk.Label(xalign=0)
+        title.get_style_context().add_class("u-title")
+        title.set_markup("<span size='x-large' weight='bold'>Unlock Vaultwarden</span>")
+        box.pack_start(title, False, False, 0)
+        sub = Gtk.Label(xalign=0)
+        sub.get_style_context().add_class("u-sub")
+        sub.set_line_wrap(True)
+        sub.set_max_width_chars(52)
+        who = email or "this host"
+        sub.set_markup(f"<span size='small'>Enter the master password for "
+                       f"<b>{esc(who)}</b>{(' at ' + esc(url)) if url else ''} to unlock "
+                       f"the secrets vault for this session.</span>")
+        box.pack_start(sub, False, False, 0)
+
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        entry.set_placeholder_text("master password")
+        entry.set_activates_default(True)
+        box.pack_start(entry, False, False, 0)
+
+        seal_chk = Gtk.CheckButton(label="Seal on this host for next boot (no password file)")
+        seal_chk.set_active(True)
+        box.pack_start(seal_chk, False, False, 0)
+
+        err = Gtk.Label(xalign=0)
+        err.get_style_context().add_class("u-err")
+        err.set_line_wrap(True)
+        err.set_max_width_chars(52)
+        err.set_no_show_all(True)
+        box.pack_start(err, False, False, 0)
+
+        # Time-box: a headless wall must never wedge forever on a prompt nobody is
+        # at. On timeout, respond CANCEL so the caller hits the fail-safe screen.
+        timed_out = {"v": False}
+
+        def _expire():
+            timed_out["v"] = True
+            timed_out["src"] = None       # auto-removed by returning False
+            dlg.response(Gtk.ResponseType.CANCEL)
+            return False
+        timed_out["src"] = _GLib.timeout_add_seconds(int(max(1.0, timeout)), _expire)
+
+        dlg.show_all()
+        entry.grab_focus()
+        resp = dlg.run()
+        # Only remove a source that is still live (the operator answered before the
+        # timeout). Removing an already-fired source emits a noisy GLib-Warning.
+        if timed_out["src"] is not None:
+            try:
+                _GLib.source_remove(timed_out["src"])
+            except Exception:  # noqa: BLE001 — defensive; already gone
+                pass
+        master = entry.get_text()
+        seal_it = seal_chk.get_active()
+        dlg.destroy()
+        # Drain the destroy so the next GTK window starts clean.
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        if resp == Gtk.ResponseType.OK and master:
+            return (master, seal_it)
+        return (None, False)
+    except Exception as e:  # noqa: BLE001 — never let the prompt mask the real error
+        log(f"(could not show the unlock dialog: {e})")
+        return (None, False)
+
+
+def _try_seal_master(master: str):
+    """Best-effort host-bound seal of an operator-supplied master from the Unlock
+    dialog, so the next boot is unattended. AES-GCM under $SOC_SECRET_DIR via
+    secretstore — the master is NEVER written as plaintext. A failure here (e.g. a
+    read-only /etc on a locked-down box) is logged, not fatal: the vault is already
+    unlocked for this session."""
+    try:
+        from . import secretstore
+        import secrets as _secrets
+        pin = "".join(_secrets.choice("0123456789") for _ in range(6))
+        secretstore.seal(master, pin)
+        log("sealed the master host-bound — next boot unlocks unattended")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"could not seal the master ({e}); will prompt again next boot")
+        return False
+
+
 def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
     """Fail-safe: instead of exiting silently (which launcher.sh would just restart
     into a black screen, so the operator sees *nothing*), show a visible, themed
@@ -828,15 +964,58 @@ def main():
     # 1. open the vault FIRST — with the rbw backend the wall config itself lives
     #    in the vault, so it must be unlocked before we can read the config.
     #    Required: fail loudly if it will not open within the timeout.
+    # Interactive when a display is up: the litebw backend then DEFERS on a missing
+    # master (returns instead of raising) so the wall can pop the themed Unlock
+    # dialog below, rather than dying with the cryptic 'no vault master password'.
+    have_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if have_display and "SOC_VAULT_INTERACTIVE" not in os.environ:
+        os.environ["SOC_VAULT_INTERACTIVE"] = "1"
     vault = Vault(ttl=cfg.env_float("SOC_CRED_TTL", 30.0, lo=1.0))
     backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND)
     log(f"opening vault (backend={backend}) ...")
+    # VaultLockedError (litebw) is the catchable 'please unlock' signal — distinct
+    # from a real connect/auth failure, which still surfaces as VaultError.
+    try:
+        from .litebw import VaultLockedError
+    except Exception:  # noqa: BLE001 — non-litebw backends never raise it
+        class VaultLockedError(Exception):
+            pass
     ready_timeout = cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
     deadline = time.time() + ready_timeout
     while True:
         try:
             vault.open()
             break
+        except VaultLockedError:
+            # No usable master yet (host not sealed + no $SOC_VAULT_PASSWORD).
+            # Pop the interactive unlock prompt instead of the cryptic fatal.
+            email = getattr(vault.backend, "email", "") or os.environ.get("SOC_VAULT_EMAIL", "")
+            url = getattr(vault.backend, "url", "") or os.environ.get("SOC_VAULT_URL", "")
+            master, seal_it = _unlock_dialog(email, url)
+            if not master:
+                return _fatal_screen(
+                    "Vaultwarden is locked",
+                    "No master password is configured for the secrets vault, and the "
+                    "unlock prompt was cancelled, so the wall cannot read its logins.",
+                    "Run Setup to configure + seal the vault master, or relaunch and "
+                    "enter the master password when prompted.")
+            try:
+                vault.backend.unlock_with(master)   # RAM-only; never written to a file
+            except VaultError as e:
+                # Wrong password OR unreachable server — say which, then re-loop so
+                # the operator can retry within the deadline.
+                log(f"unlock failed: {e}")
+                if time.time() > deadline:
+                    return _fatal_screen(
+                        "Could not unlock Vaultwarden",
+                        f"The master password was rejected, or Vaultwarden could not be "
+                        f"reached.\n\n{e}",
+                        "Check the server URL/account in Setup, or the master password, "
+                        "then relaunch.")
+                continue
+            if seal_it:
+                _try_seal_master(master)
+            continue   # session is open now; re-run open() to sync
         except VaultError as e:
             if time.time() > deadline:
                 return _fatal_screen(

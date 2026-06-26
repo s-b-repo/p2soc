@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch the graphical SOC wall setup wizard (host.setupgui).
-# This is the clickable path (soc-wall-setup.desktop / the launcher's "Setup"
-# card). It sources the (tmpfs, 0600) env, sets PYTHONPATH to the in-tree host
+# The control center (soc-wall.desktop) execs this wrapper for its "Setup" card —
+# there is no separate setup .desktop entry. It sources the (tmpfs, 0600) env, sets PYTHONPATH to the in-tree host
 # package, requires a graphical display, and runs the wizard in the foreground.
 # Any extra args are passed through (e.g. --preset NAME --output DIR for headless
 # use, --list-presets), but the GUI is the default with no args.
