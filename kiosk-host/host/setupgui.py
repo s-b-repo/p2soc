@@ -523,11 +523,24 @@ combobox cellview, cellview {{ color: {text}; }}
 menuitem {{ color: {text}; padding: 3px 8px; }}
 menuitem:hover, menuitem:selected {{ background-color: {sunken}; color: {text}; }}
 /* A plain (unclassed) button on a page — give it the ghost look so it isn't a
-   stock white box on a dark theme (e.g. 'Test connection', 'Add panel'). The
-   Assistant's own nav buttons live in its headerbar and keep GTK's styling. */
+   stock white box on a dark theme (e.g. 'Test connection', 'Add panel'). */
 .soc-page button {{ background-image: none; background-color: {sunken};
   color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 5px 12px; }}
 .soc-page button:hover {{ border-color: {accent}; background-color: {sunken}; }}
+
+/* The Assistant's OWN nav buttons (Cancel/Back/Next/Apply) live in its headerbar.
+   GTK leaves them stock-light, so on a DARK palette the label inherits the theme's
+   light `color` while the button stays light -> unreadable ("the Next button is not
+   readable"). Theme them from the palette: plain = ghost; the suggested-action
+   (Next/Apply) = the primary accent fill with a palette-contrasting label. */
+.soc-assistant headerbar button {{ background-image: none; background-color: {sunken};
+  color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 5px 14px; }}
+.soc-assistant headerbar button:hover {{ border-color: {accent}; background-color: {sunken}; }}
+.soc-assistant headerbar button:disabled {{ color: {text_dim}; opacity: 1; }}
+.soc-assistant headerbar button.suggested-action {{ background-color: {accent_strong};
+  color: {btn_fg}; border-color: {accent_strong}; font-weight: bold; }}
+.soc-assistant headerbar button.suggested-action:hover {{ border-color: {accent};
+  box-shadow: inset 0 0 0 1px {accent}; }}
 
 button.soc-primary {{ background-image: none; background-color: {accent_strong};
   color: {btn_fg}; border: 1px solid {accent_strong}; border-radius: 6px;
