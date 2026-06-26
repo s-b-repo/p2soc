@@ -750,8 +750,34 @@ def load_config(vault: Vault) -> cfg.Config:
                 pass
         log(f"config note '{item}' empty/absent; using the local file")
     panels_file = os.environ.get("SOC_PANELS_FILE") or _resolved_panels()
+    if not os.path.exists(panels_file):
+        # NOT CONFIGURED YET (no vault note, no file): launch a built-in DEFAULT
+        # template instead of dead-ending on a fatal screen. The wall comes up empty
+        # with its toolbar + an on-screen "add panels" hint, and the operator
+        # configures real panels later via Setup or the on-screen Settings
+        # (gear / Ctrl+Shift+C). A *malformed* file still raises (cfg.load below) so a
+        # broken config the operator wrote is surfaced, not silently replaced.
+        log(f"no config at {panels_file} — launching the default template; "
+            f"add panels via Setup or the on-screen Settings (Ctrl+Shift+C)")
+        return _default_template()
     log(f"config source: {panels_file}")
     return cfg.load(panels_file)
+
+
+# A complete, valid, panel-less config — the safe default when nothing is configured
+# yet, so `launch` never dead-ends. The wall renders its toolbar + a "not configured"
+# hint; the operator adds real panels in Setup / the on-screen Settings.
+_DEFAULT_TEMPLATE = (
+    "display: {auto: true, cols: 2, rows: 2, gap: 0}\n"
+    "panels: []\n"
+    "tunnel: {enabled: false}\n"
+    "vpn: {enabled: false}\n"
+)
+
+
+def _default_template() -> cfg.Config:
+    """Built-in always-valid default config for the unconfigured-launch path."""
+    return cfg.load_str(_DEFAULT_TEMPLATE, "default-template")
 
 
 class _GtkUnlockUI:
@@ -1214,11 +1240,13 @@ def main():
         auth = (f"auth via vault item '{conf.proxy.vault_item}'"
                 if conf.proxy.vault_item else "no auth")
         log(f"proxy: {conf.proxy.url} ({auth})")
-    if not conf.panels:
-        return _fatal_screen(
-            "No panels configured",
-            "The wall has no panels to display, so there is nothing to show.",
-            "Add at least one panel (Setup -> Panels), then relaunch.")
+    # Not configured yet (the built-in default template has no panels): DON'T dead-end
+    # on a fatal screen. Bring the wall up (toolbar + empty grid) and open the on-screen
+    # Settings so the operator adds panels live — no relaunch needed.
+    unconfigured = not conf.panels
+    if unconfigured:
+        log("no panels configured — launching empty; the on-screen Settings opens so "
+            "you can add panels (or use Setup)")
 
     host = KioskHost(conf, vault=vault)
 
@@ -1233,6 +1261,11 @@ def main():
 
     # 4. windows
     host.build_and_show()
+
+    # Unconfigured launch: open the on-screen Settings once the loop is running so the
+    # operator configures panels live on an otherwise-empty wall (no relaunch).
+    if unconfigured:
+        GLib.idle_add(host.open_config)
 
     # all panel views, WebContexts and config objects are now built and live
     # for the whole 24/7 uptime — freeze them out of the GC so the steady-state
