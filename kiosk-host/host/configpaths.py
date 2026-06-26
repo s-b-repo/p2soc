@@ -43,6 +43,7 @@ import sys
 PANELS_BASENAME = "panels.yaml"
 ENV_BASENAME = "soc.env"
 SECRET_BASENAME = "secret"
+WEBDATA_BASENAME = "webdata"
 ETC_DIR = "/etc/soc-display"
 MARKER_BASENAME = "active"  # presence in user_dir() => the user config tier wins
 
@@ -151,6 +152,26 @@ def resolve_secret_dir() -> str:
     if os.path.isdir(ETC_DIR):
         return os.path.join(ETC_DIR, SECRET_BASENAME)
     return os.path.join(repo_root(), "dev", "run", SECRET_BASENAME)
+
+
+def resolve_webdata_dir() -> str:
+    """Where persistent panel web data (cookies.sqlite, localStorage, IndexedDB,
+    cache, the compiled tracker filter) lives. This holds SESSION TOKENS, so it
+    must be a PRIVATE 0700 dir owned by the kiosk user — see webkit_panel.py /
+    chromium_panel.py which create it 0700.
+
+    A SIBLING of secret/ (NOT inside it), with the SAME precedence as
+    resolve_secret_dir() so the web data sits next to whichever config tier won —
+    keeping the sealed-master/no-plaintext guarantee in `secret/` untouched.
+    Always returns a path (the caller creates it 0700 on first use)."""
+    wd = os.environ.get("SOC_WEBDATA_DIR")
+    if wd:
+        return os.path.abspath(wd)
+    if os.path.exists(active_marker()):
+        return os.path.join(user_dir(), WEBDATA_BASENAME)
+    if os.path.isdir(ETC_DIR):
+        return os.path.join(ETC_DIR, WEBDATA_BASENAME)
+    return os.path.join(repo_root(), "dev", "run", WEBDATA_BASENAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +283,7 @@ def _explain() -> int:
             exists = "exists" if os.path.exists(path) else "missing"
             sys.stdout.write(f"{mark} {lbl:32s} {exists:8s} {path}\n")
     sys.stdout.write(f"\nsecret_dir resolves to: {resolve_secret_dir()}\n")
+    sys.stdout.write(f"webdata_dir resolves to: {resolve_webdata_dir()}\n")
     return 0
 
 
@@ -343,6 +365,7 @@ def _main(argv: "list[str]") -> int:
     ap.add_argument("--panels", action="store_true", help="print the resolved panels.yaml READ path")
     ap.add_argument("--env", action="store_true", help="print the resolved soc.env READ path")
     ap.add_argument("--secret-dir", action="store_true", help="print the resolved secret dir")
+    ap.add_argument("--webdata-dir", action="store_true", help="print the resolved web-data dir")
     ap.add_argument("--panels-write", action="store_true", help="print the chosen panels.yaml WRITE path")
     ap.add_argument("--env-write", action="store_true", help="print the chosen soc.env WRITE path")
     ap.add_argument("--write-target", choices=["panels", "env"],
@@ -356,6 +379,7 @@ def _main(argv: "list[str]") -> int:
     if args.panels:        return _print_resolved("panels")
     if args.env:           return _print_resolved("env")
     if args.secret_dir:    sys.stdout.write(resolve_secret_dir() + "\n"); return 0
+    if args.webdata_dir:   sys.stdout.write(resolve_webdata_dir() + "\n"); return 0
     if args.panels_write:  return _write_target("panels")
     if args.env_write:     return _write_target("env")
     if args.write_target:  return _write_target(args.write_target)

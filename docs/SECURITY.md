@@ -132,6 +132,44 @@ The wall can be repointed at the glass — convenient, but a surface to control:
   never entered here — only the *name* of the Vaultwarden login to use; the
   secrets stay in Vaultwarden.
 
+## Renderer hardening & site containment
+
+Each panel renders a third-party-fronted SOC dashboard that could be compromised
+or buggy. The renderer reduces blast radius without breaking the dashboard; the
+defaults are safe and every loosening is explicit opt-in (see
+[CONFIGURATION.md](CONFIGURATION.md#renderer-security--site-restriction) for the
+knobs). The trust model:
+
+- **Hardening is pure attack-surface reduction** — no plugins/Java, no file://
+  escalation, no mixed content on HTTPS, no downloads/file pickers, the WebKit
+  sandbox where available. None of these are features a SOC dashboard uses, so
+  the defaults are invisible. TLS certs are verified (fail-closed); a panel opts
+  out per-tile with `allow_insecure` / `insecure_tls` (trusted LAN only).
+- **The navigation allowlist is the containment boundary.** A hijacked page can
+  still reach its own CDNs/SSO (allowed) but cannot drive the wall's top-level
+  frame to an arbitrary attacker site (refused + logged). Only main-frame
+  top-level navigation is gated; sub-resources, XHR, websockets and SSO redirect
+  chains pass through, so real logins and live dashboards keep working. The
+  bundled cloud-SSO list (`security/allowlist-sso.txt`) covers the common case;
+  self-hosted origins are one `allow:` line; `SOC_NAV_ALLOWLIST=0` is the
+  kill-switch for an unmapped dashboard.
+- **Tracker blocking is defence + perf.** The curated top-20 analytics/tracker
+  domains (`security/trackers-top20.json`) are dropped as third-party requests —
+  less third-party JS means a smaller attack surface and less RAM/CPU. A
+  dashboard's own first-party telemetry is never caught (`load-type:third-party`);
+  `block_trackers: false` / `unblock:` are the escape hatches.
+- **Persistent web data holds session tokens**, so it is the most sensitive new
+  data on disk: stored under a `0700` kiosk-user-only `webdata/` dir, a **sibling**
+  of the sealed-master `secret/` dir (never inside it — the no-plaintext-master
+  guarantee is untouched), outside the repo, never world-readable, never logged,
+  and per-panel isolated (`webdata/<panel-id>/`) so one panel cannot read
+  another's session. The cookie accept policy is `NO_THIRD_PARTY`. A panel opts
+  out of on-disk sessions with `persist: false` (ephemeral).
+
+Both render engines enforce these identically: WebKit via settings / a
+`decide-policy` nav guard / a `WKContentRuleList`, Chromium via launch flags /
+a CDP nav guard / `Network.setBlockedURLs`.
+
 ## Network hardening (`HARDEN=1`)
 
 Installs:

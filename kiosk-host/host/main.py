@@ -269,6 +269,7 @@ class KioskHost:
                                      cdp_port=cdp_base + idx,
                                      proxy=self.conf.proxy,
                                      proxy_creds=self.proxy_creds,
+                                     security=self.conf.security,
                                      on_login_success=self.login_success)
             else:
                 from .webkit_panel import WebKitPanel
@@ -276,6 +277,7 @@ class KioskHost:
                                    embedded=self.wall is not None,
                                    proxy=self.conf.proxy,
                                    proxy_creds=self.proxy_creds,
+                                   security=self.conf.security,
                                    on_config=config_cb,
                                    on_login_success=self.login_success)
                 if self.wall is not None:

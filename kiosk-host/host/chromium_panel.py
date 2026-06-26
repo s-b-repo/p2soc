@@ -38,8 +38,10 @@ from websocket import create_connection
 from websocket import WebSocketTimeoutException
 
 from . import config as cfg
+from . import configpaths
 from . import inject
 from . import perf
+from . import siteguard
 
 RESPAWN_INITIAL = 5.0    # seconds; doubled up to RESPAWN_MAX after each death
 RESPAWN_MAX = 60.0
@@ -237,7 +239,7 @@ MAX_LOGIN_ATTEMPTS = 3
 class ChromiumPanel:
     def __init__(self, panel, on_need_login, log, cdp_port: int,
                  poll_interval: float = 2.0, proxy=None, proxy_creds=None,
-                 on_login_success=None):
+                 security=None, on_login_success=None):
         self.panel = panel
         self.on_need_login = on_need_login
         self.on_login_success = on_login_success
@@ -246,6 +248,19 @@ class ChromiumPanel:
         self.poll_interval = poll_interval
         self.proxy = proxy                  # config.ProxyCfg | None
         self.proxy_creds = proxy_creds      # callable() -> {"user","pass"} | None
+        # Wall-wide renderer security defaults. Default to a fresh SecurityCfg so
+        # the panel stays self-contained when constructed without one (tests,
+        # standalone smokes) and still applies the SAFE-on defaults.
+        self.security = security if security is not None else cfg.SecurityCfg()
+        # Compute the site-guard state ONCE (engine-shared logic in siteguard):
+        #  * the top-level nav allowlist set (own origin + SSO + per-panel/global),
+        #  * the tracker URL patterns for Network.setBlockedURLs.
+        # Identical to the WebKit leg so a panel is contained the same either way.
+        self._nav_gate = siteguard.nav_gate_enabled(self.security)
+        self._allowlist = siteguard.build_allowlist(panel, self.security)
+        self._block_trackers = siteguard.trackers_enabled(panel, self.security)
+        self._blocked_urls = (siteguard.chromium_blocked_urls(panel)
+                              if self._block_trackers else [])
         self._login_attempts = 0
         self.proc = None
         self.cdp = None
@@ -265,13 +280,43 @@ class ChromiumPanel:
         self._thread = threading.Thread(target=self._control_loop, daemon=True)
         self._thread.start()
 
+    def _profile_dir(self) -> str:
+        """The Chromium --user-data-dir for this panel.
+
+        persist=True (default): a PERSISTENT 0700 dir under the private webdata
+        base (resolve_webdata_dir/chromium/<id>) — so cookies/IndexedDB survive a
+        panel reload AND a full wall restart, keeping a session-cookie dashboard
+        logged in. This dir holds SESSION TOKENS, so it is created 0700,
+        kiosk-user-owned, outside the repo, never logged.
+
+        persist=False: the old tmpfs path under $XDG_RUNTIME_DIR — wiped every
+        restart, so the panel keeps NO on-disk session (the explicit opt-out)."""
+        p = self.panel
+        if getattr(p, "persist", True):
+            base = configpaths.resolve_webdata_dir()
+            # base + chromium/ created 0700 (private); install.sh chowns the
+            # /etc tier to the kiosk user. exist_ok keeps re-spawns cheap.
+            os.makedirs(base, mode=0o700, exist_ok=True)
+            chromium_base = os.path.join(base, "chromium")
+            os.makedirs(chromium_base, mode=0o700, exist_ok=True)
+            return os.path.join(chromium_base, p.id)
+        return os.path.join(
+            os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "soc-profiles", p.id)
+
     def _spawn(self):
         p = self.panel
         g = p.geometry
         self._login_attempts = 0                 # fresh process = fresh budget
-        profile = os.path.join(
-            os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "soc-profiles", p.id)
+        profile = self._profile_dir()
         os.makedirs(os.path.join(profile, "Default"), exist_ok=True)
+        # Re-assert 0700 on the per-panel profile: it holds this panel's session
+        # tokens and must not be readable by other panels/users (profile
+        # isolation). makedirs above honours umask, so set the mode explicitly.
+        if getattr(p, "persist", True):
+            try:
+                os.chmod(profile, 0o700)
+            except OSError:
+                pass
         # Seed prefs so Chromium never shows the "Save password?" bubble or the
         # session-restore prompt over a panel.
         prefs = os.path.join(profile, "Default", "Preferences")
@@ -316,7 +361,15 @@ class ChromiumPanel:
             # 1 GB budget (set just below).
             "--disable-dev-shm-usage",             # /dev/shm is tiny on a 1 GB Pi
             "--disable-pinch", "--overscroll-history-navigation=0",
-            "--disable-features=Translate,OptimizationHints",
+            # Security hardening (parity with the WebKit leg's _harden_settings):
+            #  * no downloads — a SOC wall never needs to save a file; this also
+            #    neutralises drive-by file drops (CDP Page.setDownloadBehavior
+            #    deny re-asserts it once attached).
+            #  * block active mixed content on HTTPS panels (the real attack-
+            #    surface win) so a compromised CDN can't inject http:// script.
+            "--disable-features=Translate,OptimizationHints,DownloadBubble,"
+            "DownloadBubbleV2",
+            "--block-new-web-contents",        # no panel-spawned popups/windows
             f"--ozone-platform={_ozone_platform()}",
             # sandbox stays ON in production. Some restricted CI/containers can't
             # init Chromium's namespace sandbox; SOC_CHROMIUM_NO_SANDBOX=1 is a
@@ -334,6 +387,11 @@ class ChromiumPanel:
         args += _hwaccel_flags()
         if not getattr(p, "allow_media", False):
             args.append("--disable-3d-apis")       # no WebGL/WebGL2
+        # Optional per-panel UA override (some dashboards gate on it). Parity
+        # with WebKit's settings.set_user_agent(); validated str in config.py.
+        ua = getattr(p, "user_agent", None)
+        if ua:
+            args.append(f"--user-agent={ua}")
         if self._uses_proxy():
             args += proxy_flags(self.proxy)
         elif self.proxy and self.proxy.enabled:
@@ -345,12 +403,36 @@ class ChromiumPanel:
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
 
-    # ---- proxy auth over CDP ------------------------------------------------
+    # ---- proxy auth + nav allowlist over CDP --------------------------------
+    def _nav_blocked(self, params) -> bool:
+        """True if a paused Fetch request is a main-frame top-level navigation to
+        an OFF-allowlist host that we should refuse. Only main-frame Document
+        requests are gated (sub-resources/XHR/websockets pass) — same granularity
+        as the WebKit decide-policy leg, so real CDNs/SSO keep working."""
+        if not self._nav_gate:
+            return False
+        # Fetch.requestPaused for a navigation carries resourceType Document and
+        # (on a top-level nav) no parent frame distinction is given, so we treat
+        # any Document request whose host is off-allowlist as a refused top-level
+        # nav. Sub-frame Documents are rare on a dashboard and erring toward
+        # refusing an off-allowlist sub-frame is the safer choice.
+        if params.get("resourceType") != "Document":
+            return False
+        uri = (params.get("request") or {}).get("url", "")
+        return not siteguard.nav_allowed(uri, self._allowlist)
+
     def _on_cdp_event(self, method, params):
         self._last_fetch_event = time.time()
         if method == "Fetch.requestPaused":
-            self.cdp.send_nowait("Fetch.continueRequest",
-                                 {"requestId": params["requestId"]})
+            rid = params["requestId"]
+            if self._nav_blocked(params):
+                uri = (params.get("request") or {}).get("url", "")
+                self.cdp.send_nowait("Fetch.failRequest",
+                                     {"requestId": rid,
+                                      "errorReason": "BlockedByClient"})
+                self.log(f"[{self.panel.id}] refused off-allowlist nav -> {uri}")
+                return
+            self.cdp.send_nowait("Fetch.continueRequest", {"requestId": rid})
             return
         if method != "Fetch.authRequired":
             return
@@ -391,6 +473,52 @@ class ChromiumPanel:
         creds["pass"] = ""                  # scrub our copy
         self.log(f"[{self.panel.id}] proxy auth answered "
                  f"(vault item '{self.proxy.vault_item}')")
+
+    def _setup_network_guards(self):
+        """Install the steady-state renderer security guards over CDP:
+
+          * tracker blocklist  -> Network.setBlockedURLs (same hosts the WebKit
+            UserContentFilter blocks; cheapest correct path, reuses the session).
+          * no downloads       -> Page.setDownloadBehavior deny (re-asserts the
+            --disable download flags; refuses drive-by file drops).
+          * nav allowlist      -> Fetch.enable {patterns:[{requestType:Document}]}
+            so only main-frame top-level navigations are paused (cheap) and the
+            persistent on_event refuses off-allowlist ones. handleAuthRequests
+            stays on so a late proxy re-challenge is still answered by the same
+            handler. Sub-resources/XHR/websockets are NOT paused -> no per-request
+            latency on the steady-state wall.
+
+        Every call is guarded: a Chromium build lacking a domain/method must
+        degrade (that guard simply doesn't apply) rather than wedge the panel."""
+        if not self.cdp:
+            return
+        # tracker blocklist (honours block_trackers + per-panel unblock)
+        if self._blocked_urls:
+            try:
+                self.cdp.rpc("Network.enable")
+                self.cdp.rpc("Network.setBlockedURLs", {"urls": self._blocked_urls})
+                self.log(f"[{self.panel.id}] chromium tracker block on "
+                         f"({len(self._blocked_urls)} hosts)")
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[{self.panel.id}] tracker block setup failed: {e}")
+        # refuse all downloads
+        try:
+            self.cdp.rpc("Page.setDownloadBehavior", {"behavior": "deny"})
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[{self.panel.id}] download-deny setup failed: {e}")
+        # top-level nav allowlist (Document-only Fetch interception)
+        if self._nav_gate:
+            try:
+                self.cdp.on_event = self._on_cdp_event
+                self.cdp.rpc("Fetch.enable", {
+                    "handleAuthRequests": True,
+                    "patterns": [{"requestStage": "Request",
+                                  "resourceType": "Document"}]})
+                self.log(f"[{self.panel.id}] chromium nav allowlist on "
+                         f"({len(self._allowlist)} domains)")
+            except Exception as e:  # noqa: BLE001
+                self.cdp.on_event = None
+                self.log(f"[{self.panel.id}] nav allowlist setup failed: {e}")
 
     def _proxy_auth_phase(self):
         """Brief window after attach where the Fetch domain is enabled and
@@ -443,6 +571,11 @@ class ChromiumPanel:
             self.cdp = cdp
             self.log(f"[{p.id}] chromium CDP attached + bootstrap installed")
             self._proxy_auth_phase()
+            # Steady-state security guards go up AFTER the brief proxy-auth phase
+            # (which owns Fetch for its window and disables it at the end): the
+            # tracker blocklist (Network.setBlockedURLs), download deny, and the
+            # main-frame nav allowlist (Fetch interception of Document requests).
+            self._setup_network_guards()
             return True
         except Exception as e:  # noqa: BLE001
             self.log(f"[{p.id}] chromium CDP setup failed: {e}")
@@ -553,6 +686,10 @@ class ChromiumPanel:
         self.panel.url = url or None
         if url:
             self.panel.mode = "direct"
+        # Recompute the nav allowlist: it includes the panel's OWN origin host,
+        # which just changed. The respawn below picks up the new set (read by the
+        # worker thread; assignment is atomic in CPython).
+        self._allowlist = siteguard.build_allowlist(self.panel, self.security)
         self.log(f"[{self.panel.id}] reconfigured -> {url or '(cleared)'}; "
                  f"restarting chromium")
         # Don't touch self.cdp here: this runs on the GTK main thread while the
