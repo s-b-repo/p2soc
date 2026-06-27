@@ -464,6 +464,100 @@ def _alive(url: str, timeout: float = 20.0) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# Destructive vault-account reset (forgot-master recovery), run as ROOT via pkexec.
+# NO master ever crosses this boundary: deletion is by EMAIL only; the brand-new
+# account is registered + sealed UNPRIVILEGED in the caller (master in memory).
+# --------------------------------------------------------------------------- #
+def _vw_data_folder() -> str:
+    """Vaultwarden's DATA_FOLDER from the running unit's Environment, else the
+    common default. Pure stdlib."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", "vaultwarden.service", "-p", "Environment",
+             "--value"], capture_output=True, text=True, timeout=10).stdout
+        for tok in out.split():
+            if tok.startswith("DATA_FOLDER="):
+                d = tok.split("=", 1)[1].strip()
+                if d:
+                    return d
+    except Exception:  # noqa: BLE001
+        pass
+    return "/var/lib/vaultwarden"
+
+
+def _delete_user_rows(db_path: str, email: str) -> int:
+    """Delete the Vaultwarden user matching `email` AND every row in any table whose
+    foreign key references users(uuid) — discovered by introspecting the LIVE schema
+    (PRAGMA foreign_key_list), so it stays correct across Vaultwarden versions and
+    leaves OTHER accounts untouched. Returns 1 if a user was deleted, else 0.
+
+    Pure-sqlite + testable in isolation (no service, no network). The caller stops
+    Vaultwarden first so the DB is not open elsewhere."""
+    import sqlite3
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute("PRAGMA foreign_keys=OFF")
+        row = con.execute(
+            "SELECT uuid FROM users WHERE lower(email)=lower(?)", (email,)
+        ).fetchone()
+        if not row:
+            return 0
+        uuid = row[0]
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")]
+        for t in tables:
+            if t == "users":
+                continue
+            try:
+                fks = list(con.execute(f'PRAGMA foreign_key_list("{t}")'))
+            except sqlite3.Error:
+                continue
+            for fk in fks:  # (id, seq, table, from, to, on_update, on_delete, match)
+                if (fk[2] or "").lower() == "users":
+                    con.execute(f'DELETE FROM "{t}" WHERE "{fk[3]}"=?', (uuid,))
+        con.execute("DELETE FROM users WHERE uuid=?", (uuid,))
+        con.commit()
+        try:                                   # fold WAL back so VW reads a clean db
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        return 1
+    finally:
+        con.close()
+
+
+def reset_vault_db_account(email: str, *, url: str = "", data_folder: str = "",
+                           manage_service: bool = True) -> dict:
+    """DESTRUCTIVE forgot-master recovery (ROOT): stop Vaultwarden, BACK UP its DB,
+    delete the `email` account + all its data, restart Vaultwarden. The new account
+    is registered + sealed afterwards by the UNPRIVILEGED caller (no master here).
+
+    Returns {"deleted", "backup", "data_folder"}; raises RuntimeError on failure.
+    `manage_service=False` (tests) skips the stop/start so the SQL core is testable."""
+    import time
+    df = data_folder or _vw_data_folder()
+    db = os.path.join(df, "db.sqlite3")
+    if not os.path.isfile(db):
+        raise RuntimeError(f"no Vaultwarden DB at {db} (DATA_FOLDER={df})")
+    stopped = False
+    if manage_service and _have("systemctl"):
+        rc = _run(["systemctl", "stop", "vaultwarden"], dry=False)
+        if rc not in (0, None):
+            raise RuntimeError("could not stop vaultwarden.service before the reset")
+        stopped = True
+    backup = f"{db}.reset-bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(db, backup)
+    try:
+        deleted = _delete_user_rows(db, email)
+    finally:
+        if stopped:
+            _run(["systemctl", "start", "vaultwarden"], dry=False)
+            if url:
+                _alive(url, timeout=30.0)
+    return {"deleted": deleted, "backup": backup, "data_folder": df}
+
+
 def step_vault_account(opts: Opts, master: str) -> ProvResult:
     """Ensure the Vaultwarden account exists (create if missing / verify if
     present). Delegates to host.vaultsetup.ensure_account — NO root needed (pure
@@ -761,10 +855,29 @@ def _main(argv: "list | None" = None) -> int:
     ap.add_argument("--desktop-user", default="socwall")
     ap.add_argument("--svc-user", default="socsvc")
     ap.add_argument("--fresh", action="store_true")
+    ap.add_argument("--reset-vault-db", action="store_true",
+                    help="DESTRUCTIVE (root): delete a Vaultwarden account + all its "
+                         "data by --email so a forgotten master can be re-registered")
+    ap.add_argument("--email", default="")
+    ap.add_argument("--url", default="")
     args = ap.parse_args(argv)
 
     if args.dry_run:
         os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+
+    # Forgot-master recovery: privileged, by EMAIL only (never a master). Distinct
+    # mode — must run before the provision shell-steps block.
+    if args.reset_vault_db:
+        if not args.email:
+            sys.stderr.write("reset-vault-db: --email is required\n")
+            return 2
+        try:
+            res = reset_vault_db_account(args.email, url=args.url)
+        except Exception as e:  # noqa: BLE001 — surface the cause to the caller
+            sys.stderr.write(f"reset-vault-db FAILED: {e}\n")
+            return 1
+        print(f"reset-vault-db: deleted={res['deleted']} backup={res['backup']}")
+        return 0
 
     opts = Opts(mode=args.mode, kiosk_user=args.kiosk_user,
                 desktop_user=args.desktop_user, svc_user=args.svc_user,
