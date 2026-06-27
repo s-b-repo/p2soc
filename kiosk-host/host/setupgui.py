@@ -1294,6 +1294,20 @@ class SetupAssistant:
             "re-test. Only offered when Test shows the account does not exist.")
         create_btn.set_no_show_all(True)
         create_btn.hide()
+        # Forgot-master DESTRUCTIVE recovery. When the account EXISTS but the master
+        # is lost, Create + Reset both dead-end ("already exists / wrong master").
+        # This wipes the account (root, via pkexec — the DB is backed up first) and
+        # re-creates it with the NEW master, then re-seals. Behind a hard-confirm
+        # modal; revealed only on a real backend, alongside Create.
+        forget_btn = Gtk.Button(label="Forgot master? — wipe & re-create")
+        forget_btn.get_style_context().add_class("soc-ghost")
+        forget_btn.set_tooltip_text(
+            "Lost the master? PERMANENTLY delete this Vaultwarden account + all its "
+            "logins (a timestamped DB backup is kept on the server), then re-create "
+            "it with the new master above and re-seal. Confirms first; asks for the "
+            "system password.")
+        forget_btn.set_no_show_all(True)
+        forget_btn.hide()
         test_status = Gtk.Label(xalign=0, wrap=True)
         test_status.set_max_width_chars(56)
 
@@ -1326,6 +1340,7 @@ class SetupAssistant:
             # clear "create it in the web vault" message rather than silently no-op.
             if create_btn is not None and m.vault_backend != "dev":
                 create_btn.show()
+                forget_btn.show()
                 seed_chk.show()
             self._recheck_vault(page)
             return False
@@ -1393,6 +1408,7 @@ class SetupAssistant:
                 # the operator can register it / it reports the account exists.
                 if create_btn is not None and not dev:
                     create_btn.show()
+                    forget_btn.show()
                     seed_chk.show()
             self._recheck_vault(page)
             return False
@@ -1556,6 +1572,95 @@ class SetupAssistant:
 
         create_btn.connect("clicked", on_create)
 
+        def _forget_done(ok, payload):
+            self._vault_test_running = False
+            dev = m.vault_backend == "dev"
+            for b in (test_btn, reset_btn):
+                b.set_sensitive(not dev)
+            create_btn.set_sensitive(True)
+            forget_btn.set_sensitive(True)
+            if ok:
+                # Wiped + re-created + re-sealed: the new master is proven & sealed,
+                # so arm the page gate (keyed to the params just sealed).
+                self._vault_tested_ok = True
+                self._vault_tested_key = _vault_key()
+                create_btn.hide()
+                forget_btn.hide()
+                col = self.branding.color("good")
+                _set_test(f'<span foreground="{col}">● Vault reset — new account '
+                          f'created + master re-sealed (host-bound). ONE-TIME PIN: '
+                          f'{_esc(payload)}</span>')
+            else:
+                self._vault_tested_ok = False
+                col = self.branding.color("bad")
+                _set_test(f'<span foreground="{col}">✗ {_esc(payload)}</span>')
+            self._recheck_vault(page)
+            return False
+
+        def on_forget(_b):
+            be = m.vault_backend
+            if be == "dev":
+                return
+            master = pw.get_text()
+            if not (m.vault_url and m.vault_email and master):
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Enter URL, email and the NEW master first.</span>')
+                return
+            if self.vaultsetup is None or not self.vaultsetup.available():
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Cannot re-create the account here ('
+                          f'\'cryptography\' missing) — reset it in the web vault.'
+                          f'</span>')
+                return
+            # Hard confirm BEFORE any destructive action (main thread).
+            if not self._confirm_destructive_reset(m.vault_email):
+                return
+            sd = self.model.paths.get("secret_dir")
+            if not sd:
+                from host import configpaths  # type: ignore
+                sd = configpaths.resolve_secret_dir()
+            self._vault_test_running = True
+            for b in (test_btn, reset_btn, create_btn, forget_btn):
+                b.set_sensitive(False)
+            _set_test(f'<span foreground="{self.branding.color("text_dim")}">'
+                      f'… wiping {_esc(m.vault_email)} (system password), then '
+                      f're-creating + re-sealing</span>')
+            self._recheck_vault(page)
+            url_, email_, master_, pin_ = m.vault_url, m.vault_email, master, m.master_pin
+            do_seed = seed_chk.get_active()
+
+            def _worker():
+                # 1) Privileged wipe by EMAIL (root via pkexec). The master is NEVER
+                #    part of this step — it stays in this process for register+seal.
+                rc, errtxt = self._reset_vault_via_pkexec(email_, url_)
+                if rc != 0:
+                    self.GLib.idle_add(_forget_done, False,
+                                       errtxt or f"vault reset failed (pkexec rc {rc})")
+                    return
+                # 2) Re-register the account with the NEW master (signups allowed; the
+                #    old account is gone, so this no longer 400s 'already exists').
+                try:
+                    self.vaultsetup.register_account(url_, email_, master_)
+                except Exception as e:  # noqa: BLE001
+                    self.GLib.idle_add(_forget_done, False,
+                                       f"account wiped but re-create failed: {e}")
+                    return
+                # 3) Re-seal the new master host-bound (escalates only if needed).
+                try:
+                    used = self._seal_host_bound(master_, pin_, sd)
+                except Exception as e:  # noqa: BLE001
+                    self.GLib.idle_add(_forget_done, False,
+                                       f"account re-created but re-seal failed: {e}")
+                    return
+                if do_seed:
+                    _seed_panels(url_, email_, master_)
+                self.GLib.idle_add(_forget_done, True, used)
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        forget_btn.connect("clicked", on_forget)
+
         def on_backend(*_):
             be = backend.get_active_text() or "dev"
             m.vault_backend = be
@@ -1569,9 +1674,11 @@ class SetupAssistant:
             # account to create). seed_chk rides with it.
             if dev:
                 create_btn.hide()
+                forget_btn.hide()
                 seed_chk.hide()
             else:
                 create_btn.show()
+                forget_btn.show()
                 seed_chk.show()
             # A backend change invalidates any prior green test.
             self._vault_tested_ok = False
@@ -1607,6 +1714,7 @@ class SetupAssistant:
         btn_row.pack_start(test_btn, False, False, 0)
         btn_row.pack_start(reset_btn, False, False, 0)
         btn_row.pack_start(create_btn, False, False, 0)
+        btn_row.pack_start(forget_btn, False, False, 0)
         page.pack_start(self._row("", btn_row), False, False, 0)
         page.pack_start(test_status, False, False, 0)
         page.pack_start(self._row("", seed_chk), False, False, 0)
@@ -2272,6 +2380,52 @@ class SetupAssistant:
         self.model.master_password = ""
         import threading
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _confirm_destructive_reset(self, email: str) -> bool:
+        """Hard-confirm modal for the forgot-master destructive reset. Returns True
+        only on an explicit 'Wipe & re-create'. MAIN-thread only (called from the
+        click handler before any worker is started)."""
+        Gtk = self.Gtk
+        dlg = Gtk.MessageDialog(
+            transient_for=self.assistant, modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Wipe and re-create the vault account?")
+        dlg.format_secondary_text(
+            f"This PERMANENTLY DELETES the Vaultwarden account “{email}” and ALL of "
+            f"its stored logins on the server, then re-creates it with the NEW master "
+            f"you entered above.\n\nA timestamped backup of the vault database is kept "
+            f"on the server, but this cannot be undone from the wizard. Only do this "
+            f"if the existing master is genuinely lost.")
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        wipe = dlg.add_button("Wipe & re-create", Gtk.ResponseType.OK)
+        try:
+            wipe.get_style_context().add_class("destructive-action")
+        except Exception:  # noqa: BLE001
+            pass
+        dlg.set_default_response(Gtk.ResponseType.CANCEL)
+        resp = dlg.run()
+        dlg.destroy()
+        return resp == Gtk.ResponseType.OK
+
+    def _reset_vault_via_pkexec(self, email: str, url: str):
+        """DESTRUCTIVE forgot-master reset via provision.py --reset-vault-db under
+        pkexec (root: stops Vaultwarden, BACKS UP + deletes the account by EMAIL,
+        restarts it). NO master on argv — the master never crosses this boundary; it
+        stays in-process for the unprivileged register + seal that follow. By ABSOLUTE
+        PATH (pkexec strips PYTHONPATH). Returns (returncode, stderr). Worker-safe."""
+        if not shutil.which("pkexec"):
+            return (127, "pkexec is unavailable — cannot escalate the vault reset")
+        helper = os.path.join(_repo_root(), "provision.py")
+        py = shutil.which("python3") or sys.executable
+        argv = ["pkexec", py, helper, "--reset-vault-db", "--email", email]
+        if url:
+            argv += ["--url", url]
+        try:
+            p = subprocess.run(argv, text=True, capture_output=True, timeout=240)
+        except Exception as e:  # noqa: BLE001 — treat any spawn fault as failed
+            return (126, f"pkexec escalation failed: {e}")
+        return (p.returncode, (p.stderr or "").strip())
 
     def _provision_shell_via_pkexec(self, opts):
         """Run the privileged shell steps (packages/users/deploy/units) via the

@@ -183,3 +183,77 @@ def test_cli_and_gui_share_the_same_core(prov):
     assert setup.step_users is setup.provision.step_users
     assert setup.provision_all is setup.provision.provision_all
     assert setup.Opts is setup.provision.Opts
+
+
+# --------------------------------------------------------------------------- #
+# Forgot-master destructive reset — the schema-introspecting deletion core.
+# (Pure-sqlite, no service/network — manage_service is bypassed.)
+# --------------------------------------------------------------------------- #
+def _vw_like_db(path):
+    import sqlite3
+    con = sqlite3.connect(path)
+    # Mirror Vaultwarden's INCONSISTENT cascade: most child tables reference
+    # users(uuid) with NO cascade (ciphers), a few WITH cascade (devices); plus a
+    # table with no users FK at all (must be left untouched).
+    con.executescript(
+        "CREATE TABLE users (uuid TEXT PRIMARY KEY, email TEXT);"
+        "CREATE TABLE ciphers (uuid TEXT PRIMARY KEY, user_uuid TEXT,"
+        " FOREIGN KEY(user_uuid) REFERENCES users(uuid));"
+        "CREATE TABLE devices (uuid TEXT PRIMARY KEY, user_uuid TEXT,"
+        " FOREIGN KEY(user_uuid) REFERENCES users(uuid) ON DELETE CASCADE);"
+        "CREATE TABLE org_policies (uuid TEXT PRIMARY KEY, org TEXT);")
+    con.executemany("INSERT INTO users VALUES (?,?)",
+                    [("u-keep", "keep@x"), ("u-del", "del@x")])
+    con.executemany("INSERT INTO ciphers VALUES (?,?)",
+                    [("c1", "u-keep"), ("c2", "u-del"), ("c3", "u-del")])
+    con.executemany("INSERT INTO devices VALUES (?,?)",
+                    [("d1", "u-keep"), ("d2", "u-del")])
+    con.execute("INSERT INTO org_policies VALUES ('p1','o1')")
+    con.commit()
+    con.close()
+
+
+def test_delete_user_rows_is_surgical(tmp_path):
+    import sqlite3
+    prov = _load_provision()
+    db = str(tmp_path / "db.sqlite3")
+    _vw_like_db(db)
+    # case-insensitive email match; returns 1 (a user was deleted)
+    assert prov._delete_user_rows(db, "DEL@X") == 1
+    con = sqlite3.connect(db)
+    users = [r[0] for r in con.execute("SELECT uuid FROM users ORDER BY uuid")]
+    ciph = sorted(r[0] for r in con.execute("SELECT user_uuid FROM ciphers"))
+    devs = sorted(r[0] for r in con.execute("SELECT user_uuid FROM devices"))
+    pols = [r[0] for r in con.execute("SELECT uuid FROM org_policies")]
+    con.close()
+    assert users == ["u-keep"]        # target user gone, OTHER account intact
+    assert ciph == ["u-keep"]         # only the target's non-cascade children removed
+    assert devs == ["u-keep"]         # cascade-style children removed too
+    assert pols == ["p1"]             # a table with no users-FK is untouched
+
+
+def test_delete_user_rows_missing_user_is_noop(tmp_path):
+    import sqlite3
+    prov = _load_provision()
+    db = str(tmp_path / "db.sqlite3")
+    _vw_like_db(db)
+    assert prov._delete_user_rows(db, "nobody@x") == 0   # no match -> 0, nothing touched
+    con = sqlite3.connect(db)
+    assert sorted(r[0] for r in con.execute("SELECT uuid FROM users")) == ["u-del", "u-keep"]
+    con.close()
+
+
+def test_reset_vault_db_account_backs_up_and_deletes(tmp_path):
+    import os as _os
+    import sqlite3
+    prov = _load_provision()
+    df = str(tmp_path)
+    _vw_like_db(_os.path.join(df, "db.sqlite3"))
+    # manage_service=False bypasses systemctl so the SQL+backup core is testable.
+    res = prov.reset_vault_db_account("del@x", data_folder=df, manage_service=False)
+    assert res["deleted"] == 1
+    assert _os.path.isfile(res["backup"])         # a recoverable backup was taken
+    # the backup still has BOTH users (it was copied before the delete)
+    con = sqlite3.connect(res["backup"])
+    assert sorted(r[0] for r in con.execute("SELECT email FROM users")) == ["del@x", "keep@x"]
+    con.close()
