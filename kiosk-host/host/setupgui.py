@@ -1228,6 +1228,17 @@ class SetupAssistant:
         email = self._entry(m.vault_email, self.setup.v_email, _set_email)
         url = self._entry(m.vault_url, self.setup.v_url, _set_url)
 
+        # VW auto-detect: probe /alive on the entered URL + the common local defaults
+        # and fill the first that answers, so the operator needn't know the port.
+        detect_btn = Gtk.Button(label="Detect")
+        detect_btn.get_style_context().add_class("soc-ghost")
+        detect_btn.set_tooltip_text(
+            "Probe Vaultwarden's /alive on this URL and the common local defaults; "
+            "fill in the first that answers.")
+        url_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        url_box.pack_start(url, True, True, 0)
+        url_box.pack_start(detect_btn, False, False, 0)
+
         # Selectable-source availability is a CAPABILITY probe for the wizard, NOT
         # mastersource.available_sources() (which means "usable RIGHT NOW" and only
         # lists 'sealed' once a seal already exists — wrong for a fresh box). Here
@@ -1384,6 +1395,54 @@ class SetupAssistant:
             threading.Thread(target=_worker, daemon=True).start()
 
         test_btn.connect("clicked", on_test)
+
+        def _detect_done(found):
+            self._vault_test_running = False
+            detect_btn.set_sensitive(m.vault_backend != "dev")
+            if found:
+                url.set_text(found)      # fires _set_url -> model + re-arm gate
+                _set_test(f'<span foreground="{self.branding.color("good")}">'
+                          f'● Found Vaultwarden at {_esc(found)} — now Test (or '
+                          f'Create / Forgot master).</span>')
+            else:
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Nothing answered /alive on this URL or the common local '
+                          f'defaults — is vaultwarden.service running?</span>')
+            self._recheck_vault(page)
+            return False
+
+        def on_detect(_b):
+            if m.vault_backend == "dev":
+                return
+            cands = []
+            for u in (m.vault_url, "http://127.0.0.1:8222", "http://localhost:8222",
+                      "https://127.0.0.1:8222"):
+                u = (u or "").strip().rstrip("/")
+                if u and u not in cands:
+                    cands.append(u)
+            self._vault_test_running = True
+            detect_btn.set_sensitive(False)
+            _set_test(f'<span foreground="{self.branding.color("text_dim")}">'
+                      f'… probing for Vaultwarden</span>')
+            self._recheck_vault(page)
+
+            def _worker():
+                import urllib.request
+                found = None
+                for u in cands:
+                    try:
+                        with urllib.request.urlopen(u + "/alive", timeout=2.0) as r:
+                            if getattr(r, "status", 200) == 200:
+                                found = u
+                                break
+                    except Exception:  # noqa: BLE001 — unreachable candidate
+                        continue
+                self.GLib.idle_add(_detect_done, found)
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        detect_btn.connect("clicked", on_detect)
 
         def _reset_done(ok, payload):
             self._vault_test_running = False
@@ -1661,12 +1720,33 @@ class SetupAssistant:
 
         forget_btn.connect("clicked", on_forget)
 
+        # In-GUI panel-login editor: fill each configured panel's username/password
+        # straight into Vaultwarden (no web vault needed). Needs a master + URL.
+        login_btn = Gtk.Button(label="Edit panel logins…")
+        login_btn.get_style_context().add_class("soc-ghost")
+        login_btn.set_tooltip_text(
+            "Set each configured panel's username + password and write them straight "
+            "into Vaultwarden (item name = the panel's vault item). Needs the master "
+            "above.")
+
+        def on_edit_logins(_b):
+            if m.vault_backend == "dev":
+                return
+            master = pw.get_text()
+            if not (m.vault_url and m.vault_email and master):
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ Enter URL, email and the master first, then edit logins.'
+                          f'</span>')
+                return
+            self._open_panel_login_editor(m.vault_url, m.vault_email, master)
+        login_btn.connect("clicked", on_edit_logins)
+
         def on_backend(*_):
             be = backend.get_active_text() or "dev"
             m.vault_backend = be
             dev = be == "dev"
             for w in (email, url, pw, pin, source, test_btn, reset_btn,
-                      create_btn):
+                      create_btn, detect_btn, login_btn):
                 w.set_sensitive(not dev)
             # Create is ALWAYS present for a real backend (litebw/rbw) — so the
             # fresh-box "account never registered" path is reachable without first
@@ -1706,7 +1786,7 @@ class SetupAssistant:
 
         page.pack_start(self._row("Vault backend", backend), False, False, 0)
         page.pack_start(self._row("Account email", email), False, False, 0)
-        page.pack_start(self._row("Vaultwarden URL", url), False, False, 0)
+        page.pack_start(self._row("Vaultwarden URL", url_box), False, False, 0)
         page.pack_start(self._row("Master source", source), False, False, 0)
         page.pack_start(self._row("Master password", pw), False, False, 0)
         page.pack_start(self._row("One-time PIN", pin), False, False, 0)
@@ -1718,6 +1798,7 @@ class SetupAssistant:
         page.pack_start(self._row("", btn_row), False, False, 0)
         page.pack_start(test_status, False, False, 0)
         page.pack_start(self._row("", seed_chk), False, False, 0)
+        page.pack_start(self._row("", login_btn), False, False, 0)
         page.pack_start(hint, False, False, 0)
 
         on_backend()
@@ -2426,6 +2507,118 @@ class SetupAssistant:
         except Exception as e:  # noqa: BLE001 — treat any spawn fault as failed
             return (126, f"pkexec escalation failed: {e}")
         return (p.returncode, (p.stderr or "").strip())
+
+    def _open_panel_login_editor(self, url: str, email: str, master: str):
+        """Modal-ish editor: one row per configured panel (vault item + URL) with a
+        username + password field -> vaultseed.upsert_login (master in memory, never
+        written). Lets the operator fill the logins the wall reads IN-GUI instead of
+        the web vault. Non-blocking (no Gtk.Dialog.run): the dialog manages its own
+        Save/Close so the parent loop keeps running. MAIN-thread only."""
+        Gtk = self.Gtk
+        items = []
+        for p in self.model.cfg().get("panels", []):
+            if p.get("vault_item"):
+                items.append((p["vault_item"], p.get("url", "")))
+        dlg = Gtk.Dialog(title="Panel logins", transient_for=self.assistant,
+                         modal=True)
+        try:
+            dlg.get_style_context().add_class("soc-config")
+        except Exception:  # noqa: BLE001
+            pass
+        dlg.set_default_size(560, -1)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        if not items:
+            lbl = Gtk.Label(xalign=0, wrap=True)
+            lbl.set_markup(f'<span foreground="{self.branding.color("text")}">'
+                           f'No panels with a vault item are configured.</span>')
+            box.add(lbl)
+            dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+            dlg.connect("response", lambda d, _r: d.destroy())
+            dlg.show_all()
+            return
+        intro = Gtk.Label(xalign=0, wrap=True)
+        intro.set_markup(
+            f'<span foreground="{self.branding.color("text_dim")}">Set each panel’s '
+            f'login — saved straight into Vaultwarden (item name = the panel’s vault '
+            f'item). Leave a row blank to skip it.</span>')
+        box.add(intro)
+        grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+        for c, head in enumerate(("Panel item", "Username", "Password")):
+            h = Gtk.Label(xalign=0)
+            h.set_markup(f'<span foreground="{self.branding.color("text")}">{head}</span>')
+            grid.attach(h, c, 0, 1, 1)
+        rows = []
+        for i, (name, uri) in enumerate(items, start=1):
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup(f'<span foreground="{self.branding.color("text")}">'
+                           f'{_esc(name)}</span>')
+            user_e = Gtk.Entry()
+            user_e.set_hexpand(True)
+            pass_e = Gtk.Entry()
+            pass_e.set_visibility(False)
+            pass_e.set_hexpand(True)
+            grid.attach(lbl, 0, i, 1, 1)
+            grid.attach(user_e, 1, i, 1, 1)
+            grid.attach(pass_e, 2, i, 1, 1)
+            rows.append((name, uri, user_e, pass_e))
+        box.add(grid)
+        status = Gtk.Label(xalign=0, wrap=True)
+        box.add(status)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        save = dlg.add_button("Save logins", Gtk.ResponseType.APPLY)
+        save.get_style_context().add_class("soc-primary")
+
+        def _on_response(d, resp):
+            if resp != Gtk.ResponseType.APPLY:
+                d.destroy()
+                return
+            payload = [(n, uri, ue.get_text(), pe.get_text())
+                       for (n, uri, ue, pe) in rows
+                       if ue.get_text() or pe.get_text()]
+            if not payload:
+                status.set_markup(f'<span foreground="{self.branding.color("bad")}">'
+                                  f'Nothing to save (every row is blank).</span>')
+                return
+            save.set_sensitive(False)
+            status.set_markup(f'<span foreground="{self.branding.color("text_dim")}">'
+                              f'… saving {len(payload)} login(s)</span>')
+
+            def _worker():
+                try:
+                    from host import vaultseed  # type: ignore
+                except Exception as e:  # noqa: BLE001
+                    self.GLib.idle_add(_fin, 0, 0, f"vault writer unavailable: {e}")
+                    return
+                done = 0
+                err = ""
+                for n, uri, u, p in payload:
+                    try:
+                        vaultseed.upsert_login(url, email, master, n, u, p,
+                                               uri=uri or None)
+                        done += 1
+                    except Exception as e:  # noqa: BLE001 — collect first cause
+                        err = err or str(e)
+                self.GLib.idle_add(_fin, done, len(payload), err)
+
+            def _fin(done, total, err):
+                save.set_sensitive(True)
+                if done == total:
+                    status.set_markup(
+                        f'<span foreground="{self.branding.color("good")}">'
+                        f'● saved {done}/{total} login(s).</span>')
+                else:
+                    status.set_markup(
+                        f'<span foreground="{self.branding.color("bad")}">'
+                        f'✗ saved {done}/{total}; first error: {_esc(err)}</span>')
+                return False
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        dlg.connect("response", _on_response)
+        dlg.show_all()
 
     def _provision_shell_via_pkexec(self, opts):
         """Run the privileged shell steps (packages/users/deploy/units) via the
