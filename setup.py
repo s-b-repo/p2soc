@@ -1497,8 +1497,9 @@ def cmd_doctor(args) -> int:
         d.check("config source", lambda: (
             "OK", f"vault note '{item}' (local file fallback)", ""))
 
-    # file perms
-    for f, want in ((paths["soc_env"], 0o640),):
+    # file perms — soc.env is non-secret (master sealed separately) and 0644 so
+    # the desktop/kiosk user can source it; the check ceiling allows 0644.
+    for f, want in ((paths["soc_env"], 0o644),):
         if os.path.exists(f):
             d.check(f"perms {os.path.basename(f)}", (lambda f=f, want=want: (
                 ("OK", oct(os.stat(f).st_mode & 0o777), "")
@@ -1644,8 +1645,9 @@ def cmd_repair(args) -> int:
             _run([backend, "config", "set", "pinentry", paths["pinentry"]])
             ok(f"{backend} pinentry -> pinentry-vault.py")
 
-    # 4) file perms
-    for f, mode in ((paths["soc_env"], 0o640),):
+    # 4) file perms — soc.env 0644 (non-secret) so the desktop/kiosk user can
+    #    source it; repairing to 0640 would re-break desktop-mode vault unlock.
+    for f, mode in ((paths["soc_env"], 0o644),):
         if os.path.exists(f) and not env.is_root and target == "pi":
             note(f"(need root to chmod {f})")
         elif os.path.exists(f):

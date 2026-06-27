@@ -524,7 +524,7 @@ install_template(){  # src dst mode owner
     cp "$1" "$2"; chmod "$3" "$2"; chown "$4" "$2"; log "created $2"; fi
 }
 install_template "$SOC_ROOT/config/panels.yaml"          "$ETC/panels.yaml"      0644 "root:root"
-install_template "$SOC_ROOT/config/soc.env.example"      "$ETC/soc.env"          0640 "root:$KIOSK_USER"
+install_template "$SOC_ROOT/config/soc.env.example"      "$ETC/soc.env"          0644 "root:root"
 # Vaultwarden config is inline in its systemd unit (no .env) — nothing to install.
 chmod 0750 "$ETC/keys"; chown "$SVC_USER:$SVC_USER" "$ETC/keys"
 # Host-bound sealed vault secret (master.enc / pin.enc) — owned by the kiosk user
@@ -535,17 +535,15 @@ mkdir -p "$ETC/secret"; chmod 0700 "$ETC/secret"; chown "$KIOSK_USER:$KIOSK_USER
 # (the panels write it). A SIBLING of secret/, not inside it, so the sealed-master
 # guarantee is untouched. The wall creates per-panel 0700 subdirs on first use.
 mkdir -p "$ETC/webdata"; chmod 0700 "$ETC/webdata"; chown "$KIOSK_USER:$KIOSK_USER" "$ETC/webdata"
-# soc.env must be readable by BOTH the kiosk user (sources it at session start)
-# and the autossh service user — but NEVER world-readable (it holds the vault
-# email/URL, secret-dir path and config-item name). Prefer an ACL; if ACLs are
-# unavailable, fall back to a shared group (add the service user to the kiosk
-# user's group). The sealed-secret dir stays 0700, so this grants soc.env only.
-if ! setfacl -m u:"$SVC_USER":r "$ETC/soc.env" 2>/dev/null; then
-  warn "setfacl unavailable — granting $SVC_USER read on soc.env via group membership (not world-readable)"
-  usermod -aG "$KIOSK_USER" "$SVC_USER" 2>/dev/null \
-    || warn "could not add $SVC_USER to group $KIOSK_USER; autossh may not read soc.env"
-  chown "root:$KIOSK_USER" "$ETC/soc.env"; chmod 0640 "$ETC/soc.env"
-fi
+# soc.env is NON-SECRET (vault email/URL, secret-dir PATH, config-item name,
+# ports, timeouts — NO password; the master is sealed 0600 under $ETC/secret).
+# It is 0644 root:root so EVERY launch path can source it: the kiosk user (tty1
+# session), the desktop user (a DE session via soc-wall-desktop.sh — which may be
+# ANY logged-in operator, not a fixed account), and the autossh/forti service
+# users. A non-readable soc.env is the #1 cause of "desktop mode can't unlock the
+# vault" (the launcher silently skips an unreadable env -> empty SOC_VAULT_EMAIL).
+# The actual secret (the sealed master) stays 0700/0600, so this exposes no creds.
+chmod 0644 "$ETC/soc.env"; chown root:root "$ETC/soc.env"
 
 # default the vault backend to litebw (pure-Python; rbw/dev stay selectable).
 # The shipped soc.env.example already defaults to litebw; this only migrates a

@@ -27,6 +27,13 @@ if [ -r "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+elif [ -e "$ENV_FILE" ]; then
+  # soc.env exists but THIS user cannot read it -> the vault config (email/URL)
+  # never loads and unlock fails with an empty account. soc.env is NON-SECRET
+  # (the master is sealed separately), so surface this loudly instead of silently
+  # skipping it. The #1 cause of "desktop mode can't unlock the vault".
+  echo "WARNING: $ENV_FILE exists but is not readable by $(id -un 2>/dev/null) —" >&2
+  echo "  the wall's vault config will not load. Fix: sudo chmod 0644 $ENV_FILE" >&2
 fi
 
 # Send everything to the journal when possible: `journalctl -t soc-kiosk -f`

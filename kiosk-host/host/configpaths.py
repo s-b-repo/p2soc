@@ -198,7 +198,8 @@ def resolve_write(kind: str, *, want_etc: bool = True,
     Returns a dict:
       path            absolute file path to write
       dir             its parent directory (the caller mkdir -p's it)
-      mode            octal file mode (0644 panels everywhere; env 0640 /etc, 0600 user)
+      mode            octal file mode (0644 panels + /etc env [non-secret, must be readable
+      #                  by the desktop/kiosk user]; 0600 user-tier env)
       needs_privilege True when want_etc but /etc is not writable and we will escalate
       via             'env' | 'etc' | 'user' | 'repo'  — which tier was chosen
       marker          path of the marker to write (user tier only), else None
@@ -222,7 +223,7 @@ def resolve_write(kind: str, *, want_etc: bool = True,
         d = os.path.dirname(ov) or "."
         if _dir_writable(d):
             return dict(path=ov, dir=d,
-                        mode=(panels_mode if kind == "panels" else 0o640),
+                        mode=(panels_mode if kind == "panels" else 0o644),
                         needs_privilege=False, via="env", marker=None)
 
     # B/C. /etc — canonical deployed. Writable directly, or via pkexec escalation.
@@ -230,11 +231,11 @@ def resolve_write(kind: str, *, want_etc: bool = True,
         etc_path = os.path.join(ETC_DIR, base)
         if _dir_writable(ETC_DIR):
             return dict(path=etc_path, dir=ETC_DIR,
-                        mode=(panels_mode if kind == "panels" else 0o640),
+                        mode=(panels_mode if kind == "panels" else 0o644),
                         needs_privilege=False, via="etc", marker=None)
         if can_escalate:
             return dict(path=etc_path, dir=ETC_DIR,
-                        mode=(panels_mode if kind == "panels" else 0o640),
+                        mode=(panels_mode if kind == "panels" else 0o644),
                         needs_privilege=True, via="etc", marker=None)
 
     # E. dev checkout — when SOC_ROOT is the repo and /etc isn't the target, prefer
@@ -346,7 +347,7 @@ def _write_atomic(path: str, text: str, mode: int) -> str:
 
 def _install_etc() -> int:
     """pkexec helper: read rendered panels.yaml + soc.env from STDIN and write them
-    root-owned into /etc/soc-display (panels 0644, env 0640). Content comes from
+    root-owned into /etc/soc-display (panels 0644, env 0644 — non-secret). Content comes from
     STDIN — NEVER argv — so panel URLs / emails never appear on the process table,
     and SOC_VAULT_PASSWORD is never passed in (it isn't in soc.env). Input format:
         ---PANELS---\n<panels.yaml>\n---ENV---\n<soc.env>
@@ -377,7 +378,7 @@ def _install_etc() -> int:
         # Stage BOTH temps fully (written + fsync'd, final mode baked in) before
         # swapping either — so the swap step can't be interrupted half-way.
         p_tmp = _write_atomic(pf, panels_text, 0o644)
-        e_tmp = _write_atomic(ef, env_text, 0o640)
+        e_tmp = _write_atomic(ef, env_text, 0o644)
         os.replace(p_tmp, pf)
         p_tmp = None
         os.replace(e_tmp, ef)
@@ -398,7 +399,7 @@ def _install_etc() -> int:
                 except OSError:
                     pass
     # Best-effort group: leave to install.sh/setfacl for the kiosk user's read access.
-    sys.stdout.write(f"wrote {pf} (0644) and {ef} (0640)\n")
+    sys.stdout.write(f"wrote {pf} (0644) and {ef} (0644)\n")
     return 0
 
 

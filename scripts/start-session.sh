@@ -29,11 +29,16 @@ if [ -n "$RESOLVE_PY" ]; then
 fi
 : "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
 ENV_FILE="$SOC_ENV_FILE"
-if [ -f "$ENV_FILE" ]; then
+if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+elif [ -e "$ENV_FILE" ]; then
+  # exists but unreadable -> vault config never loads (and -f + source would abort
+  # the session under set -e). soc.env is non-secret; surface it loudly.
+  echo "[start-session] WARNING: $ENV_FILE exists but is not readable by $(id -un 2>/dev/null) —" >&2
+  echo "[start-session]   vault config not loaded. Fix: sudo chmod 0644 $ENV_FILE" >&2
 fi
 
 log() { echo "[start-session] $*" >&2; }
