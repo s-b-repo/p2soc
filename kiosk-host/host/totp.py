@@ -129,7 +129,7 @@ def provision_uri(secret_b32: str, label: str, issuer: str = "SOC Wall",
     # every authenticator app expects.
     label_q = urllib.parse.quote(f"{issuer}:{label}", safe=":/@")
     params = urllib.parse.urlencode({
-        "secret": secret_b32.replace(" ", "").upper(),
+        "secret": secret_b32.replace(" ", "").upper().rstrip("="),
         "issuer": issuer,
         "algorithm": algorithm.upper(),
         "digits": digits,
