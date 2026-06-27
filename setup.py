@@ -1526,7 +1526,28 @@ def cmd_doctor(args) -> int:
                     "matches your kiosk user")
         d.check("reconnect sudoers rule", _sudoers_reconnect)
 
+    # Fresh-box detection: if the kiosk/desktop/service users or /opt/soc-display
+    # are missing, this box has never been fully installed — `repair` only patches
+    # an existing install, so steer the operator to the full-install path
+    # (provision == the GUI's "Install on this system": users + packages + deploy +
+    # vault + seal). repair/doctor alone won't create users or deploy /opt.
+    fresh_box = False
+    if provision is not None:
+        try:
+            kiosk_u = soc_env.get("SOC_KIOSK_USER") or "soc"
+            no_users = not any(provision._user_exists(u)
+                               for u in (kiosk_u, "socwall", "socsvc"))
+            no_opt = not os.path.isdir("/opt/soc-display")
+            fresh_box = no_users or no_opt
+        except Exception:  # noqa: BLE001
+            fresh_box = False
+
     print()
+    if fresh_box:
+        warn("this box is not fully installed yet (missing users and/or /opt/soc-display)")
+        print(dim("   run: setup.py provision  "
+                   "(full install: users + packages + deploy + vault + seal)"))
+        print(dim("   or:  setup.py provision --dry-run   (preview, changes nothing)"))
     if d.fails:
         print(red(f"   {d.fails} problem(s), {d.warns} warning(s) — run: setup.py repair"))
         return 1
@@ -1621,6 +1642,21 @@ def cmd_repair(args) -> int:
 
     print()
     note("re-run `setup.py doctor` to confirm.")
+    # repair only patches an EXISTING install (venv/packages/keys/perms). A fresh
+    # box with no kiosk/desktop/service users or no /opt/soc-display needs the
+    # full-install path instead — the same provisioner the GUI's "Install on this
+    # system" runs (users + packages + deploy + vault + seal).
+    if provision is not None:
+        try:
+            kiosk_u = soc_env.get("SOC_KIOSK_USER") or "soc"
+            fresh_box = (not os.path.isdir("/opt/soc-display")) or not any(
+                provision._user_exists(u) for u in (kiosk_u, "socwall", "socsvc"))
+        except Exception:  # noqa: BLE001
+            fresh_box = False
+        if fresh_box:
+            note("this looks like a fresh box — a full install needs "
+                 "`setup.py provision` (users + packages + deploy + vault + seal), "
+                 "not just repair.")
     return 0
 
 
@@ -2111,7 +2147,14 @@ def cmd_deploy(args) -> int:
         fresh = run_install
     else:
         run_install = ask_bool("Step 1/6 — install OS packages + services (install.sh)?", True)
-    if run_install and has_pm:
+    if run_install and has_pm and args.dry_run:
+        # install.sh has no --dry-run flag and mutates the host (creates users,
+        # builds the venv, installs packages). Honour the dry-run contract by
+        # PRINTING what would run and changing nothing — never shell the installer.
+        cmd = ["./install.sh"] + (["--fresh"] if fresh else [])
+        note("Step 1/6 — [dry-run] would run: "
+             + " ".join((cmd if env.is_root else ["sudo"] + cmd)))
+    elif run_install and has_pm:
         cmd = ["./install.sh"] + (["--fresh"] if fresh else [])
         rc = _run(cmd if env.is_root else ["sudo"] + cmd)
         if rc not in (0, None):
@@ -2138,7 +2181,10 @@ def cmd_deploy(args) -> int:
     if is_vault:
         url = soc_env.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
         email = soc_env.get("SOC_VAULT_EMAIL", "")
-        if _have("systemctl") and os.path.isdir("/run/systemd/system"):
+        if args.dry_run and _have("systemctl") and os.path.isdir("/run/systemd/system"):
+            note("Step 3/6 — [dry-run] would start Vaultwarden "
+                 "(systemctl start vaultwarden) and wait for /alive.")
+        elif _have("systemctl") and os.path.isdir("/run/systemd/system"):
             if ask_bool("Step 3/6 — start Vaultwarden (systemctl start vaultwarden)?",
                         target == "pi"):
                 _run(["systemctl", "start", "vaultwarden"] if env.is_root
