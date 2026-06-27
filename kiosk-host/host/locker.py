@@ -90,6 +90,24 @@ def clear_pin(state_dir: str) -> None:
         pass
 
 
+def set_totp(state_dir: str, secret_b32: str) -> None:
+    """Enroll a panel-lock TOTP secret (base32). Stored 0600 at _totp_path via
+    host.totp's writer. Empty/None clears it, mirroring set_pin's shape."""
+    if not secret_b32:
+        clear_totp(state_dir)
+        return
+    _totp.save(_totp_path(state_dir), secret_b32)
+
+
+def clear_totp(state_dir: str) -> None:
+    _totp.clear(_totp_path(state_dir))
+
+
+def load_totp(state_dir: str) -> str | None:
+    """The stored panel-lock TOTP secret (base32), or None if not enrolled."""
+    return _totp.load(_totp_path(state_dir))
+
+
 def verify_pin(state_dir: str, pin: str) -> bool:
     try:
         with open(_pin_path(state_dir), "r", encoding="utf-8") as fh:
@@ -128,7 +146,7 @@ def verify_any(state_dir: str, code: str) -> bool:
         return False
     code = code.strip()
     if totp_is_set(state_dir):
-        s = _totp.load(_totp_path(state_dir))
+        s = load_totp(state_dir)
         if s and _totp.verify(s, code):
             return True
     if pin_is_set(state_dir) and verify_pin(state_dir, code):

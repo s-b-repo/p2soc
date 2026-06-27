@@ -12,9 +12,9 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _KIOSK = os.path.join(_REPO, "kiosk-host")
 
 
-def test_six_grouped_entries_with_system_actions():
+def test_seven_grouped_entries_with_system_actions():
     e = launchermenu._ENTRIES
-    assert len(e) == 6
+    assert len(e) == 7
     # each row is now an 8-tuple: (section, glyph, title, sub, tag, class, ckey, action)
     assert all(len(row) == 8 for row in e)
     # action is a plain callable OR a known in-process sentinel (install/uninstall).
@@ -26,6 +26,9 @@ def test_six_grouped_entries_with_system_actions():
     # configure group: Appearance still wired to launch_appearance.
     assert by_class["soc-appearance"][-1] is launchermenu.launch_appearance
     assert by_class["soc-appearance"][2] == "Appearance"
+    # configure group: the new Credentials & Security tile -> launch_credentials.
+    assert by_class["soc-credentials"][-1] is launchermenu.launch_credentials
+    assert by_class["soc-credentials"][2] == "Credentials & Security"
     # system group: Install/Uninstall sentinels (in-process, need the window).
     assert by_class["soc-install"][-1] == launchermenu._ACT_INSTALL
     assert by_class["soc-uninstall"][-1] == launchermenu._ACT_UNINSTALL
@@ -37,9 +40,9 @@ def test_six_grouped_entries_with_system_actions():
 
 
 def test_entries_use_known_mode_glyphs():
-    # index-1 is the mode GLYPH key (gear/window/expand/swatch/download/trash).
+    # index-1 is the mode GLYPH key (gear/window/expand/swatch/shield/download/trash).
     keys = [row[1] for row in launchermenu._ENTRIES]
-    assert keys == ["window", "expand", "gear", "swatch", "download", "trash"]
+    assert keys == ["window", "expand", "gear", "swatch", "shield", "download", "trash"]
     assert all(k in launchermenu._GLYPHS for k in keys)
     # each glyph template renders a non-empty accent-stroked SVG body (headless,
     # no gi) and has a unicode fallback so a box without the SVG loader still shows.
@@ -65,6 +68,10 @@ def test_launch_appearance_is_callable():
     assert callable(launchermenu.launch_appearance)
 
 
+def test_launch_credentials_is_callable():
+    assert callable(launchermenu.launch_credentials)
+
+
 def test_health_is_installed_force_override(monkeypatch):
     # The adaptive // system group keys off health.is_installed(); the
     # SOC_FORCE_INSTALLED override (verify's analogue of SOC_VAULT_BACKEND=dev) must
@@ -87,7 +94,7 @@ def test_reapply_safe_without_provider():
 
 
 def test_check_smoke_no_gi():
-    """`--check` must validate the 6-tile control-center wiring in a fresh
+    """`--check` must validate the 7-tile control-center wiring in a fresh
     interpreter without importing gi (sysaction._check runs headless too)."""
     code = (
         "import sys\n"

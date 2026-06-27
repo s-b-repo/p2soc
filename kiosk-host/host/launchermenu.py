@@ -127,6 +127,20 @@ def launch_appearance() -> "tuple[bool, str]":
     return _spawn([_venv_python(), "-m", "host.appearance"], cwd=kiosk, env=env)
 
 
+def launch_credentials() -> "tuple[bool, str]":
+    """Open the credentials & security control center (vault logins + PIN/TOTP store).
+    Prefer the shell wrapper (detached, so the menu can stay open / exit independently);
+    fall back to spawning host.configcenter under the venv interpreter."""
+    sh = _script("soc-wall-credentials.sh")
+    if os.path.exists(sh):
+        return _spawn(["bash", sh])
+    kiosk = os.path.join(ROOT, "kiosk-host")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = kiosk + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    # Venv interpreter (deps live there), not the menu's own — same as scripts/*.sh.
+    return _spawn([_venv_python(), "-m", "host.configcenter"], cwd=kiosk, env=env)
+
+
 # (section, glyph, title, subtitle, tag, css_class, colour_key, action). `section`
 # is the '// ' eyebrow this tile lives under (run/configure/system); the build loop
 # emits the eyebrow when the section changes. `glyph` names the per-tile mode icon
@@ -147,6 +161,8 @@ _ENTRIES = (
      "soc-setup", "setup", launch_setup),
     ("configure", "swatch", "Appearance", "Theme colours & presets", "",
      "soc-appearance", "primary", launch_appearance),
+    ("configure", "shield", "Credentials & Security", "Vault logins, PIN & TOTP", "",
+     "soc-credentials", "setup", launch_credentials),
     ("system", "download", "Install / Update", "Deploy or update the wall", "",
      "soc-install", "accent_strong", _ACT_INSTALL),
     ("system", "trash", "Uninstall", "Remove the deployed wall", "",
@@ -247,6 +263,16 @@ def _svg_swatch(ac: str) -> str:
             f'<rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.3"/></g>')
 
 
+def _svg_shield(ac: str) -> str:
+    # shield outline + a keyhole — reads as "credentials / security" at 22px.
+    return (f'<g fill="none" stroke="{ac}" stroke-width="1.6" '
+            f'stroke-linejoin="round" stroke-linecap="round">'
+            f'<path d="M12 3.2 L19 6 V11.5 C19 16 15.8 19.2 12 20.8 '
+            f'C8.2 19.2 5 16 5 11.5 V6 Z"/>'
+            f'<circle cx="12" cy="10.5" r="1.9"/>'
+            f'<path d="M12 12.4 V15.2"/></g>')
+
+
 def _svg_download(ac: str) -> str:
     # tray + down-arrow into it — "box-in / install / deploy onto this box".
     return (f'<g fill="none" stroke="{ac}" stroke-width="1.8" '
@@ -267,10 +293,12 @@ def _svg_trash(ac: str) -> str:
 
 _GLYPHS = {"gear": _svg_gear, "window": _svg_window,
            "expand": _svg_expand, "swatch": _svg_swatch,
+           "shield": _svg_shield,
            "download": _svg_download, "trash": _svg_trash}
 # Unicode fallback per glyph (themed Pango) if the SVG loader is unavailable.
 _GLYPH_FALLBACK = {"gear": "⚙", "window": "▢",
                    "expand": "⤢", "swatch": "▦",
+                   "shield": "⛨",
                    "download": "⤓", "trash": "✕"}
 
 
@@ -324,6 +352,7 @@ def _css(colors=None) -> bytes:
     setup, desktop, kiosk = (col("setup", "#1FA463"), col("desktop", "#1FA463"),
                              col("kiosk", "#0E7C7B"))
     appearance = col("primary", "#1FA463")  # the Appearance tile uses the brand accent
+    credentials = col("setup", "#1FA463")   # credentials/security rides the setup accent
     glow = _rgba(accent, 0.28)
     emph_glow = _rgba(accent, 0.22)
     bad_glow = _rgba(bad, 0.26)
@@ -377,6 +406,7 @@ window.soc-launcher {{ background-color: {bg}; }}
 {card("soc-desktop", desktop)}
 {card("soc-kiosk", kiosk)}
 {card("soc-appearance", appearance)}
+{card("soc-credentials", credentials)}
 {card("soc-install", accent_strong)}
 .soc-tag {{ background-color: {s_bot}; border: 1px solid {border};
   border-radius: 4px; padding: 2px 9px; color: {text_dim}; }}
@@ -1242,9 +1272,9 @@ def _build_window():
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--check" in argv:               # CI: verify wiring, no GTK / no display
-        # SIX tiles now, each an 8-tuple (section, glyph, title, sub, tag, class,
+        # SEVEN tiles now, each an 8-tuple (section, glyph, title, sub, tag, class,
         # colour_key, action) with a callable-or-sentinel action.
-        assert len(_ENTRIES) == 6
+        assert len(_ENTRIES) == 7
         assert all(len(e) == 8 for e in _ENTRIES), "every entry is an 8-tuple"
         assert all(callable(e[-1]) or e[-1] in (_ACT_INSTALL, _ACT_UNINSTALL)
                    for e in _ENTRIES), "action must be callable or a known sentinel"
@@ -1252,6 +1282,7 @@ def main(argv=None) -> int:
         assert all(e[0] in _SECTIONS for e in _ENTRIES), "unknown section in _ENTRIES"
         by_class = {e[5]: e for e in _ENTRIES}
         assert by_class["soc-appearance"][-1] is launch_appearance
+        assert by_class["soc-credentials"][-1] is launch_credentials
         assert by_class["soc-install"][-1] == _ACT_INSTALL
         assert by_class["soc-uninstall"][-1] == _ACT_UNINSTALL
         # Spawn-tile contract: the helpers return (ok, reason) so the menu can gate
@@ -1263,7 +1294,7 @@ def main(argv=None) -> int:
         # every tile names a known mode glyph (the per-tile inline-SVG icon), and the
         # new system glyphs exist with unicode fallbacks.
         assert all(e[1] in _GLYPHS for e in _ENTRIES), "unknown glyph key in _ENTRIES"
-        for g in ("download", "trash"):
+        for g in ("shield", "download", "trash"):
             assert g in _GLYPHS and g in _GLYPH_FALLBACK, f"missing glyph {g!r}"
         # the honest dot is health-driven: health must import + map every level
         # headless (no GTK), and dot_for must produce a real (level, label).

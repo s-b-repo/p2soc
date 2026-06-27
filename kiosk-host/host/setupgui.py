@@ -515,6 +515,11 @@ def _css(branding) -> bytes:
     good = col("good", "#1FA463")
     bad = col("bad", "#C0341D")
     glow = _rgba(accent, 0.28)
+    ring = _rgba(accent, 0.34)              # crisper focus-visible ring
+    # A soft neutral drop-shadow for the slightly-elevated card (text-derived so it
+    # stays subtle on both light and dark palettes — never a hard black box).
+    shade = _rgba(text, 0.10)
+    shade_hi = _rgba(text, 0.16)
     # On-surface accent for the section-title TEXT (sits on `surface`): swap the
     # brand green for accent_strong where it dips below AA on the tinted surface.
     accent_surf = branding.accent_on(surface, accent=accent, strong=accent_strong)
@@ -534,30 +539,45 @@ def _css(branding) -> bytes:
     return f"""
 window.soc-assistant {{ background-color: {bg}; }}
 assistant.soc-assistant {{ background-color: {bg}; }}
-.soc-assistant {{ background-color: {bg}; color: {text}; }}
+.soc-assistant {{ background-color: {bg}; color: {text};
+  font-size: 11pt; }}
+/* Stand-alone dialogs (e.g. the "Panel logins" window) carry the .soc-config
+   class. GTK auto-adds `background` to top-level windows, so give both the
+   palette surface + a readable default text colour — otherwise the dialog
+   keeps the stock (light) theme while its labels use our palette text colour,
+   i.e. pale-on-light on the dark presets. */
+.soc-config, .soc-config.background {{ background-color: {bg}; color: {text}; }}
 .soc-assistant headerbar {{ background-color: {surface};
   border-bottom: 1px solid {border}; box-shadow: inset 0 2px 0 {accent}; }}
 .soc-header {{ background-color: {surface};
   border-top: 2px solid {accent}; border-bottom: 1px solid {border};
-  padding: 16px 20px 14px 20px; }}
-.soc-page {{ background-color: {surface}; padding: 16px 18px; }}
-.soc-section-title {{ color: {accent_surf}; font-weight: bold; }}
-.soc-divider {{ background-color: {border}; min-height: 1px; }}
+  padding: 18px 22px 16px 22px; }}
+.soc-page {{ background-color: {surface}; padding: 20px 22px; }}
+.soc-section-title {{ color: {accent_surf}; font-weight: bold;
+  font-size: 12.5pt; letter-spacing: 0.2px; }}
+.soc-divider {{ background-color: {border}; min-height: 1px;
+  margin: 4px 0 4px 0; }}
 
+/* Cards: a slightly elevated surface (soft neutral drop-shadow at rest) with a
+   thicker accent left-rule and roomier padding; hover lifts it further with the
+   accent ring + green glow. Visual-only — class name unchanged. */
 .soc-card {{ background-color: {surface};
-  border: 1px solid {border}; border-left: 4px solid {setup_c}; border-radius: 6px;
-  padding: 13px 16px; transition: all 160ms ease; }}
+  border: 1px solid {border}; border-left: 4px solid {setup_c}; border-radius: 8px;
+  padding: 15px 18px; box-shadow: 0 1px 3px {shade}; transition: all 150ms ease; }}
 .soc-card:hover {{ border-color: {accent}; background-color: {sunken};
-  box-shadow: inset 0 0 0 1px {accent}, 0 6px 18px {glow}; }}
+  box-shadow: inset 0 0 0 1px {accent}, 0 8px 22px {shade_hi}, 0 0 0 0 {glow}; }}
 .soc-card:checked {{ border-color: {accent}; border-left: 4px solid {accent};
-  background-color: {sunken}; }}
+  background-color: {sunken}; box-shadow: inset 0 0 0 1px {accent}, 0 2px 6px {shade}; }}
+.soc-card:focus, .soc-card:focus-visible {{ outline: none;
+  box-shadow: 0 0 0 2px {ring}, 0 1px 3px {shade}; }}
 
 /* Gtk.Assistant left page-list sidebar — recolour the default-GTK selection
    (blue) current-page marker to a green left-bar + green-tinted fill so the
    page list reads as the green console, not stock GTK. */
 .soc-assistant .sidebar {{ background-color: {surface};
-  border-right: 1px solid {border}; }}
-.soc-assistant .sidebar label {{ color: {text_dim}; padding: 4px 10px; }}
+  border-right: 1px solid {border}; padding: 6px 4px; }}
+.soc-assistant .sidebar label {{ color: {text_dim}; padding: 5px 12px;
+  border-radius: 5px; }}
 .soc-assistant .sidebar label.highlight {{ background-color: {sunken};
   color: {accent_strong}; box-shadow: inset 3px 0 0 {accent}; font-weight: bold; }}
 
@@ -567,38 +587,48 @@ assistant.soc-assistant {{ background-color: {bg}; }}
   margin: 0; padding: 0; border: 0; background: none; box-shadow: none; }}
 
 entry {{ background-color: {sunken}; color: {text};
-  border: 1px solid {border}; border-radius: 4px; padding: 6px 8px; }}
-entry:focus {{ border: 1px solid {accent}; box-shadow: 0 0 0 2px {glow}; }}
+  border: 1px solid {border}; border-radius: 6px; padding: 7px 10px;
+  caret-color: {accent}; transition: border-color 120ms ease, box-shadow 120ms ease; }}
+entry:focus, entry:focus-visible {{ border: 1px solid {accent};
+  box-shadow: 0 0 0 2px {ring}; }}
 entry image, entry placeholder {{ color: {text_dim}; }}
 .soc-field-bad {{ border: 1px solid {bad}; }}
-.soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.28)}; }}
+.soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.30)}; }}
 .soc-field-good {{ border: 1px solid {good}; }}
+.soc-field-good:focus {{ border: 1px solid {good};
+  box-shadow: 0 0 0 2px {_rgba(good, 0.26)}; }}
 
 /* SpinButton, ComboBox + its dropdown popup, and any plain button — palette-driven
    so they don't fall back to GTK's stock LIGHT theme (a white spin/combo + white
    button) on a DARK palette, which is the classic dark-theme black-on-white glitch
    (and where the unthemed white 'Test connection' button came from). */
 spinbutton {{ background-color: {sunken}; color: {text};
-  border: 1px solid {border}; border-radius: 4px; }}
-spinbutton entry {{ border: 0; background-color: transparent; }}
+  border: 1px solid {border}; border-radius: 6px; }}
+spinbutton:focus-within {{ border-color: {accent}; box-shadow: 0 0 0 2px {ring}; }}
+spinbutton entry {{ border: 0; background-color: transparent; box-shadow: none; }}
 spinbutton button {{ background-image: none; background-color: {sunken};
   color: {text_dim}; border: 0; }}
 spinbutton button:hover {{ color: {accent_surf}; }}
 combobox button.combo {{ background-image: none; background-color: {sunken};
-  color: {text}; border: 1px solid {border}; border-radius: 4px; padding: 4px 8px; }}
+  color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 5px 10px; }}
 combobox button.combo:hover {{ border-color: {accent}; }}
+combobox button.combo:focus, combobox button.combo:focus-visible {{
+  border-color: {accent}; box-shadow: 0 0 0 2px {ring}; }}
 combobox arrow {{ color: {text_dim}; }}
 combobox window, combobox window.background,
 combobox menu, .menu, menu {{ background-color: {surface}; color: {text};
-  border: 1px solid {border}; }}
+  border: 1px solid {border}; border-radius: 6px; }}
 combobox cellview, cellview {{ color: {text}; }}
-menuitem {{ color: {text}; padding: 3px 8px; }}
+menuitem {{ color: {text}; padding: 4px 10px; border-radius: 4px; }}
 menuitem:hover, menuitem:selected {{ background-color: {sunken}; color: {text}; }}
 /* A plain (unclassed) button on a page — give it the ghost look so it isn't a
    stock white box on a dark theme (e.g. 'Test connection', 'Add panel'). */
 .soc-page button {{ background-image: none; background-color: {sunken};
-  color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 5px 12px; }}
+  color: {text}; border: 1px solid {border}; border-radius: 7px; padding: 6px 14px;
+  transition: all 120ms ease; }}
 .soc-page button:hover {{ border-color: {accent}; background-color: {sunken}; }}
+.soc-page button:focus, .soc-page button:focus-visible {{ border-color: {accent};
+  box-shadow: 0 0 0 2px {ring}; }}
 
 /* The Assistant's OWN nav buttons (Cancel/Back/Next/Apply) live in its headerbar.
    GTK leaves them stock-light, so on a DARK palette the label inherits the theme's
@@ -606,24 +636,33 @@ menuitem:hover, menuitem:selected {{ background-color: {sunken}; color: {text}; 
    readable"). Theme them from the palette: plain = ghost; the suggested-action
    (Next/Apply) = the primary accent fill with a palette-contrasting label. */
 .soc-assistant headerbar button {{ background-image: none; background-color: {sunken};
-  color: {text}; border: 1px solid {border}; border-radius: 6px; padding: 5px 14px; }}
+  color: {text}; border: 1px solid {border}; border-radius: 7px; padding: 6px 16px;
+  transition: all 120ms ease; }}
 .soc-assistant headerbar button:hover {{ border-color: {accent}; background-color: {sunken}; }}
+.soc-assistant headerbar button:focus, .soc-assistant headerbar button:focus-visible {{
+  box-shadow: 0 0 0 2px {ring}; }}
 .soc-assistant headerbar button:disabled {{ color: {text_dim}; opacity: 1; }}
 .soc-assistant headerbar button.suggested-action {{ background-color: {accent_strong};
   color: {btn_fg}; border-color: {accent_strong}; font-weight: bold; }}
 .soc-assistant headerbar button.suggested-action:hover {{ border-color: {accent};
-  box-shadow: inset 0 0 0 1px {accent}; }}
+  box-shadow: inset 0 0 0 1px {accent}, 0 4px 14px {glow}; }}
+.soc-assistant headerbar button.suggested-action:focus-visible {{
+  box-shadow: 0 0 0 2px {ring}, inset 0 0 0 1px {accent}; }}
 
 button.soc-primary {{ background-image: none; background-color: {accent_strong};
-  color: {btn_fg}; border: 1px solid {accent_strong}; border-radius: 6px;
-  font-weight: bold; padding: 6px 14px; }}
+  color: {btn_fg}; border: 1px solid {accent_strong}; border-radius: 7px;
+  font-weight: bold; padding: 7px 16px; transition: all 120ms ease; }}
 button.soc-primary:hover {{ background-color: {accent_strong};
   border-color: {accent}; color: {btn_fg};
   box-shadow: inset 0 0 0 1px {accent}, 0 4px 14px {glow}; }}
+button.soc-primary:focus, button.soc-primary:focus-visible {{
+  box-shadow: 0 0 0 2px {ring}, inset 0 0 0 1px {accent}; }}
 button.soc-ghost {{ background-image: none; background-color: transparent;
-  color: {accent_strong}; border: 1px solid {border}; border-radius: 6px;
-  padding: 6px 12px; }}
+  color: {accent_strong}; border: 1px solid {border}; border-radius: 7px;
+  padding: 7px 14px; transition: all 120ms ease; }}
 button.soc-ghost:hover {{ background-color: {sunken}; border-color: {accent}; }}
+button.soc-ghost:focus, button.soc-ghost:focus-visible {{ border-color: {accent};
+  box-shadow: 0 0 0 2px {ring}; }}
 
 .soc-mono {{ font-family: monospace; font-size: 10px; }}
 .soc-problem {{ color: {bad}; }}
@@ -1741,6 +1780,22 @@ class SetupAssistant:
             self._open_panel_login_editor(m.vault_url, m.vault_email, master)
         login_btn.connect("clicked", on_edit_logins)
 
+        # Link to the full Credentials & Security control center (host.configcenter):
+        # manage ALL vault logins (add/edit/delete, TOTP) + the PIN/TOTP security store,
+        # beyond just the configured panels. Spawned detached so it outlives the wizard.
+        creds_btn = Gtk.Button(label="Manage credentials & security…")
+        creds_btn.get_style_context().add_class("soc-ghost")
+        creds_btn.set_tooltip_text(
+            "Open the credentials & security center: manage every Vaultwarden login "
+            "(add/edit/delete, TOTP) and the local unlock PIN / TOTP store.")
+
+        def on_manage_creds(_b):
+            ok, reason = self._spawn_credentials_center()
+            if not ok:
+                _set_test(f'<span foreground="{self.branding.color("bad")}">'
+                          f'✗ {_esc(reason)}</span>')
+        creds_btn.connect("clicked", on_manage_creds)
+
         def on_backend(*_):
             be = backend.get_active_text() or "dev"
             m.vault_backend = be
@@ -1798,7 +1853,10 @@ class SetupAssistant:
         page.pack_start(self._row("", btn_row), False, False, 0)
         page.pack_start(test_status, False, False, 0)
         page.pack_start(self._row("", seed_chk), False, False, 0)
-        page.pack_start(self._row("", login_btn), False, False, 0)
+        manage_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        manage_row.pack_start(login_btn, False, False, 0)
+        manage_row.pack_start(creds_btn, False, False, 0)
+        page.pack_start(self._row("", manage_row), False, False, 0)
         page.pack_start(hint, False, False, 0)
 
         on_backend()
@@ -2507,6 +2565,30 @@ class SetupAssistant:
         except Exception as e:  # noqa: BLE001 — treat any spawn fault as failed
             return (126, f"pkexec escalation failed: {e}")
         return (p.returncode, (p.stderr or "").strip())
+
+    def _spawn_credentials_center(self) -> "tuple[bool, str]":
+        """Spawn the credentials & security control center DETACHED (its own session)
+        so it outlives the wizard. Prefer scripts/soc-wall-credentials.sh; fall back to
+        `python -m host.configcenter` under the venv interpreter (mirrors
+        launchermenu.launch_credentials). Returns (ok, reason)."""
+        root = _repo_root()
+        sh = os.path.join(root, "scripts", "soc-wall-credentials.sh")
+        if os.path.exists(sh):
+            argv, cwd, env = ["bash", sh], None, None
+        else:
+            kiosk = os.path.join(root, "kiosk-host")
+            env = dict(os.environ)
+            env["PYTHONPATH"] = kiosk + (
+                os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            cand = os.path.join(root, ".venv", "bin", "python")
+            py = cand if os.access(cand, os.X_OK) else (
+                shutil.which("python3") or sys.executable)
+            argv, cwd = [py, "-m", "host.configcenter"], kiosk
+        try:
+            subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+            return True, ""
+        except OSError as e:
+            return False, f"could not launch {argv[0]}: {e}"
 
     def _open_panel_login_editor(self, url: str, email: str, master: str):
         """Modal-ish editor: one row per configured panel (vault item + URL) with a
