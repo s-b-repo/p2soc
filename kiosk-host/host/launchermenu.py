@@ -38,18 +38,33 @@ def _script(name: str) -> str:
     return os.path.join(ROOT, "scripts", name)
 
 
-def _spawn(argv, cwd=None, env=None) -> bool:
-    """Start a helper in its own session so the menu can exit without killing it."""
+def _venv_python() -> str:
+    """The interpreter the wall's deps live under — prefer $SOC_ROOT/.venv/bin/python
+    (PyYAML/websocket-client/cryptography/WebKit typelibs install there), exactly like
+    the shell wrappers. sys.executable (the menu's own interpreter) may be the bare
+    system python3 with none of those, so a module-spawn fallback under it would crash
+    host.main on import. Mirrors scripts/*.sh's venv-preference resolution."""
+    cand = os.path.join(ROOT, ".venv", "bin", "python")
+    return cand if os.access(cand, os.X_OK) else (shutil.which("python3") or sys.executable)
+
+
+def _spawn(argv, cwd=None, env=None) -> "tuple[bool, str]":
+    """Start a helper in its own session so the menu can exit without killing it.
+    Returns (ok, reason): reason names the failing binary on the spawn-time OSError so
+    callers can SURFACE the cause (the menu's stderr is discarded under Terminal=false).
+    Note: this only sees the spawn-time error, not a later in-child ImportError, which a
+    detached Popen cannot observe."""
     try:
         subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
-        return True
+        return True, ""
     except OSError as e:
-        sys.stderr.write(f"soc-wall menu: could not launch {argv[0]}: {e}\n")
-        return False
+        msg = f"could not launch {argv[0]}: {e}"
+        sys.stderr.write(f"soc-wall menu: {msg}\n")
+        return False, msg
 
 
-def launch_wall(mode: str) -> bool:
-    """mode: '--fullscreen' (kiosk) or '--window' (desktop)."""
+def launch_wall(mode: str) -> "tuple[bool, str]":
+    """mode: '--fullscreen' (kiosk) or '--window' (desktop). Returns (ok, reason)."""
     sh = _script("soc-wall-desktop.sh")
     if os.path.exists(sh):
         return _spawn(["bash", sh, mode])
@@ -72,11 +87,13 @@ def launch_wall(mode: str) -> bool:
                 env["SOC_ENV_FILE"] = e
     except Exception:  # noqa: BLE001 — resolver best-effort; host.main self-resolves too
         pass
-    return _spawn([sys.executable, "-m", "host.main"], cwd=kiosk, env=env)
+    # Use the venv interpreter (deps live there), not the menu's own — same as scripts/*.sh.
+    return _spawn([_venv_python(), "-m", "host.main"], cwd=kiosk, env=env)
 
 
-def launch_setup() -> bool:
-    """Prefer the GUI setup wizard; fall back to the TTY wizard in a terminal."""
+def launch_setup() -> "tuple[bool, str]":
+    """Prefer the GUI setup wizard; fall back to the TTY wizard in a terminal.
+    Returns (ok, reason)."""
     gui = _script("soc-wall-setup-gui.sh")
     if os.path.exists(gui):
         # Ask the wizard to come back HERE (the "main page") when it finishes, so
@@ -92,12 +109,12 @@ def launch_setup() -> bool:
     if term and os.path.exists(setup):
         py = shutil.which("python3") or sys.executable
         return _spawn([term, "-e", py, setup, "wizard"])
-    sys.stderr.write("soc-wall menu: no setup wizard available "
-                     "(run 'python3 setup.py wizard').\n")
-    return False
+    reason = "no setup wizard available — run: python3 setup.py wizard"
+    sys.stderr.write(f"soc-wall menu: {reason}\n")
+    return False, reason
 
 
-def launch_appearance() -> bool:
+def launch_appearance() -> "tuple[bool, str]":
     """Open the theme/appearance editor. Prefer the shell wrapper (detached, so the
     menu can stay open / exit independently); fall back to spawning the module."""
     sh = _script("soc-wall-appearance.sh")
@@ -106,7 +123,8 @@ def launch_appearance() -> bool:
     kiosk = os.path.join(ROOT, "kiosk-host")
     env = dict(os.environ)
     env["PYTHONPATH"] = kiosk + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    return _spawn([sys.executable, "-m", "host.appearance"], cwd=kiosk, env=env)
+    # Venv interpreter (deps live there), not the menu's own — same as scripts/*.sh.
+    return _spawn([_venv_python(), "-m", "host.appearance"], cwd=kiosk, env=env)
 
 
 # (section, glyph, title, subtitle, tag, css_class, colour_key, action). `section`
@@ -282,11 +300,15 @@ def _glyph_image(glyph: str, accent: str, px: int = 22):
     return lbl
 
 
-def _css() -> bytes:
+def _css(colors=None) -> bytes:
     """Build the launcher stylesheet from the branding palette: a crisp green-on-
     white technical console — flat surfaces, thin accent left-borders, low radius,
-    a green hover glow. Every colour flows from branding so a rebrand reskins it."""
-    c = branding.load().get("colors", {})
+    a green hover glow. Every colour flows from branding so a rebrand reskins it.
+
+    `colors` (an explicit palette dict) lets the in-launcher Appearance editor preview
+    an UNSAVED palette WITHOUT mutating branding's process-wide cache; default-None
+    keeps every other caller reading the persisted theme."""
+    c = colors if colors is not None else branding.load().get("colors", {})
 
     def col(k, d):
         return c.get(k) or d
@@ -387,14 +409,19 @@ class _Launcher:
     # the old window's destroy must NOT Gtk.main_quit when we're swapping in a fresh
     # one in the same loop. Reset by the new window's destroy handler.
     refreshing = False
+    # An UNSAVED Appearance preview palette, held HERE rather than mutated into
+    # branding's process-wide cache (which any concurrent reader — Validate, _refresh
+    # — would otherwise bake into freshly-built widgets). Cleared on Save/Cancel.
+    preview_colors = None
 
 
-def _reapply():
-    """Repaint the launcher's cached provider from the (refreshed) branding palette
-    — the in-launcher Appearance editor calls this after a live colour change so the
-    open launcher window recolours instantly. No new provider is added to the screen."""
+def _reapply(colors=None):
+    """Repaint the launcher's cached provider — the in-launcher Appearance editor calls
+    this after a live colour change so the open launcher window recolours instantly.
+    `colors` previews an UNSAVED palette; default-None repaints from the persisted
+    branding theme. No new provider is added to the screen."""
     if _Launcher.provider is not None:
-        _Launcher.provider.load_from_data(_css())
+        _Launcher.provider.load_from_data(_css(colors))
 
 
 def _open_appearance(parent_win):
@@ -406,13 +433,17 @@ def _open_appearance(parent_win):
     from gi.repository import GdkPixbuf
 
     def on_apply(colors):
-        # Monkeypatch branding's in-memory palette so _css() reflects the preview,
-        # then repaint the launcher's cached provider (no persistence yet).
-        cur = branding.load()
-        cur.setdefault("colors", {}).update(colors)
-        _reapply()
+        # Preview WITHOUT mutating branding's shared cache: merge the picked colours
+        # over the persisted base, stash on _Launcher and repaint from THAT palette.
+        # Every other reader (cards, Validate, _refresh) still sees the persisted theme,
+        # so no half-applied palette can leak even if teardown is skipped.
+        base = dict(branding.load().get("colors", {}))
+        base.update(colors)
+        _Launcher.preview_colors = base
+        _reapply(base)
 
     def on_saved(_colors):
+        _Launcher.preview_colors = None
         branding.load(refresh=True)   # pick up the persisted palette
         _reapply()
 
@@ -422,11 +453,11 @@ def _open_appearance(parent_win):
     win.set_transient_for(parent_win)
 
     def _on_close(_w):
-        # CANCEL path: on_apply mutated branding's process-wide cached palette in
-        # place to PREVIEW; closing without Save leaves that preview poisoning the
-        # cache, so later-built launcher widgets would inherit the wrong colours.
-        # Refresh from disk + repaint to revert to the persisted theme (on_saved
-        # already does this on the Save path; the bare-destroy path did not).
+        # CANCEL path: drop any unsaved preview and repaint from the persisted theme.
+        # The preview was never written to branding's cache, so this is just dropping
+        # the held palette — nothing to un-poison — but we still repaint to revert any
+        # live preview the operator applied before cancelling.
+        _Launcher.preview_colors = None
         branding.load(refresh=True)
         _reapply()
     win.connect("destroy", _on_close)
@@ -604,6 +635,51 @@ def _manual_window(parent, cols, action, line):
                                      f'foreground="{primary}" size="9000" '
                                      f'letter_spacing="600">close</span>')
     close.connect("clicked", lambda _b: w.destroy())
+    box.pack_start(close, False, False, 0)
+    w.show_all()
+
+
+def _launch_error_window(parent, cols, reason: str, shell_line: str = ""):
+    """A spawn FAILED (helper missing / OSError) — surface the cause in a themed child
+    instead of silently destroying the launcher. Deliberately NOT guierror.show() (it
+    runs its OWN Gtk.main, nesting/quitting this live loop); mirrors _manual_window:
+    transient modal child, selectable shell line, Close destroys the CHILD only."""
+    Gtk = _Launcher.Gtk
+    dim = cols.get("text_dim", "#5B7567")
+    text = cols.get("text", "#0B1F14")
+    bad = cols.get("bad", "#C0341D")
+    primary = branding.accent_on(cols.get("background", "#FFFFFF"),
+                                 accent=cols.get("primary", "#1FA463"),
+                                 strong=cols.get("accent_strong", "#157A49"),
+                                 minimum=4.5)
+    w, box = _child_window(parent, "Could not start")
+    box.pack_start(_eyebrow("// failed", bad), False, False, 0)
+    msg = Gtk.Label(xalign=0)
+    msg.set_line_wrap(True)
+    msg.set_markup(f'<span foreground="{text}" size="11000" weight="bold">'
+                   f'{_esc(reason)}</span>')
+    box.pack_start(msg, False, False, 0)
+    if shell_line:
+        sub = Gtk.Label(xalign=0)
+        sub.set_line_wrap(True)
+        sub.set_markup(f'<span foreground="{dim}" size="10000">'
+                       f'You can run it in a shell instead:</span>')
+        box.pack_start(sub, False, False, 0)
+        code = Gtk.Label(xalign=0)
+        code.set_selectable(True)
+        code.set_line_wrap(True)
+        code.set_markup(f'<span font_family="monospace" foreground="{primary}" '
+                        f'size="10500">{_esc(shell_line)}</span>')
+        box.pack_start(code, False, False, 0)
+    close = Gtk.Button(label="Close")
+    close.set_relief(Gtk.ReliefStyle.NONE)
+    close.get_style_context().add_class("soc-validate")
+    close.set_halign(Gtk.Align.END)
+    if isinstance(close.get_child(), Gtk.Label):
+        close.get_child().set_markup(f'<span font_family="monospace" '
+                                     f'foreground="{primary}" size="9000" '
+                                     f'letter_spacing="600">close</span>')
+    close.connect("clicked", lambda _b: w.destroy())  # CHILD only, never main_quit
     box.pack_start(close, False, False, 0)
     w.show_all()
 
@@ -805,6 +881,17 @@ def _build_window():
                 "vpn_configured": False, "configured": False}
         inst = {"installed": False, "reason": "health unavailable"}
 
+    # An in-place refresh (Install/Uninstall -> _refresh) rebuilds the window, so drop
+    # the PREVIOUS screen-scoped provider before adding the new one — otherwise each
+    # rebuild stacks another whole-screen provider (memory + re-parse cost, and stale
+    # providers keep painting since _reapply only repaints the newest). First call is a
+    # no-op (provider is None). Mirrors appearance.py / sysaction.py teardown.
+    if _Launcher.provider is not None:
+        try:
+            Gtk.StyleContext.remove_provider_for_screen(
+                Gdk.Screen.get_default(), _Launcher.provider)
+        except Exception:  # noqa: BLE001 — narrow: only guards the GTK remove call
+            pass
     provider = Gtk.CssProvider()
     _Launcher.Gtk, _Launcher.Gdk = Gtk, Gdk   # set BEFORE _css() so the motion gate reads Settings
     provider.load_from_data(_css())
@@ -1023,8 +1110,22 @@ def _build_window():
             if action == _ACT_UNINSTALL:
                 _on_uninstall(win, cols, _refresh)
                 return
-            action()
-            win.destroy()
+            # Spawn tiles (Run desktop/kiosk, Setup) return (ok, reason). Only quit the
+            # loop when the helper actually STARTED; on failure keep the launcher open
+            # and surface the cause (the menu's stderr is discarded under .desktop) so
+            # the single entry point is never a silent dead-end.
+            result = action()
+            ok, reason = result if isinstance(result, tuple) else (bool(result), "")
+            if ok:
+                win.destroy()  # helper started; hand off + close the menu as before
+            else:
+                # Offer a copy-pasteable shell line where we can name one.
+                shell_line = ""
+                if action is launch_setup:
+                    shell_line = f"python3 {os.path.join(ROOT, 'setup.py')} wizard"
+                _launch_error_window(win, cols,
+                                     reason or "the helper could not be started",
+                                     shell_line)
         return _cb
 
     # ADAPTIVE STATE (item 2): the install state tells a story.
@@ -1153,6 +1254,12 @@ def main(argv=None) -> int:
         assert by_class["soc-appearance"][-1] is launch_appearance
         assert by_class["soc-install"][-1] == _ACT_INSTALL
         assert by_class["soc-uninstall"][-1] == _ACT_UNINSTALL
+        # Spawn-tile contract: the helpers return (ok, reason) so the menu can gate
+        # win.destroy() on success and surface the cause on failure (never a silent
+        # dead-end). A bad argv must fail closed to a (False, reason) tuple.
+        ok, reason = _spawn(["/nonexistent/soc-wall-check-binary"])
+        assert ok is False and isinstance(reason, str) and reason, "spawn must report failure"
+        assert isinstance(_venv_python(), str) and _venv_python(), "venv resolver returns a path"
         # every tile names a known mode glyph (the per-tile inline-SVG icon), and the
         # new system glyphs exist with unicode fallbacks.
         assert all(e[1] in _GLYPHS for e in _ENTRIES), "unknown glyph key in _ENTRIES"

@@ -118,8 +118,26 @@ class WallWindow:
 
         if on_destroy:
             # losing the wall window (e.g. the compositor killed it) leaves
-            # nothing on screen — exit so the launcher restarts the host
-            win.connect("destroy", lambda *_: on_destroy())
+            # nothing on screen — exit so the launcher restarts the host. Make
+            # this fail-safe: if on_destroy (KioskHost.shutdown) raises BEFORE
+            # it reaches Gtk.main_quit, the GTK loop would otherwise keep
+            # spinning with no visible window — a dark, launcher-won't-restart
+            # wall (the process is still alive). On the happy path shutdown
+            # already calls Gtk.main_quit, so we just return; only force-exit in
+            # the except branch so a window-less live loop can never persist.
+            def _on_destroy(*_):
+                try:
+                    on_destroy()
+                except Exception as e:                  # noqa: BLE001
+                    try:
+                        self.log(f"shutdown raised on wall-window destroy: {e}")
+                    except Exception:                   # noqa: BLE001
+                        pass
+                    try:
+                        Gtk.main_quit()
+                    finally:
+                        os._exit(0)   # force respawn via launcher/systemd
+            win.connect("destroy", _on_destroy)
 
         self.window = win
         self.grid = grid

@@ -101,6 +101,14 @@ class VpnLogViewer:
         self._io_tag: Optional[int] = None
         self._collapsed = False
         self._sudo = _have_nopasswd_journalctl()
+        # Bounded auto-restart of the journal stream after a HUP/EOF (e.g. a
+        # non-root host without NOPASSWD journalctl where the tail dies almost
+        # immediately). Without a cap a failing journalctl would respawn in a
+        # tight loop; with one, the viewer tries a few times then stops and
+        # tells the operator to use Reconnect.
+        self._stream_restarts = 0
+        self._max_stream_restarts = 3
+        self._restart_tag = None       # pending GLib timeout id for a restart
 
     @property
     def is_open(self) -> bool:
@@ -306,17 +314,74 @@ class VpnLogViewer:
     def _on_io(self, _source, condition):
         if condition & GLib.IO_HUP:
             self._append(f"[viewer] journalctl exited for {_VPN_UNIT}\n")
-            return False
+            self._handle_stream_end()
+            return False                               # source removes itself
         try:
             line = self._proc.stdout.readline()
         except (OSError, ValueError):
+            self._handle_stream_end()
             return False
-        if not line:
-            return False                               # EOF -> unregister
+        if not line:                                   # EOF -> stream ended
+            self._handle_stream_end()
+            return False
+        # A real line means the (possibly just-restarted) stream is healthy —
+        # reset the restart budget so a later, unrelated exit gets fresh retries
+        # instead of inheriting an exhausted counter.
+        self._stream_restarts = 0
         self._append(line)
         return True                                    # keep watching
 
+    def _handle_stream_end(self):
+        """The journalctl tail died (HUP/EOF). The GLib io watch is removing
+        itself (we returned False), so clear our stale _io_tag, reap the exited
+        child here (don't leave a zombie until window close), and schedule a
+        bounded auto-restart so a transient exit recovers without the operator
+        reopening the window."""
+        self._io_tag = None                            # the watch is gone now
+        p = self._proc
+        self._proc = None
+        if p is not None:
+            try:
+                p.wait(timeout=2)                      # reap the exited child
+            except (OSError, subprocess.SubprocessError,
+                    subprocess.TimeoutExpired):
+                try:
+                    p.kill()
+                    p.wait(timeout=2)
+                except (OSError, subprocess.SubprocessError,
+                        subprocess.TimeoutExpired):
+                    pass
+        # Window already closing? Don't respawn.
+        if self._win is None:
+            return
+        if self._stream_restarts >= self._max_stream_restarts:
+            self._append(
+                f"[viewer] giving up auto-restarting the {_VPN_UNIT} log after "
+                f"{self._max_stream_restarts} attempts — use Reconnect or "
+                f"reopen the window to try again.\n")
+            return
+        self._stream_restarts += 1
+        delay_ms = 2000 * self._stream_restarts        # 2s, 4s, 6s backoff
+        self._append(
+            f"[viewer] restarting the log stream in {delay_ms // 1000}s "
+            f"(attempt {self._stream_restarts}/{self._max_stream_restarts})…\n")
+        self._restart_tag = GLib.timeout_add(delay_ms, self._restart_stream)
+
+    def _restart_stream(self):
+        self._restart_tag = None
+        if self._win is not None and self._proc is None:
+            self._start_stream()
+        return False                                   # one-shot
+
     def _stop_stream(self):
+        # Cancel any pending auto-restart so a queued respawn can't fire after
+        # the window is gone.
+        if self._restart_tag is not None:
+            try:
+                GLib.source_remove(self._restart_tag)
+            except (AttributeError, ValueError, TypeError):
+                pass
+            self._restart_tag = None
         if self._io_tag is not None:
             try:
                 GLib.source_remove(self._io_tag)
@@ -382,8 +447,20 @@ class VpnLogViewer:
 
     def _reconnect(self):
         self._append(f"[viewer] reconnect requested for {_VPN_UNIT}\n")
+        # Pass a sink so the reconnect OUTCOME (success / privilege-refusal /
+        # failure) is printed here too — the most common failure (no NOPASSWD
+        # sudo) only ever surfaced on the pill tooltip, leaving the viewer with a
+        # lone 'requested' line and no result. The sink runs on the GTK main
+        # thread (host dispatches it via GLib.idle_add), so appending is safe.
+        sink = lambda msg: self._append(f"[viewer] {msg}\n")  # noqa: E731
         try:
-            self._on_reconnect()
+            try:
+                self._on_reconnect(sink=sink)
+            except TypeError:
+                # Back-compat: an on_reconnect that doesn't accept the kwarg
+                # (older host) — fall back to the no-arg call so the reconnect
+                # still happens; the outcome line just won't appear.
+                self._on_reconnect()
         except Exception as e:                         # noqa: BLE001
             self._append(f"[viewer] reconnect raised: {e}\n")
 

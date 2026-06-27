@@ -297,25 +297,35 @@ class KioskHost:
         cdp_base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
         delay = 0.0
         for idx, panel in enumerate(self.conf.panels):
-            if panel.engine == "chromium":
-                from .chromium_panel import ChromiumPanel
-                view = ChromiumPanel(panel, self.need_login, log,
-                                     cdp_port=cdp_base + idx,
-                                     proxy=self.conf.proxy,
-                                     proxy_creds=self.proxy_creds,
-                                     security=self.conf.security,
-                                     on_login_success=self.login_success)
-            else:
-                from .webkit_panel import WebKitPanel
-                view = WebKitPanel(panel, self.need_login, log,
-                                   embedded=self.wall is not None,
-                                   proxy=self.conf.proxy,
-                                   proxy_creds=self.proxy_creds,
-                                   security=self.conf.security,
-                                   on_config=config_cb,
-                                   on_login_success=self.login_success)
-                if self.wall is not None:
-                    self.wall.attach(panel, view.widget)
+            # Guard each per-panel constructor: one malformed panel (bad
+            # geometry, a WebKit2 version mismatch, an OSError creating the 0700
+            # chromium profile dir) is logged + skipped so the REST of the wall
+            # still paints, instead of one bad panel aborting build_and_show()
+            # to the fatal screen. The happy path is unchanged.
+            try:
+                if panel.engine == "chromium":
+                    from .chromium_panel import ChromiumPanel
+                    view = ChromiumPanel(panel, self.need_login, log,
+                                         cdp_port=cdp_base + idx,
+                                         proxy=self.conf.proxy,
+                                         proxy_creds=self.proxy_creds,
+                                         security=self.conf.security,
+                                         on_login_success=self.login_success)
+                else:
+                    from .webkit_panel import WebKitPanel
+                    view = WebKitPanel(panel, self.need_login, log,
+                                       embedded=self.wall is not None,
+                                       proxy=self.conf.proxy,
+                                       proxy_creds=self.proxy_creds,
+                                       security=self.conf.security,
+                                       on_config=config_cb,
+                                       on_login_success=self.login_success)
+                    if self.wall is not None:
+                        self.wall.attach(panel, view.widget)
+            except Exception as e:  # noqa: BLE001 — skip one bad panel, keep the wall
+                log(f"[{getattr(panel, 'id', '?')}] panel construction failed; "
+                    f"skipping this panel: {e}")
+                continue
             self.panels_view.append(view)
             GLib.timeout_add(int(delay * 1000), self._show_one, view)
             delay += stagger
@@ -364,9 +374,19 @@ class KioskHost:
             try:
                 view.recycle()
             except Exception as e:          # noqa: BLE001
+                # The recycle FAILED and reclaimed nothing while memory is still
+                # critical. Do NOT consume the cooldown or fully reset the
+                # streak — that would throttle the watchdog out of retrying for
+                # the full cooldown while the box stays under the floor and gets
+                # OOM-killed. Leave _mem_last_recycle untouched and clamp the
+                # streak to 1 so a single next low reading re-arms a retry; the
+                # round-robin target picker naturally tries a different panel.
                 log(f"[mem] recycle of {view.panel.id} failed: {e}")
-            self._mem_last_recycle = now
-            self._mem_low_streak = 0
+                self._mem_low_streak = 1
+            else:
+                # Recycle succeeded — start the cooldown and reset hysteresis.
+                self._mem_last_recycle = now
+                self._mem_low_streak = 0
         return True
 
     def _pick_recycle_target(self):
@@ -433,7 +453,18 @@ class KioskHost:
                 f"{nm}: {st.replace('_', ' ')}" for nm, st in states.items()
             ) or "VPN: not configured"
             GLib.idle_add(self._set_pill, css, label, tip)
-        threading.Thread(target=work, daemon=True).start()
+        # If thread start fails (RuntimeError 'can't start new thread' under
+        # thread exhaustion / OOM on the 1 GB board), work()'s finally never
+        # runs to reset _vpn_poll_busy — which would wedge every future tick at
+        # the early-return above and freeze the pill forever. Reset the flag and
+        # log here so the next tick can retry. Keep setting the flag on the GTK
+        # thread (do NOT move it into the worker — the early-return must already
+        # see it set before work() is scheduled).
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except RuntimeError as e:
+            self._vpn_poll_busy = False
+            log(f"[vpn] could not start status-poll thread; will retry next tick: {e}")
         return False
 
     def _set_pill(self, css, label, tip=None):
@@ -549,54 +580,89 @@ class KioskHost:
         import threading
 
         def work():
-            ok, info = self._privileged_systemctl("restart", "forti-vpn.service")
-            if ok:
-                log(ok_msg)
-            else:
-                log(f"{fail_msg} ({info})")
-            if on_done is not None:
-                # on_done may touch GTK widgets (pill tooltip), so hop to the
-                # main thread — work() is on a daemon worker.
-                GLib.idle_add(on_done, ok, info)
+            try:
+                ok, info = self._privileged_systemctl("restart", "forti-vpn.service")
+                if ok:
+                    log(ok_msg)
+                else:
+                    log(f"{fail_msg} ({info})")
+                if on_done is not None:
+                    # on_done may touch GTK widgets (pill tooltip), so hop to the
+                    # main thread — work() is on a daemon worker.
+                    GLib.idle_add(on_done, ok, info)
+            except Exception as e:  # noqa: BLE001 — worker must not die silently
+                # If work() raised BEFORE scheduling on_done, the pill would
+                # stay frozen on 'checking…' forever (on_done never runs, no
+                # re-poll). Log it (not swallowed) and reset the pill promptly
+                # via a re-poll. NOT a finally — the happy path already re-polls
+                # through _vpn_reconnect_done, so a finally would double-schedule.
+                log(f"VPN restart worker error: {e}")
+                GLib.idle_add(self._poll_vpn)
         threading.Thread(target=work, daemon=True).start()
 
-    def _vpn_reconnect_done(self, ok, info):
+    def _vpn_reconnect_done(self, ok, info, sink=None):
         """Reconnect finished. On a privilege refusal the pill would otherwise
         just snap back to 'down' with the reason buried in a log the kiosk
         operator never sees — surface it as a pill tooltip pointing at the VPN
-        log viewer, so the click isn't a silent dead-end. Then re-poll."""
+        log viewer, so the click isn't a silent dead-end. Then re-poll.
+
+        `sink` (when the VPN-log viewer requested the reconnect) gets the same
+        human outcome so the viewer prints success/refusal/failure instead of
+        leaving a lone '[viewer] reconnect requested' with no result line.
+        Runs on the GTK main thread (dispatched via GLib.idle_add), so calling
+        the viewer's buffer append is thread-safe."""
+        if ok:
+            tip = "VPN status — click to re-check / reconnect"
+            outcome = "reconnect requested OK — see the log below for each step"
+        elif "no NOPASSWD sudo" in (info or ""):
+            tip = ("Reconnect needs privilege this user doesn't have. Run the "
+                   "wall as root, or let install.sh add the NOPASSWD systemctl "
+                   "sudoers rule. Click the \U0001f4dc VPN-log button for details.")
+            outcome = ("reconnect refused: no NOPASSWD sudo for systemctl — "
+                       "see pill tooltip")
+        else:
+            tip = (f"Reconnect failed: {info}\nClick the \U0001f4dc VPN-log "
+                   f"button to see the supervisor output.")
+            outcome = f"reconnect failed: {info}"
         if self.wall is not None and self.wall.vpn_pill is not None:
-            if ok:
-                tip = "VPN status — click to re-check / reconnect"
-            elif "no NOPASSWD sudo" in (info or ""):
-                tip = ("Reconnect needs privilege this user doesn't have. Run the "
-                       "wall as root, or let install.sh add the NOPASSWD systemctl "
-                       "sudoers rule. Click the \U0001f4dc VPN-log button for details.")
-            else:
-                tip = (f"Reconnect failed: {info}\nClick the \U0001f4dc VPN-log "
-                       f"button to see the supervisor output.")
             try:
                 self.wall.vpn_pill.set_tooltip_text(tip)
             except Exception:  # noqa: BLE001 — tooltip is a nicety, never fatal
                 pass
+        if sink is not None:
+            try:
+                sink(outcome)
+            except Exception:  # noqa: BLE001 — viewer line is a nicety, never fatal
+                pass
         GLib.timeout_add_seconds(2, self._poll_vpn)
         return False
 
-    def vpn_action(self):
+    def vpn_action(self, sink=None):
         """Pill click: show 'checking', best-effort reconnect, then re-poll. The
-        reconnect runs off the GTK thread so it can't freeze the wall."""
+        reconnect runs off the GTK thread so it can't freeze the wall.
+
+        `sink` is an optional callable(text) the VPN-log viewer passes so the
+        reconnect OUTCOME (success / privilege-refusal / failure) is printed in
+        the viewer too — not just on the pill tooltip. Default None keeps both
+        no-arg call sites (the pill's on_vpn and the viewer's on_reconnect)
+        working unchanged on the happy path."""
         if self.wall is not None:
             self.wall.set_vpn_status("checking", "VPN: checking…")
         any_enabled = any(
             isinstance(v, dict) and v.get("enabled")
             for v in (self.conf.vpns or []))
         if not any_enabled:
+            if sink is not None:
+                try:
+                    sink("no VPN is enabled — nothing to reconnect")
+                except Exception:  # noqa: BLE001
+                    pass
             self._poll_vpn()
             return
         self._restart_vpn_service(
             "VPN reconnect requested (systemctl restart forti-vpn)",
             "VPN reconnect not permitted from the wall; re-checking",
-            on_done=self._vpn_reconnect_done)
+            on_done=lambda ok, info: self._vpn_reconnect_done(ok, info, sink=sink))
 
     # ---- on-screen configuration ------------------------------------------
     def open_config(self):
@@ -743,17 +809,27 @@ class KioskHost:
         return False  # one-shot timeout
 
     def shutdown(self, *_):
-        log("shutting down ...")
-        for v in self.panels_view:
-            if hasattr(v, "stop"):
-                try:
-                    v.stop()
-                except Exception as e:  # noqa: BLE001
-                    # Surface which panel failed (a swallowed Chromium stop can
-                    # orphan a child / leak a CDP port + profile lock across
-                    # 24/7 restarts) but never block main_quit on one bad panel.
-                    log(f"[{getattr(v.panel, 'id', '?')}] stop failed: {e}")
-        Gtk.main_quit()
+        # try/finally so Gtk.main_quit() ALWAYS runs — even if the leading log()
+        # or an attribute access before the guarded block raises. Otherwise a
+        # SIGTERM handler that raised here would never quit the loop, hanging
+        # `systemctl stop` until TimeoutStopSec forces a SIGKILL (orphaning
+        # chromium children whose _reap never runs).
+        try:
+            log("shutting down ...")
+            for v in self.panels_view:
+                if hasattr(v, "stop"):
+                    try:
+                        v.stop()
+                    except Exception as e:  # noqa: BLE001
+                        # Surface which panel failed (a swallowed Chromium stop
+                        # can orphan a child / leak a CDP port + profile lock
+                        # across 24/7 restarts) but never block main_quit on one
+                        # bad panel. getattr is double-hardened so the except
+                        # handler itself can't raise.
+                        log(f"[{getattr(getattr(v, 'panel', None), 'id', '?')}] "
+                            f"stop failed: {e}")
+        finally:
+            Gtk.main_quit()
         return False
 
 
@@ -1223,6 +1299,14 @@ def main():
             pass
     ready_timeout = cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
     deadline = time.time() + ready_timeout
+    # Count consecutive 'accepted the master but vault.open() still reports
+    # locked' cycles. A backend that re-locks right after a successful unlock
+    # (litebw session that doesn't persist across open(), clock-skew session
+    # expiry, a sync that re-locks) would otherwise re-pop the unlock dialog
+    # forever. A wall-clock deadline alone can't gate this — a slow first-time
+    # operator could blow the 120s deadline on the FIRST (legitimate) prompt —
+    # so we count the relock cycles instead.
+    unlock_relock_attempts = 0
     while True:
         try:
             vault.open()
@@ -1258,6 +1342,21 @@ def main():
             # _verify already opened the backend session on success.
             if seal_it:
                 _try_seal_master(master)
+            master = ""                # drop the plaintext as soon as it's used
+            # The operator gave a master that verified, yet we are back here
+            # because vault.open() re-raised VaultLockedError. If that keeps
+            # happening, the backend is rejecting the session immediately after
+            # login — re-popping the dialog forever would trap the operator.
+            unlock_relock_attempts += 1
+            if unlock_relock_attempts >= 3:
+                return _fatal_screen(
+                    "Vault keeps re-locking",
+                    "The vault accepted the master password but locked again "
+                    "immediately several times in a row. This usually means the "
+                    "Vaultwarden session is being rejected right after login "
+                    "(clock skew on the Pi or server, or an invalidated session).",
+                    "Check the Pi and Vaultwarden clocks (chrony/ntp), confirm the "
+                    "server session/token settings, then relaunch.")
             continue   # session is open now; re-run open() to sync
         except VaultError as e:
             if time.time() > deadline:
@@ -1312,37 +1411,68 @@ def main():
         log("no panels configured — launching empty; the on-screen Settings opens so "
             "you can add panels (or use Setup)")
 
-    host = KioskHost(conf, vault=vault)
+    # Everything from here on builds windows/panels and enters the loop. A
+    # constructor (WallWindow, a WebKit/Chromium panel, CSS provider, the 0700
+    # chromium profile dir) can raise; without a guard that would crash to a
+    # BLACK screen (no themed diagnostic) and the launcher would busy-restart
+    # into the same crash. Route any such failure to the fail-safe screen
+    # instead; let KeyboardInterrupt propagate so Ctrl+C still exits cleanly.
+    try:
+        host = KioskHost(conf, vault=vault)
 
-    # warm the credential cache off-thread while we wait for VPN/tunnels, so
-    # the first login of each panel never blocks the GTK loop on a vault call
-    host.prewarm_creds()
+        # warm the credential cache off-thread while we wait for VPN/tunnels, so
+        # the first login of each panel never blocks the GTK loop on a vault call
+        host.prewarm_creds()
 
-    # 3. VPN + tunnels (best-effort). VPN first: its routes may be what makes a
-    #    tunnel's jump host (or a direct VPN-side panel) reachable at all.
-    wait_for_vpn(conf.vpns, timeout=ready_timeout)
-    wait_for_tunnels(conf.panels, timeout=ready_timeout)
+        # 4. windows FIRST — paint immediately so a boot-time VPN/carrier outage
+        #    shows each panel's branded 'connecting…' card (with its own load
+        #    backoff self-heal) instead of a long black screen while the
+        #    best-effort readiness probes run. (build_and_show must precede the
+        #    probes; see the daemon worker below.)
+        host.build_and_show()
 
-    # 4. windows
-    host.build_and_show()
+        # 3. VPN + tunnels (best-effort), now OFF the main thread so they never
+        #    gate first paint. VPN first: its routes may be what makes a tunnel's
+        #    jump host (or a direct VPN-side panel) reachable at all — preserved
+        #    here by running them sequentially in one worker. The probes only do
+        #    socket.create_connection + log() (thread-safe); they touch GTK only
+        #    via the VPN pill, which already hops through GLib.idle_add. daemon
+        #    so the worker can never block host.shutdown.
+        import threading
 
-    # Unconfigured launch: open the on-screen Settings once the loop is running so the
-    # operator configures panels live on an otherwise-empty wall (no relaunch).
-    if unconfigured:
-        GLib.idle_add(host.open_config)
+        def _readiness_probes():
+            wait_for_vpn(conf.vpns, timeout=ready_timeout)
+            wait_for_tunnels(conf.panels, timeout=ready_timeout)
+        threading.Thread(target=_readiness_probes, daemon=True).start()
 
-    # all panel views, WebContexts and config objects are now built and live
-    # for the whole 24/7 uptime — freeze them out of the GC so the steady-state
-    # loop stops re-scanning these permanent objects on every gen-2 collection.
-    import gc
-    gc.collect()
-    if hasattr(gc, "freeze"):
-        gc.freeze()
+        # Unconfigured launch: open the on-screen Settings once the loop is running so the
+        # operator configures panels live on an otherwise-empty wall (no relaunch).
+        if unconfigured:
+            GLib.idle_add(host.open_config)
 
-    # 5. signals + main loop
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, host.shutdown)
-    log("entering GTK main loop")
+        # all panel views, WebContexts and config objects are now built and live
+        # for the whole 24/7 uptime — freeze them out of the GC so the steady-state
+        # loop stops re-scanning these permanent objects on every gen-2 collection.
+        import gc
+        gc.collect()
+        if hasattr(gc, "freeze"):
+            gc.freeze()
+
+        # 5. signals + main loop
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, host.shutdown)
+        log("entering GTK main loop")
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:  # noqa: BLE001 — a build/window crash must not go black
+        import traceback
+        log(f"window/panel construction failed:\n{traceback.format_exc()}")
+        return _fatal_screen(
+            "The wall could not start",
+            f"Building the panel windows failed:\n\n{e}",
+            "This is usually a renderer/display problem (WebKit/Chromium, the "
+            "GTK theme, or the screen). Check the log above, then relaunch — "
+            "use Open Setup to review the configuration.")
     Gtk.main()
     return 0
 

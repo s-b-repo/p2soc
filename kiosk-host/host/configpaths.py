@@ -327,13 +327,34 @@ def _check() -> int:
     return 0
 
 
+def _write_atomic(path: str, text: str, mode: int) -> str:
+    """Write `text` to `path` atomically: stage into <path>.tmp in the SAME dir
+    (so os.replace is a same-fs rename, never EXDEV), fsync the data, then return
+    the tmp path WITHOUT replacing yet — the caller stages every file first and
+    swaps them back-to-back so a crash never leaves one new / one stale. The final
+    `mode` is baked into the open, so there is no post-replace chmod race. Mirrors
+    secretstore._write_atomic / backup.write_backup. Re-raises OSError (ENOSPC)."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return tmp
+
+
 def _install_etc() -> int:
     """pkexec helper: read rendered panels.yaml + soc.env from STDIN and write them
     root-owned into /etc/soc-display (panels 0644, env 0640). Content comes from
     STDIN — NEVER argv — so panel URLs / emails never appear on the process table,
     and SOC_VAULT_PASSWORD is never passed in (it isn't in soc.env). Input format:
         ---PANELS---\n<panels.yaml>\n---ENV---\n<soc.env>
-    so a single privileged invocation writes both atomically."""
+    Both files are staged (written + fsync'd) into <path>.tmp BEFORE either is
+    swapped in, then the two os.replace() calls run back-to-back, so a crash /
+    ENOSPC mid-write can never leave a NEW panels.yaml beside a STALE soc.env (the
+    half-updated /etc that bricks the next boot). Leftover *.tmp are unlinked on
+    any failure, leaving the previous pair intact."""
     data = sys.stdin.read()
     PMARK, EMARK = "---PANELS---\n", "\n---ENV---\n"
     if not data.startswith(PMARK) or EMARK not in data:
@@ -345,22 +366,37 @@ def _install_etc() -> int:
     pf = os.path.join(ETC_DIR, PANELS_BASENAME)
     ef = os.path.join(ETC_DIR, ENV_BASENAME)
     # Writing /etc requires root; this helper is only ever invoked via pkexec (as
-    # root). If it's run directly by a non-root user the os.makedirs/chmod/open
-    # raise PermissionError — catch it and emit the same clean, actionable error
-    # the secretstore --seal helper uses instead of dumping a traceback.
+    # root). If it's run directly by a non-root user the os.makedirs/open raise
+    # PermissionError — catch it and emit the same clean, actionable error the
+    # secretstore --seal helper uses instead of dumping a traceback. ENOSPC is NOT
+    # swallowed into success either: it surfaces via the same OSError arm.
+    p_tmp = e_tmp = None
     try:
         os.makedirs(ETC_DIR, exist_ok=True)
         os.chmod(ETC_DIR, 0o755)
-        with open(pf, "w", encoding="utf-8") as fh:
-            fh.write(panels_text)
-        os.chmod(pf, 0o644)
-        with open(ef, "w", encoding="utf-8") as fh:
-            fh.write(env_text)
-        os.chmod(ef, 0o640)
+        # Stage BOTH temps fully (written + fsync'd, final mode baked in) before
+        # swapping either — so the swap step can't be interrupted half-way.
+        p_tmp = _write_atomic(pf, panels_text, 0o644)
+        e_tmp = _write_atomic(ef, env_text, 0o640)
+        os.replace(p_tmp, pf)
+        p_tmp = None
+        os.replace(e_tmp, ef)
+        e_tmp = None
     except OSError as e:
         sys.stderr.write(f"configpaths --install-etc: {e} "
                          f"(must run as root via pkexec)\n")
         return 1
+    finally:
+        # Remove any leftover *.tmp so a partial failure leaves no orphan temps
+        # (the previous pf/ef pair stays intact because we never truncated them).
+        for t in (p_tmp, e_tmp):
+            if t:
+                try:
+                    os.unlink(t)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
     # Best-effort group: leave to install.sh/setfacl for the kiosk user's read access.
     sys.stdout.write(f"wrote {pf} (0644) and {ef} (0640)\n")
     return 0

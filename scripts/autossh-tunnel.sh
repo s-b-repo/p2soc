@@ -12,13 +12,33 @@ export SOC_PANELS_FILE="${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}"
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
 
-mapfile -t ARGS < <("$PYBIN" "$ROOT/scripts/tunnel-args.py")
+# Capture the python exit status separately from its output: process
+# substitution (`mapfile < <(...)`) hides the python exit code, so a crashing
+# tunnel-args.py (bad panels.yaml / missing PyYAML) would otherwise yield zero
+# args and look like "no tunnels configured" — a silent dead-end. Fail loud and
+# idle (so Restart=always doesn't churn on an unfixable config error) instead.
+if ! ARGS_RAW="$("$PYBIN" "$ROOT/scripts/tunnel-args.py")"; then
+  echo "[autossh-tunnel] FATAL: tunnel-args.py failed (bad panels.yaml or missing PyYAML?); idling so Restart does not churn — fix config and restart" >&2
+  exec sleep infinity
+fi
+mapfile -t ARGS <<< "$ARGS_RAW"
+# `<<< ""` yields a single empty element; normalize it back to an empty array so
+# the no-tunnel happy path idles rather than exec'ing `autossh ""`.
+if [ "${#ARGS[@]}" -eq 1 ] && [ -z "${ARGS[0]}" ]; then
+  ARGS=()
+fi
 
 if [ "${#ARGS[@]}" -eq 0 ]; then
   echo "[autossh-tunnel] no tunnels configured; idling" >&2
   exec sleep infinity
 fi
 
-export AUTOSSH_GATETIME=0
+# -M 0 + ServerAlive (in tunnel-args.py) provides liveness; keep a small gate so
+# autossh retains its tight-respawn protection — repeated sub-gate exits trip
+# autossh's give-up, then systemd's RestartSec bounds the respawn. A bare
+# GATETIME=0 disables that guard and lets a flapping link hot-loop with no
+# backoff at either layer. Both knobs stay overridable from soc.env.
+export AUTOSSH_GATETIME=${AUTOSSH_GATETIME:-30}
+export AUTOSSH_POLL=${AUTOSSH_POLL:-30}
 echo "[autossh-tunnel] autossh ${ARGS[*]}" >&2
 exec autossh "${ARGS[@]}"

@@ -258,6 +258,15 @@ class Vault:
                 if log:
                     log(f"prewarm '{it}': {e}")
                 return False
+            except Exception as e:
+                # An unexpected (non-VaultError) backend exception — e.g. a bare
+                # ValueError/KeyError from a decrypt edge — must NOT escape
+                # ex.map and abort the whole prewarm. Log it (matching the
+                # VaultError branch) and skip just this one item; the docstring
+                # contract is "per-item failures are logged, not raised".
+                if log:
+                    log(f"prewarm '{it}': unexpected {type(e).__name__}: {e}")
+                return False
         with ThreadPoolExecutor(max_workers=min(4, len(uniq))) as ex:
             return sum(1 for r in ex.map(one, uniq) if r)
 

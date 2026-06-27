@@ -13,17 +13,36 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from functools import lru_cache
 from urllib.parse import urlsplit
 
 _DEFAULT_TMPL = os.path.join(os.path.dirname(__file__), "..", "..", "inject", "login.js.tmpl")
 
+# Minimal idempotent bootstrap used when login.js.tmpl is missing/unreadable
+# (e.g. SOC_INJECT_TMPL typo). It installs window.__SOC with needLogin:false so
+# NO auto-login fires (render-no-login beats a dark wall / blank respawn loop),
+# carries installed:true so the idempotency guard and Chromium's defensive
+# `window.__SOC||{}` read behave, and adds no token the .replace() in
+# bootstrap_js() would corrupt.
+_FALLBACK_BOOTSTRAP = ("(function(){if(window.__SOC&&window.__SOC.installed)return;"
+                       "window.__SOC={installed:true,needLogin:false,justLoggedIn:false,lastLogin:0};})();")
+
 
 @lru_cache(maxsize=1)
 def _template() -> str:
-    path = os.environ.get("SOC_INJECT_TMPL", _DEFAULT_TMPL)
-    with open(os.path.abspath(path), "r", encoding="utf-8") as fh:
-        return fh.read()
+    path = os.path.abspath(os.environ.get("SOC_INJECT_TMPL", _DEFAULT_TMPL))
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as e:
+        # Loud once-per-cold-start diagnostic: print the resolved abspath AND
+        # the env-var name so a SOC_INJECT_TMPL typo is obvious. Returning the
+        # built-in fallback keeps panels RENDERING (without auto-login) instead
+        # of crashing _build() (dark wall) or looping CDP setup forever.
+        sys.stderr.write(f"[soc-inject] login bootstrap template unreadable at {path} "
+                         f"(SOC_INJECT_TMPL); panels render WITHOUT auto-login: {e}\n")
+        return _FALLBACK_BOOTSTRAP
 
 
 def panel_origin(url: str) -> str:

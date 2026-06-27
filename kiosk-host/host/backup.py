@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import tarfile
 
 from . import secretstore as ss
@@ -34,6 +35,11 @@ from . import secretstore as ss
 _MAGIC = b"PSBK"                       # p2soc backup, distinct from the seal's "PS"
 _MIN_PASSPHRASE = 8                    # NIST SP 800-63B: user-chosen secret floor
 _HEADER = len(_MAGIC) + 16 + 12       # magic + salt + nonce
+# Size caps so a giant/corrupt blob can't be slurped into RAM on the 1GB Pi before
+# the passphrase even matters. A kiosk vault is a handful of logins (tiny); these
+# are generous ceilings, not a tuning knob.
+_MAX_BLOB = 256 * 1024 * 1024         # on-disk encrypted backup (256 MiB)
+_MAX_INNER = 512 * 1024 * 1024        # decompressed gzip-tar (512 MiB)
 
 
 class BackupError(Exception):
@@ -93,12 +99,63 @@ def write_backup(src_dir: str, out_path: str, passphrase: str) -> None:
 
 
 def restore_backup(in_path: str, dest_dir: str, passphrase: str) -> None:
-    """Decrypt `in_path` and extract its tar into `dest_dir`."""
+    """Decrypt `in_path` and restore its tar AS `dest_dir`, atomically.
+
+    The archive is extracted into a throwaway staging dir ADJACENT to dest_dir
+    (same filesystem, so the final os.rename is atomic — not EXDEV); only on a
+    fully-successful extract is the live dest_dir swapped out for the staged copy.
+    A mid-extraction failure (disk full, rejected member, SD I/O error) therefore
+    only ever dirties the throwaway dir and the pre-existing dest_dir is left
+    intact (rolled back) — never a half-restored, partly-old/partly-new vault.
+
+    NOTE: restore REPLACES dest_dir wholesale (the correct semantics for a vault
+    data-dir restore), rather than overlaying onto whatever was already there."""
+    # Reject an oversized on-disk blob BEFORE slurping it, so a corrupt/giant file
+    # can't OOM the 1GB Pi.
+    try:
+        sz = os.path.getsize(in_path)
+    except OSError as e:
+        raise BackupError(f"cannot read backup {in_path}: {e}")
+    if sz > _MAX_BLOB:
+        raise BackupError(
+            f"backup file too large ({sz} bytes > {_MAX_BLOB} cap) — refusing to "
+            "load it into memory")
     with open(in_path, "rb") as fh:
         inner = open_backup(fh.read(), passphrase)
-    os.makedirs(dest_dir, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(inner), mode="r:gz") as tar:
-        _safe_extract(tar, dest_dir)
+    if len(inner) > _MAX_INNER:
+        raise BackupError(
+            f"decompressed backup too large ({len(inner)} bytes > {_MAX_INNER} "
+            "cap) — refusing to extract")
+
+    dest_dir = dest_dir.rstrip("/") or dest_dir
+    staging = f"{dest_dir}.restore.{os.getpid()}.tmp"
+    backout = f"{dest_dir}.bak.{os.getpid()}"
+    parent = os.path.dirname(dest_dir) or "."
+    os.makedirs(parent, exist_ok=True)
+    # Start from a clean staging dir on the SAME filesystem as dest_dir.
+    if os.path.exists(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(inner), mode="r:gz") as tar:
+            _safe_extract(tar, staging)
+        # Extract succeeded — swap atomically. Move the live dir aside first so a
+        # failure of the second rename can be rolled back to the original.
+        if os.path.exists(dest_dir):
+            os.rename(dest_dir, backout)
+            try:
+                os.rename(staging, dest_dir)
+            except OSError:
+                # restore the pre-existing state, then surface the failure
+                os.rename(backout, dest_dir)
+                raise
+            shutil.rmtree(backout, ignore_errors=True)
+        else:
+            os.rename(staging, dest_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        if os.path.isdir(backout):
+            shutil.rmtree(backout, ignore_errors=True)
 
 
 def _safe_extract(tar: "tarfile.TarFile", dest_dir: str) -> None:

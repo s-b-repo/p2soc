@@ -162,12 +162,59 @@ class KioskLocker:
         if self._win is not None:
             self._win.present()
             return
+        # Fail CLOSED: with no PIN/TOTP/seal enrolled there is nothing to
+        # verify against, so a lock overlay would be purely decorative (any
+        # keypress would dismiss it) — worse than none, since it gives a false
+        # sense of security on an unattended-by-design wall. Refuse to lock and
+        # tell the operator to enroll a credential. (Happy path — a credential
+        # present — falls straight through to _build() exactly as before.)
+        if not self._has_credential():
+            self._advise_no_credential()
+            return
         self._on_unlock = on_unlock
         self._build()
 
     def unlock(self):
         """Force-unlock (used by an admin programmatic emergency-clear)."""
         self._teardown()
+
+    def _advise_no_credential(self):
+        """Themed, self-disposing advisory shown instead of a decorative lock
+        when no unlock credential is enrolled. Non-blocking; the OK button
+        destroys the card. Reuses the _build() CSS/idiom so it reads correctly
+        on any operator theme."""
+        try:
+            _style.apply_css()
+        except Exception:                          # noqa: BLE001 — never block
+            pass
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_keep_above(True)
+        win.set_position(Gtk.WindowPosition.CENTER)
+        card = Gtk.Frame()
+        card.get_style_context().add_class("soc-config")
+        card.set_size_request(420, 0)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(20)
+        title = Gtk.Label(label="⚠  Wall NOT locked")
+        title.set_xalign(0.5)
+        title.get_style_context().add_class("soc-config-title")
+        sub = Gtk.Label(label="No panel-lock credential is enrolled, so the lock "
+                              "would be decorative.\nSet a panel-lock PIN first: "
+                              "⚙ Settings → Security.")
+        sub.set_xalign(0.5)
+        sub.set_line_wrap(True)
+        sub.get_style_context().add_class("soc-config-sub")
+        ok = Gtk.Button(label="OK")
+        ok.get_style_context().add_class("soc-config-primary")
+        ok.connect("clicked", lambda *_: win.destroy())
+        for w in (title, sub, ok):
+            box.pack_start(w, False, False, 0)
+        card.add(box)
+        win.add(card)
+        win.show_all()
 
     # --- internals -----
     def _build(self):
@@ -280,13 +327,10 @@ class KioskLocker:
             return "Enter the 6-digit code from your authenticator app."
         if has_pin:
             return "Enter your PIN."
-        if self._has_credential():
-            # Only the host-sealed setup PIN can unlock.
-            return "Enter the host setup PIN to unlock."
-        # Locked with no credential set — emergency fallback: any non-empty
-        # input unlocks, but the operator should enroll a PIN ASAP.
-        return ("⚠ No PIN/TOTP enrolled (lock is decorative — enroll one "
-                "from ⚙ Settings → Security).")
+        # Only the host-sealed setup PIN remains as an unlock path. (lock()
+        # refuses to build the overlay when no credential is enrolled, so the
+        # no-credential case is unreachable here.)
+        return "Enter the host setup PIN to unlock."
 
     def _on_key(self, _w, event):
         # Esc must not close the lock; Enter activates.
@@ -299,12 +343,9 @@ class KioskLocker:
 
     def _try(self):
         code = (self._entry.get_text() or "").strip()
-        # No credential enrolled at all → degraded "always unlocks" path so an
-        # operator can't lock themselves out without first enrolling. Loud
-        # marker on the unlock card already told them.
-        if not self._has_credential():
-            self._teardown()
-            return
+        # _try() is only reachable with a credential present (lock() refuses to
+        # build the overlay otherwise), so we gate strictly on verify_any() —
+        # there is no fail-open "no credential → always unlock" path.
         if verify_any(self.state_dir, code):
             self._fails = 0
             self._teardown()

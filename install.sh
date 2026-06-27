@@ -92,6 +92,19 @@ log(){ printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn(){ printf '\033[33m!!\033[0m %s\n' "$*"; }
 die(){ printf '\033[31mEE\033[0m %s\n' "$*" >&2; exit 1; }
 
+# docker pull with bounded retry/backoff — a transient registry/network failure
+# (common on a Pi bringing up Wi-Fi during first boot) shouldn't throw away a long
+# install on the first flake. Up to 3 attempts, bounded sleep; returns non-zero on
+# exhaustion so the caller can `die` with actionable text. Re-running is idempotent.
+docker_pull_retry(){ # $1=image
+  local img="$1" n=0
+  until docker pull "$img"; do
+    n=$((n+1)); [ "$n" -ge 3 ] && return 1
+    warn "docker pull $img failed (attempt $n/3) — retrying in $((n*3))s (network/registry)"
+    sleep "$((n*3))"
+  done
+}
+
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo ./install.sh)"
 case "$SESSION" in auto|wayland|xwayland|xlibre|xorg|x11) ;; *)
   die "SESSION must be auto|wayland|xwayland|xlibre|xorg|x11 (got '$SESSION')";; esac
@@ -566,7 +579,8 @@ if [ "$VW_MODE" = "docker" ]; then
     esac
   fi
   [ "$HAS_SYSTEMD" = "1" ] && systemctl enable --now docker >/dev/null 2>&1 || true
-  docker pull vaultwarden/server:latest
+  docker_pull_retry vaultwarden/server:latest \
+    || die "could not pull vaultwarden/server:latest after 3 attempts — check network/DNS/registry reachability (Pi Wi-Fi may still be coming up), then re-run ./install.sh (it is idempotent)."
   # Verify the daemon resolved the correct multi-arch variant (do NOT force
   # --platform — that would break x86 dev). Warn-only; the image is multi-arch,
   # so a mismatch means a stale/side-loaded wrong-arch image that would only fail
@@ -766,6 +780,13 @@ fi
 # --------------------------------------------------------------------------- #
 log "Configuring kiosk session for $KIOSK_USER (SESSION=$SESSION)"
 HOME_DIR="$(getent passwd "$KIOSK_USER" | cut -d: -f6)"
+# Fail CLOSED if the home field came back empty or is not a real directory
+# (NSS hiccup, a just-created account whose home isn't materialised yet, an
+# account with no home). Without this guard the install -d / dotfile writes /
+# chown -R below would target "/.config", "/.xinitrc", etc. — corrupting the
+# filesystem root and chowning root-level paths to the kiosk user.
+[ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || \
+  die "kiosk user '$KIOSK_USER' has no valid home directory (got '${HOME_DIR:-<empty>}') — refusing to write session dotfiles to the filesystem root. Check the account (getent passwd $KIOSK_USER) and re-run ./install.sh (it is idempotent)."
 install -d -o "$KIOSK_USER" -g "$KIOSK_USER" "$HOME_DIR/.config/openbox"
 # rc.xml with the grid placement rules from panels.yaml. 1920x1080 is only the
 # install-time default: xinitrc regenerates it from xrandr at every X session
@@ -795,45 +816,18 @@ if [ -n "$DESKTOP_HOME" ]; then
 fi
 
 # Capture the original default target BEFORE we touch it, so uninstall.sh can
-# restore it (only meaningful with systemd). Recorded into the manifest below.
+# restore it (only meaningful with systemd). The actual boot takeover (set-default
+# + getty override + consoleblank) is DEFERRED to immediately before the manifest
+# write further down, so any earlier failure (docker pull, venv/pip, hardening,
+# sshd validation) exits with the boot target UNCHANGED — never a dark/unbootable
+# box mid-install. This capture must stay BEFORE that deferred set-default.
 ORIG_DEFAULT_TARGET=""
 if [ "$HAS_SYSTEMD" = "1" ]; then
   ORIG_DEFAULT_TARGET="$(systemctl get-default 2>/dev/null || true)"
 fi
-
-# tty1 takeover (autologin + multi-user default target) is the dedicated-appliance
-# behaviour — kiosk mode only. In desktop mode we deploy the same session bits but
-# leave the boot alone so the existing DE/login manager keeps working; the wall is
-# launched on demand (desktop icon / `systemctl start soc-wall`).
+# Boot-takeover state flags (mutated only by the deferred block before the manifest).
 DID_SET_DEFAULT=0
-if [ "$INSTALL_MODE" = "kiosk" ]; then
-  if [ "$HAS_SYSTEMD" = "1" ]; then
-    log "Enabling tty1 autologin (INSTALL_MODE=kiosk)"
-    mkdir -p /etc/systemd/system/getty@tty1.service.d
-    sed "s/--autologin soc /--autologin $KIOSK_USER /" \
-      "$SOC_ROOT/systemd/getty-autologin.conf" > /etc/systemd/system/getty@tty1.service.d/override.conf
-    systemctl set-default multi-user.target    # no desktop env; we run our own session
-    DID_SET_DEFAULT=1
-    systemctl daemon-reload
-  else
-    warn "no systemd — set up tty1 autologin for '$KIOSK_USER' with your init."
-    warn "  agetty:  agetty --autologin $KIOSK_USER --noclear tty1 (in inittab/respawn)"
-    warn "  Its login runs ~$KIOSK_USER/.bash_profile, which execs the SOC session."
-  fi
-else
-  log "INSTALL_MODE=desktop — leaving the boot/default target + getty untouched"
-  log "  launch the wall from the 'SOC Video Wall' desktop icon, or:"
-  log "  $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start soc-wall" || echo "$SOC_ROOT/scripts/launcher.sh")"
-  log "  (re-run with INSTALL_MODE=kiosk for a dedicated tty1-autologin appliance)"
-fi
-
-# kernel console blanking off (Raspberry Pi). Track whether WE added it so
-# uninstall.sh only strips it back out if this install introduced it.
 DID_CONSOLEBLANK=0
-if [ -f /boot/firmware/cmdline.txt ] && ! grep -q consoleblank /boot/firmware/cmdline.txt; then
-  sed -i 's/$/ consoleblank=0/' /boot/firmware/cmdline.txt
-  DID_CONSOLEBLANK=1
-fi
 
 # --------------------------------------------------------------------------- #
 # Clickable launcher: the "SOC Video Wall" XDG .desktop app + icon — THE single
@@ -1049,6 +1043,55 @@ if [ "$HARDEN" = "1" ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# DEFERRED boot takeover. Everything that can fail on a flaky network or a picky
+# box (docker pull, venv/pip, the HARDEN nftables `die`, sshd validation, the
+# launcher/cp steps) has now run. Only here — with all of that behind us — do we
+# flip the boot: switch the default target to multi-user, install the tty1
+# autologin override, and disable console blanking. So any earlier failure exits
+# with the boot COMPLETELY UNCHANGED (no dark/unbootable box mid-install), and the
+# REVERT rows are written into the manifest right after this mutation. The
+# happy-path end state is byte-identical to doing this earlier.
+#
+# Belt-and-suspenders: a scoped trap rolls the mutation back if we're interrupted
+# (SIGINT) or hit an unexpected failure in the tiny window between here and the
+# manifest+stamp write. Every rollback command is `|| true` so the trap can never
+# itself abort under set -e or mask the original non-zero exit (we always re-exit
+# $_rc). The trap is disarmed (`trap - ERR EXIT`) right after the stamp write.
+trap '_rc=$?; trap - ERR EXIT; if [ "$_rc" -ne 0 ] && [ "${DID_SET_DEFAULT:-0}" = 1 ] && [ -n "$ORIG_DEFAULT_TARGET" ]; then systemctl set-default "$ORIG_DEFAULT_TARGET" >/dev/null 2>&1 || true; fi; if [ "$_rc" -ne 0 ] && [ "${DID_CONSOLEBLANK:-0}" = 1 ]; then sed -i "s/ consoleblank=0//" /boot/firmware/cmdline.txt 2>/dev/null || true; fi; exit $_rc' ERR EXIT
+
+# tty1 takeover (autologin + multi-user default target) is the dedicated-appliance
+# behaviour — kiosk mode only. In desktop mode we deploy the same session bits but
+# leave the boot alone so the existing DE/login manager keeps working; the wall is
+# launched on demand (desktop icon / `systemctl start soc-wall`).
+if [ "$INSTALL_MODE" = "kiosk" ]; then
+  if [ "$HAS_SYSTEMD" = "1" ]; then
+    log "Enabling tty1 autologin (INSTALL_MODE=kiosk)"
+    mkdir -p /etc/systemd/system/getty@tty1.service.d
+    sed "s/--autologin soc /--autologin $KIOSK_USER /" \
+      "$SOC_ROOT/systemd/getty-autologin.conf" > /etc/systemd/system/getty@tty1.service.d/override.conf
+    systemctl set-default multi-user.target    # no desktop env; we run our own session
+    DID_SET_DEFAULT=1
+    systemctl daemon-reload
+  else
+    warn "no systemd — set up tty1 autologin for '$KIOSK_USER' with your init."
+    warn "  agetty:  agetty --autologin $KIOSK_USER --noclear tty1 (in inittab/respawn)"
+    warn "  Its login runs ~$KIOSK_USER/.bash_profile, which execs the SOC session."
+  fi
+else
+  log "INSTALL_MODE=desktop — leaving the boot/default target + getty untouched"
+  log "  launch the wall from the 'SOC Video Wall' desktop icon, or:"
+  log "  $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start soc-wall" || echo "$SOC_ROOT/scripts/launcher.sh")"
+  log "  (re-run with INSTALL_MODE=kiosk for a dedicated tty1-autologin appliance)"
+fi
+
+# kernel console blanking off (Raspberry Pi). Track whether WE added it so
+# uninstall.sh only strips it back out if this install introduced it.
+if [ -f /boot/firmware/cmdline.txt ] && ! grep -q consoleblank /boot/firmware/cmdline.txt; then
+  sed -i 's/$/ consoleblank=0/' /boot/firmware/cmdline.txt
+  DID_CONSOLEBLANK=1
+fi
+
+# --------------------------------------------------------------------------- #
 # Install manifest + revert state for uninstall.sh. Simple line format:
 #   TYPE|VALUE|NOTE
 # TYPE is one of: META, DIR, FILE, UNIT, USER, SYSCHANGE, REVERT. Idempotent —
@@ -1152,6 +1195,10 @@ chmod 0644 "$ETC/.install-manifest" 2>/dev/null || true
 printf 'installed=%s arch=%s session=%s mode=%s\n' \
   "$(date -Is 2>/dev/null || date 2>/dev/null || echo unknown)" "$ARCH" "$SESSION" "$INSTALL_MODE" \
   > "$ETC/.installed" 2>/dev/null || true
+
+# The boot mutation + its REVERT rows + the success stamp are all on disk now —
+# disarm the scoped boot-rollback trap so a normal exit doesn't undo the takeover.
+trap - ERR EXIT
 
 cat <<EOF
 
