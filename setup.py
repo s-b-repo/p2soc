@@ -312,9 +312,37 @@ def write_file(path: str, content: str, mode: int, dry: bool):
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
     backup(path)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    os.chmod(path, mode)
+    # Atomic write (mirror backup.write_backup): stage into <path>.tmp in the SAME
+    # dir (so os.replace is a same-fs rename, no EXDEV), fsync, force the final
+    # mode, then replace — so an interrupted write (power loss / ENOSPC / kill) on
+    # the Pi's SD card never leaves a truncated panels.yaml/soc.env live. A real
+    # failure still surfaces (the tmp is removed and the error re-raised — never
+    # swallowed); the old file stays intact.
+    tmp = path + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.write(fd, content.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # Durability across a power cut: fsync the parent dir so the rename is on disk.
+    try:
+        dfd = os.open(parent or ".", os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass  # not all platforms/filesystems allow dir-fsync; best effort only
     ok(f"wrote {path}  ({oct(mode)[2:]})")
 
 
@@ -1173,6 +1201,18 @@ def _resolve_master(soc_env: dict) -> str:
             return secretstore.unseal(sd)
     except Exception as e:  # noqa: BLE001
         warn(f"could not unseal the master ({e}); enter it manually")
+    # No usable seal. In a NON-INTERACTIVE context (--defaults, or piped/EOF
+    # stdin) we must NOT invent a master: ask_secret would return the literal
+    # "CHANGE-ME" default (a truthy placeholder that downstream would register as
+    # the real master) or block on getpass. Fail closed — return "" so the caller
+    # skips the account/seal step and the operator seals it explicitly instead.
+    non_interactive = ASSUME_DEFAULTS or not (
+        sys.stdin.isatty() and sys.stdout.isatty())
+    if non_interactive:
+        warn("no usable vault master (not sealed) and not interactive — refusing "
+             "to use a placeholder; seal it first (python3 setup.py first-run) "
+             "or pass --master-fd")
+        return ""
     return ask_secret("vault master password (used now, not stored)")
 
 
@@ -2195,20 +2235,43 @@ def cmd_deploy(args) -> int:
                         break
                     time.sleep(1)
                 else:
-                    warn(f"{url} not answering /alive yet — check it before continuing")
+                    # Fail CLOSED on a real run: a vault that never answered /alive
+                    # means the account/seal steps below will fail too, leaving a
+                    # box that boots into a wall that can't read the vault. Make the
+                    # operator confirm before pressing on (dry-run never prompts).
+                    err(f"{url} not answering /alive — the vault is not up; "
+                        "account create + seal will fail and the wall will be dark")
+                    if not ask_bool("  continue anyway (NOT recommended)?", False):
+                        err("aborting deploy — start Vaultwarden, then re-run")
+                        return 1
         else:
             note("Step 3/6 — no systemd; start Vaultwarden via your init manager.")
         # Ensure the account EXISTS (create if missing) via the shared core — the
         # same path the GUI's "Create account" button uses. No more "create it in
-        # the web vault by hand" dead-end.
+        # the web vault by hand" dead-end. The master comes from --master-fd (the
+        # non-interactive escape hatch) or the sealed/interactive resolver; an
+        # empty result means "no usable master" -> skip rather than register with "".
         if provision is not None and email and ask_bool(
                 f"  ensure the Vaultwarden account {email} exists (create if missing)?", True):
-            pw = _resolve_master(soc_env) or _unseal_master(
-                soc_env.get("SOC_SECRET_DIR"), "vault master (to create/verify the account)")
-            popts = provision.Opts(email=email, url=url, dry_run=args.dry_run)
-            res = provision.step_vault_account(popts, pw)
-            pw = ""  # scrub
-            (ok if res.ok else warn)(res.detail)
+            pw = _read_master_fd(args) or _resolve_master(soc_env)
+            if not pw:
+                warn("no usable master available — seal it (Step 4) or re-run with "
+                     "--master-fd; skipping account create/verify")
+            else:
+                popts = provision.Opts(email=email, url=url, dry_run=args.dry_run)
+                res = provision.step_vault_account(popts, pw)
+                pw = ""  # scrub
+                if res.ok:
+                    ok(res.detail)
+                else:
+                    # Fail CLOSED: a failed account-ensure is an ERROR, not a yellow
+                    # warning — without it the wall can't log into the vault. Require
+                    # confirmation to continue (dry-run never prompts).
+                    err(f"account create/verify failed: {res.detail}")
+                    if not args.dry_run and not ask_bool(
+                            "  continue anyway (the wall may not be able to log in)?", False):
+                        err("aborting deploy — fix the vault account, then re-run")
+                        return 1
     else:
         note("Step 3/6 — dev vault backend; no Vaultwarden server needed.")
 

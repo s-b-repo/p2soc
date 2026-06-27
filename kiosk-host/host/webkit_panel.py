@@ -53,7 +53,9 @@ RETRY_INITIAL = 5       # seconds; load-failure retry backoff
 RETRY_MAX = 120
 PANEL_STABLE_SEC = 30   # a load must stay up this long before backoff resets
 PROXY_AUTH_MAX_ATTEMPTS = 3   # then stop, or a bad password hammers the proxy
-MAX_LOGIN_ATTEMPTS = 3        # then show the "please sign in" popup instead
+MAX_LOGIN_ATTEMPTS = 3        # real fill+submit attempts before the "sign in" popup
+MAX_LOGIN_MISSES = 10         # consecutive structural misses (socLogin false/undefined)
+#                               before we stop re-injecting + show the popup
 
 _default_ctx_proxied = False
 _mem_pressure_done = False
@@ -139,8 +141,13 @@ def _ensure_tracker_filter(panel, on_ready, log):
             pass
         try:
             _filter_store = WebKit2.UserContentFilterStore.new(store_dir)
-        except Exception:                # very old/odd build — give up gracefully
+        except Exception as e:           # very old/odd build — give up gracefully
+            # Clear the stranded waiters too (else they + the key leak forever
+            # across reconfig cycles); mirror the save-exception branch below.
             _filters_pending.discard(key)
+            _filter_waiters.pop(key, None)
+            log(f"tracker filter store unavailable; trackers not blocked "
+                f"for key {key!r}: {e}")
             return
 
     ident = "soc-trackers" + ("-" + "_".join(key) if key else "")
@@ -379,7 +386,9 @@ class WebKitPanel:
         self.security = security             # config.SecurityCfg | None (wall-wide)
         self.on_config = on_config           # callable() -> open the config window
         self.on_login_success = on_login_success   # callable(panel) on a good login
-        self._login_attempts = 0
+        self._login_attempts = 0      # counts only real fill+submit attempts
+        self._login_misses = 0        # consecutive structural misses (page not fillable)
+        self._login_inflight = False  # re-entrancy guard: one injection at a time
         self.window = None
         self.webview = None
         self.frame = None                    # style.PanelFrame (the widget)
@@ -390,6 +399,12 @@ class WebKitPanel:
         self._ever_loaded = False
         self._load_failed = False
         self._proxy_auth_attempts = 0
+        # Continuous-failure tracking for the offline card. The retry CADENCE is
+        # unchanged (still RETRY_MAX forever); these only switch the card COPY to
+        # a clearer terminal-style line once a panel has been failing long enough
+        # that it's probably a config/URL problem, not a transient blip.
+        self._consec_fail = 0
+        self._first_fail_at = 0.0
         self._build()
 
     # ---- construction ------------------------------------------------------
@@ -575,8 +590,19 @@ class WebKitPanel:
             if hasattr(na, "is_main_frame") and not na.is_main_frame():
                 return False
             uri = na.get_request().get_uri()
-        except Exception:
-            return False
+        except Exception as e:
+            # We are past the NEW_WINDOW / non-NAVIGATION_ACTION gates, so this IS
+            # a navigation we cannot vet. For a fail-closed security guard the
+            # conservative default is to REFUSE the anomalous nav rather than let
+            # WebKit's default-allow apply. (Sub-frames stay protected by the
+            # tracker filter; a thrown extraction is itself anomalous.)
+            try:
+                decision.ignore()
+            except Exception:
+                pass
+            self.log(f"[{self.panel.id}] nav-policy eval error, refusing "
+                     f"(fail-closed): {e!r}")
+            return True
         host = websecurity.host_of(uri)
         # about:blank / non-http(s) have no host: allow (set_url already refuses
         # non-http(s) loads upstream; about:blank is our own status/sink target).
@@ -584,10 +610,13 @@ class WebKitPanel:
             return False
         if websecurity.host_matches(host, self._allowlist):
             return False                          # allowed -> proceed
+        # We DECIDED to block — enforce it even if ignore() throws, and always
+        # return True so WebKit never falls through to its default-allow.
         try:
             decision.ignore()
-        except Exception:
-            return False
+        except Exception as e:
+            self.log(f"[{self.panel.id}] ignore() failed on off-allowlist nav, "
+                     f"refusing anyway: {e!r}")
         self.log(f"[{self.panel.id}] refused off-allowlist nav -> {uri}")
         return True
 
@@ -669,6 +698,8 @@ class WebKitPanel:
         if not self._ever_loaded:
             self.status.update("connecting…")
         self._login_attempts = 0           # fresh page = fresh login budget
+        self._login_misses = 0             # and a fresh structural-miss budget
+        self._login_inflight = False
         self.webview.load_uri(url)
         self.log(f"[{self.panel.id}] webkit loading {url}")
 
@@ -698,12 +729,25 @@ class WebKitPanel:
         self._retry_pending = False
         self._load_failed = False
         self._ever_loaded = False
+        self._consec_fail = 0
+        self._first_fail_at = 0.0
         self.log(f"[{self.panel.id}] reconfigured -> {url or '(cleared)'}")
         self.load()
 
     # ---- self-healing ------------------------------------------------------
+    def _note_failure(self) -> bool:
+        """Record one continuous failure; return True once the panel has been
+        failing long enough to look permanent (config/URL problem) rather than a
+        transient outage. Reset in _on_load_changed's stable-load guard + set_url."""
+        if self._consec_fail == 0:
+            self._first_fail_at = time.monotonic()
+        self._consec_fail += 1
+        return (self._consec_fail >= 10 or
+                (time.monotonic() - self._first_fail_at) >= 1800)
+
     def _on_terminated(self, _wv, reason):
         why = reason.value_nick if hasattr(reason, "value_nick") else "crashed"
+        persistent = self._note_failure()
         # Use the same exponential backoff as load failures. On a 1 GB Pi a
         # web-process termination is usually the memory-pressure killer; a fixed
         # 3s reload of a heavy page would just crash-OOM-loop and starve the
@@ -711,8 +755,14 @@ class WebKitPanel:
         # (_on_load_changed FINISHED).
         self.log(f"[{self.panel.id}] web process terminated ({why}); "
                  f"reloading in {self._retry_delay}s")
-        self.status.update(f"renderer {why} — recovering in {self._retry_delay}s",
-                           error=True)
+        if persistent:
+            self.status.update(
+                f"unreachable {self._consec_fail}x — verify URL/tunnel "
+                f"(Ctrl+Shift+C)\nstill retrying every {self._retry_delay}s",
+                error=True, busy=False)
+        else:
+            self.status.update(f"renderer {why} — recovering in {self._retry_delay}s",
+                               error=True)
         self._load_failed = True              # keep the card; don't clear on the
         #                                       error page's FINISHED event
         self._schedule_retry(self._retry_delay)
@@ -724,10 +774,17 @@ class WebKitPanel:
                          WebKit2.NetworkError.CANCELLED):
             return False
         self._load_failed = True
+        persistent = self._note_failure()
         self.log(f"[{self.panel.id}] load failed: {error.message} ({uri}); "
                  f"retrying in {self._retry_delay}s")
-        self.status.update(f"offline: {error.message}\n"
-                           f"retrying in {self._retry_delay}s", error=True)
+        if persistent:
+            self.status.update(
+                f"unreachable {self._consec_fail}x — verify URL/tunnel "
+                f"(Ctrl+Shift+C)\nstill retrying every {self._retry_delay}s",
+                error=True, busy=False)
+        else:
+            self.status.update(f"offline: {error.message}\n"
+                               f"retrying in {self._retry_delay}s", error=True)
         self._schedule_retry(self._retry_delay)
         self._retry_delay = min(self._retry_delay * 2, RETRY_MAX)
         # TRUE = handle the error ourselves: our status card is the error UI, so
@@ -754,6 +811,11 @@ class WebKitPanel:
             # 5s reload loop. The first-ever load (_loaded_at == 0.0) just stamps.
             if self._loaded_at and (now - self._loaded_at) >= stable:
                 self._retry_delay = RETRY_INITIAL
+                # Same stable-load guard resets the continuous-failure tracking,
+                # so an error-page FINISHED or an OOM-flap does NOT falsely clear
+                # the "unreachable Nx" state.
+                self._consec_fail = 0
+                self._first_fail_at = 0.0
             self._loaded_at = now
             self._ever_loaded = True
             # a finished load means the proxy accepted the creds — reset the
@@ -823,28 +885,51 @@ class WebKitPanel:
         return "login"
 
     def _on_message(self, ucm, message):
-        if self._reason(message) == "loggedin":
-            self._on_logged_in()
-        else:
-            self._do_login()
+        # GLib 'script-message-received' callback: a raise here escapes into the
+        # main loop and kills the handler for this event (the panel then never
+        # retries login). Guard the whole dispatch — log once, swallow, return.
+        try:
+            if self._reason(message) == "loggedin":
+                self._on_logged_in()
+            else:
+                self._do_login()
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[{self.panel.id}] login dispatch error: {e}")
 
     def _on_logged_in(self):
         """The login form went away — we are in. Remember it + clear the popup."""
-        self._login_attempts = 0
-        self._evaluate(inject.prompt_clear_call())
-        if self.on_login_success:
-            try:
-                self.on_login_success(self.panel)
-            except Exception as e:  # noqa: BLE001
-                self.log(f"[{self.panel.id}] login-success hook: {e}")
+        try:
+            self._login_attempts = 0
+            self._login_misses = 0
+            self._login_inflight = False
+            self._evaluate(inject.prompt_clear_call())
+            if self.on_login_success:
+                try:
+                    self.on_login_success(self.panel)
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"[{self.panel.id}] login-success hook: {e}")
+        except Exception as e:  # noqa: BLE001 — never let a logged-in event raise
+            self.log(f"[{self.panel.id}] login dispatch error: {e}")
 
     def _do_login(self):
-        self._login_attempts += 1
-        # auto-login kept failing (wrong/expired creds) — stop and ask the user
-        if self._login_attempts > MAX_LOGIN_ATTEMPTS:
+        # Re-entrancy guard: the page's un-debounced check() loop can fire
+        # overlapping 'login' messages within the ~4s window; serialise so we
+        # don't inject creds twice or race the attempt counters.
+        if self._login_inflight:
+            return
+        # Wrong/expired creds: real fill+submit attempts exhausted -> ask the user.
+        if self._login_attempts >= MAX_LOGIN_ATTEMPTS:
             self._evaluate(inject.prompt_call(
                 "Auto-login failed — please sign in here, or open Settings (⚙ top "
                 "bar) to fix the saved login."))
+            return
+        # Structurally-unfillable page (wrong selectors -> socLogin always false):
+        # stop re-injecting once we've missed enough, but still surface a prompt so
+        # the operator isn't left at a silent dead-end.
+        if self._login_misses >= MAX_LOGIN_MISSES:
+            self._evaluate(inject.prompt_call(
+                "Sign-in needed — couldn't auto-fill this page. Log in here, or "
+                "open Settings (⚙ top bar) to fix the saved login selectors."))
             return
         try:
             creds = self.on_need_login(self.panel)
@@ -859,18 +944,75 @@ class WebKitPanel:
             return
         js = inject.login_call(creds)
         creds["pass"] = ""  # scrub our copy
-        self._evaluate(js)
-        self.log(f"[{self.panel.id}] injected login (attempt {self._login_attempts})")
+        # Inject FIRST, then count based on what socLogin actually did: it returns
+        # true only when it filled+submitted a form (the wrong-creds path that
+        # SHOULD exhaust the budget) and false on a transient/structural miss
+        # (socLogin undefined, fields not found, origin-gate refusal). A transient
+        # miss must NOT burn the login budget.
+        self._login_inflight = True
+        self._evaluate(js, self._after_login_inject)
 
-    def _evaluate(self, js: str):
-        # 4.1 prefers evaluate_javascript(); 4.0 has run_javascript().
+    def _after_login_inject(self, value):
+        """Callback with socLogin's JSCValue (or None on eval error). Advance the
+        real-attempt counter only on a true submit; otherwise count a miss."""
+        self._login_inflight = False
+        submitted = False
+        try:
+            if value is not None and hasattr(value, "to_boolean"):
+                submitted = bool(value.to_boolean())
+            elif value is not None and hasattr(value, "is_boolean") and value.is_boolean():
+                submitted = bool(value.to_boolean())
+        except Exception:  # noqa: BLE001 — treat an unreadable result as a miss
+            submitted = False
+        if submitted:
+            self._login_attempts += 1
+            self._login_misses = 0
+            self.log(f"[{self.panel.id}] injected login "
+                     f"(attempt {self._login_attempts})")
+        else:
+            self._login_misses += 1
+            self.log(f"[{self.panel.id}] login injection miss "
+                     f"(retriable {self._login_misses}/{MAX_LOGIN_MISSES})")
+
+    def _evaluate(self, js: str, on_result=None):
+        """Evaluate JS in the view. When `on_result` is given, it is called with
+        the resulting JSCValue (or None on any eval/dispatch error) — failures are
+        observed, never silently swallowed. With no callback it is fire-and-forget
+        (back-compat for prompt_call / prompt_clear_call)."""
+        # 4.1 prefers evaluate_javascript() (async, observed via *_finish in the
+        # callback); 4.0 has the older run_javascript().
         if hasattr(self.webview, "evaluate_javascript"):
+            def _finish(_wv, result, _data=None):
+                val = None
+                try:
+                    val = self.webview.evaluate_javascript_finish(result)
+                except Exception as e:  # noqa: BLE001 — JS threw / web process gone
+                    self.log(f"[{self.panel.id}] evaluate_javascript failed: {e}")
+                if on_result is not None:
+                    try:
+                        on_result(val)
+                    except Exception as e:  # noqa: BLE001
+                        self.log(f"[{self.panel.id}] eval callback error: {e}")
             try:
-                self.webview.evaluate_javascript(js, -1, None, None, None, None, None)
+                self.webview.evaluate_javascript(
+                    js, -1, None, None, None, _finish, None)
                 return
             except TypeError:
-                pass
-        self.webview.run_javascript(js, None, None, None)
+                pass                    # signature drift -> fall through to 4.0 path
+            except Exception as e:      # noqa: BLE001 — dispatch failed; don't escape
+                self.log(f"[{self.panel.id}] evaluate_javascript dispatch error: {e}")
+                if on_result is not None:
+                    on_result(None)
+                return
+        # 4.0 fallback: run_javascript (removed on some 4.1 builds). Wrap so a
+        # missing/changed API logs once and degrades instead of escaping the
+        # signal handler. We can't easily read its result here, so report None.
+        try:
+            self.webview.run_javascript(js, None, None, None)
+        except Exception as e:          # noqa: BLE001 — API absent/changed
+            self.log(f"[{self.panel.id}] run_javascript failed: {e}")
+        if on_result is not None:
+            on_result(None)
 
     def _on_destroy(self, *_):
         self.log(f"[{self.panel.id}] window closed")

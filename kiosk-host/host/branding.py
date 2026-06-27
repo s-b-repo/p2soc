@@ -102,6 +102,16 @@ def _parse_flat(path: str) -> dict:
     return data
 
 
+def _warn_ignored(path: str, exc: BaseException) -> None:
+    """Emit one non-fatal diagnostic naming the rejected file + cause, so an operator
+    whose hand-edited branding silently fell back to defaults can see WHY. Wrapped so
+    the diagnostic write itself can never raise (matches the module's stderr idiom)."""
+    try:
+        sys.stderr.write(f"branding: ignoring {path}: {exc}\n")
+    except Exception:  # noqa: BLE001 — diagnostics must never become a new failure.
+        pass
+
+
 def _load_file(path: str) -> dict:
     try:
         import yaml  # type: ignore
@@ -111,13 +121,19 @@ def _load_file(path: str) -> dict:
     except ImportError:
         try:
             return _parse_flat(path)
-        except OSError:
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            _warn_ignored(path, exc)
             return {}
-    except Exception:
-        # malformed YAML — try the lenient parser, else give up to defaults
+    except Exception as yaml_exc:  # noqa: BLE001 — some loader errors are not YAMLError.
+        # malformed YAML — try the lenient parser, else give up to defaults. Keep the
+        # broad catch so non-YAMLError loader faults still hit the fallback parser.
         try:
             return _parse_flat(path)
-        except Exception:
+        except (OSError, ValueError, UnicodeDecodeError):
+            # Realistic file/parse faults degrade to defaults, but surface the ORIGINAL
+            # yaml cause so the operator can tell 'rejected' from 'missing'. An unexpected
+            # programmer error in _parse_flat is NOT caught here and propagates.
+            _warn_ignored(path, yaml_exc)
             return {}
 
 

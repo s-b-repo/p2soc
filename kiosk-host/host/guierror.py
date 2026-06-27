@@ -60,11 +60,28 @@ def show(title: str, detail: str = "") -> int:
         f"button.soc-ghost:hover {{ background-color: {sunken};"
         f" border-color: {accent_strong}; }}"
     ).encode()
-    provider = Gtk.CssProvider()
-    provider.load_from_data(css)
-    Gtk.StyleContext.add_provider_for_screen(
-        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    # A malformed branding colour would make load_from_data raise — guard it so the
+    # fail-safe dialog never crashes itself; an unthemed dialog still reaches the operator.
+    try:
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    except Exception as e:  # noqa: BLE001 — bad branding CSS: skip theming, keep the dialog.
+        sys.stderr.write(f"(guierror: themed CSS skipped: {e})\n")
 
+    # Wrap the entire GTK build + main loop: if anything in here raises, the message
+    # must still reach the operator (stderr) rather than vanishing silently.
+    try:
+        return _build_and_run(Gtk, title, detail)
+    except Exception as e:  # noqa: BLE001 — last-resort: never let the fail-safe itself die silently.
+        sys.stderr.write(f"{title}\n{detail}\n(guierror: GTK dialog failed: {e})\n")
+        return 0
+
+
+def _build_and_run(Gtk, title: str, detail: str) -> int:
+    """Build the themed window and run the blocking GTK loop. Split out so show() can
+    wrap it in a try/except and fall back to stderr if GTK raises mid-build."""
     win = Gtk.Window(title="SOC Wall")
     win.get_style_context().add_class("soc-err-bar")
     win.set_position(Gtk.WindowPosition.CENTER)

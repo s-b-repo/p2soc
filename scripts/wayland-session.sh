@@ -49,22 +49,31 @@ start_labwc(){
 }
 
 start_generic(){
-  # best effort for a cage-like kiosk compositor: most accept "-- <cmd>"
+  # best effort for a cage-like kiosk compositor: most accept "-- <cmd>".
+  # Run (NOT exec) so that if the operator's compositor doesn't support the
+  # "-- <cmd>" form (only cage/labwc are known to) and exits immediately, we
+  # log and RETURN — letting the caller fall through to the cage/labwc/X11 auto
+  # chain instead of vanishing into a dead exec and leaving a black screen. A
+  # working long-running compositor blocks here in the foreground exactly as an
+  # exec would, and the script ends with its exit status.
   export SOC_LAYOUT="${SOC_LAYOUT:-single}"
   log "starting $1 (SOC_COMPOSITOR; generic single-window invocation)"
-  exec "$1" -- "$LAUNCHER"
+  "$1" -- "$LAUNCHER"; rc=$?
+  log "WARNING SOC_COMPOSITOR='$1' exited rc=$rc (does it accept '-- <cmd>'? cage-style only) — falling back to auto-selection"
+  return $rc
 }
 
 # 0) explicit override wins.
 if [ -n "${SOC_COMPOSITOR:-}" ]; then
   if command -v "$SOC_COMPOSITOR" >/dev/null 2>&1; then
     case "$SOC_COMPOSITOR" in
-      cage)  start_cage ;;
-      labwc) start_labwc ;;
-      *)     start_generic "$SOC_COMPOSITOR" ;;
+      cage)  start_cage ;;     # exec — never returns on success
+      labwc) start_labwc ;;    # exec — never returns on success
+      *)     start_generic "$SOC_COMPOSITOR" ;;  # runs; returns -> fall through
     esac
+  else
+    log "WARNING SOC_COMPOSITOR='$SOC_COMPOSITOR' not found on PATH — auto-selecting"
   fi
-  log "WARNING SOC_COMPOSITOR='$SOC_COMPOSITOR' not found on PATH — auto-selecting"
 fi
 
 # 1) cage: ideal for an all-webkit wall.

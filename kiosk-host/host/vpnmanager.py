@@ -38,8 +38,10 @@ blast radius) is documented in docs/ARCHITECTURE.md.
 from __future__ import annotations
 
 import copy
+import os
 import threading
 import time
+import traceback
 from typing import Callable, Optional
 
 from . import config as cfg
@@ -150,12 +152,30 @@ class _GuardedSupervisor(fortivpn.Supervisor):
                     continue
             out.append(line)
         if changed:
+            # Atomic rewrite: stage to a tmp in the SAME dir, fsync, then
+            # os.replace — never open(path,'w') which truncates first, leaving a
+            # torn/empty .conf if the process is killed mid-write (then wg-quick
+            # would load a corrupt or under-scoped config). On any write error,
+            # unlink the tmp and return False so the supervisor idles this entry
+            # rather than bringing up an unstripped catch-all tunnel — the
+            # security intent (no default-route hijack) fails closed.
+            tmp = path + ".tmp"
             try:
-                with open(path, "w", encoding="utf-8") as fh:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.writelines(out)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
             except OSError as e:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
                 self.log(f"[vpn:{self.vpn.get('name')}] could not rewrite .conf "
-                         f"to strip catch-all route: {e}")
+                         f"to strip catch-all route: {e} — refusing to bring up an "
+                         f"unstripped catch-all tunnel")
+                return False
         return ok
 
 
@@ -246,6 +266,15 @@ class VpnManager:
             self._spawn_one(name, entry)
             time.sleep(self._START_STAGGER)
 
+    # Defense-in-depth resurrection caps. Supervisor.run() already self-heals an
+    # internal failure into idle() (it never escapes), so this wrapper is a
+    # backstop for a TRULY unexpected escape (e.g. a bug in the guard itself).
+    # We relaunch with a bounded, growing delay and a hard cap so a
+    # deterministically-crashing entry cannot hot-loop and starve the 1 GB Pi.
+    _RELAUNCH_MAX = 3
+    _RELAUNCH_DELAY = 5.0
+    _RELAUNCH_DELAY_MAX = 60.0
+
     def _spawn_one(self, name: str, entry: dict):
         def tagged(msg, _n=name):
             # Prefix every supervisor/driver line so journald is attributable
@@ -256,11 +285,40 @@ class VpnManager:
                 self._log(f"[vpn:{_n}] {msg}")
         driver = vpndrivers.get_driver(entry)
         sup = _GuardedSupervisor(entry, self.pinentry, log=tagged, driver=driver)
-        t = threading.Thread(target=sup.run, name=f"vpn:{name}", daemon=True)
+        t = threading.Thread(target=self._supervised_run, args=(name, sup, tagged),
+                             name=f"vpn:{name}", daemon=True)
         with self._lock:
             self._supers[name] = sup
             self._threads[name] = t
         t.start()
+
+    def _supervised_run(self, name: str, sup, tagged: Callable[[str], None]):
+        """Run sup.run(); if it ever escapes with an UNEXPECTED exception (it
+        normally falls into idle() and never returns until stop), relaunch with a
+        bounded backoff and a hard cap. Never resurrects a VPN whose stop was
+        requested, and every catch logs loudly (no silent swallow)."""
+        delay = self._RELAUNCH_DELAY
+        for attempt in range(self._RELAUNCH_MAX + 1):
+            if sup.stop_event.is_set():
+                return
+            try:
+                sup.run()
+                return                                 # clean stop — done
+            except Exception as e:                     # noqa: BLE001
+                tagged(f"supervisor crashed: {e!r}; {traceback.format_exc()}")
+            if sup.stop_event.is_set():
+                return
+            if attempt >= self._RELAUNCH_MAX:
+                tagged(f"supervisor crashed {self._RELAUNCH_MAX} times — giving up "
+                       f"relaunch; this VPN will stay offline until the service is "
+                       f"restarted (fix the cause in the journal above)")
+                return
+            tagged(f"relaunching supervisor in {delay:.0f}s "
+                   f"(attempt {attempt + 1}/{self._RELAUNCH_MAX})")
+            # stop_event.wait so manager.stop() unblocks the backoff immediately.
+            if sup.stop_event.wait(delay):
+                return
+            delay = min(delay * 2.0, self._RELAUNCH_DELAY_MAX)
 
     def stop(self, grace: float = 10.0):
         """Tear EVERY supervisor down: signal stop, terminate the child, join."""
@@ -299,16 +357,33 @@ class VpnManager:
     def count(self) -> int:
         return len(self._entries)
 
-    def states(self) -> dict:
+    # A short per-probe timeout for the status path. The supervise loop calls
+    # states() under the systemd watchdog; a black-holed ready_probe would
+    # otherwise block ~2s each and, across many VPNs, a single batch could exceed
+    # WatchdogSec and self-kill the unit. A live tunnel's probe connects far
+    # inside this, so green/offline classification is unchanged (matches
+    # health.py's PROBE_TIMEOUT idiom).
+    _PROBE_TIMEOUT = 0.5
+
+    def states(self, on_each: Optional[Callable[[], None]] = None) -> dict:
         """Per-name {name: state}. Each state is computed from the entry the
         manager actually started (post-coercion), so e.g. ready_probe is the
-        live one. Safe to call from any thread — it only does TCP/sysfs reads."""
+        live one. Safe to call from any thread — it only does TCP/sysfs reads.
+
+        `on_each`, when given, is invoked between per-VPN probes so the caller
+        can pet the systemd watchdog inside the loop — no batch size can starve
+        the heartbeat regardless of how many probes stall."""
         out = {}
         for name, entry, _owner in self._entries:
             try:
-                out[name] = vpnstatus.vpn_state(entry)
+                out[name] = vpnstatus.vpn_state(entry, timeout=self._PROBE_TIMEOUT)
             except Exception:                          # noqa: BLE001
                 out[name] = vpnstatus.STATE_OFFLINE
+            if on_each is not None:
+                try:
+                    on_each()
+                except Exception:                      # noqa: BLE001
+                    pass
         return out
 
     def state_aggregate(self) -> str:

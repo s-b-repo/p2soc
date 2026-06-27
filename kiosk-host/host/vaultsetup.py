@@ -91,6 +91,12 @@ def register_account(url: str, email: str, master: str,
     import hashlib
     import os
 
+    # Defence in depth: the account boundary must never be driven with an empty
+    # master (e.g. an EOF/placeholder leaking out of a non-interactive resolver).
+    # Fail CLOSED here so a blank master can never register a vault.
+    if not master:
+        raise VaultSeedError("refusing to register with an empty master password")
+
     base = url.rstrip("/")
     email = email.lower()
     pw = master.encode()

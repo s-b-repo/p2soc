@@ -2141,36 +2141,58 @@ class SetupAssistant:
         self._install_set_status(
             ("dry-run: simulating — no changes" if dry else "installing…"))
 
-        opts = self._build_opts()
-        # Capture the model's config ONCE, AFTER the wizard pages have populated it,
-        # and HOLD that snapshot for the whole worker run so write_config can never
-        # see a transiently-empty cfg (the "no wizard config yet" artifact).
-        cfg = self.model.cfg()
-        soc_env = self.model.soc_env()
-        paths = self.model.paths
-        backend = soc_env.get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
+        # Everything between the control-disable above and the thread start below
+        # must re-arm the page on ANY failure — otherwise a render/assert/opts
+        # error strands the operator on a dead page (controls disabled, page
+        # incomplete) with no way to retry. Mirror the no-config guard's recovery.
+        # The master is NOT scrubbed here: the worker never ran, so it must remain
+        # for the retry (scrubbing happens only on the success path before start).
+        try:
+            opts = self._build_opts()
+            # Capture the model's config ONCE, AFTER the wizard pages have populated it,
+            # and HOLD that snapshot for the whole worker run so write_config can never
+            # see a transiently-empty cfg (the "no wizard config yet" artifact).
+            cfg = self.model.cfg()
+            soc_env = self.model.soc_env()
+            paths = self.model.paths
+            backend = soc_env.get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
 
-        # Guard: never launch the worker with nothing to install. Surface a
-        # guiding status instead of a silent "no wizard config yet" line buried in
-        # the per-step log — the operator must configure display + panels first.
-        if not (cfg.get("display") and cfg.get("panels")):
+            # Guard: never launch the worker with nothing to install. Surface a
+            # guiding status instead of a silent "no wizard config yet" line buried in
+            # the per-step log — the operator must configure display + panels first.
+            if not (cfg.get("display") and cfg.get("panels")):
+                self._install_busy = False
+                for w in (self._install_run_btn, self._install_preview_btn,
+                          self._install_dry_chk, self._install_mode_combo):
+                    if w is not None:
+                        w.set_sensitive(True)
+                self.assistant.set_page_complete(self._install_page, True)
+                self._install_set_status(
+                    "configure the display + panels first (run the wizard pages), "
+                    "then install", bad=True)
+                return
+
+            # No-plaintext-master guarantee on this path (mirror _write :2028).
+            env_text = self.setup.render_soc_env(soc_env)
+            assert "SOC_VAULT_PASSWORD" not in env_text
+
+            # Capture the master into a mutable holder (so the worker can scrub the
+            # reference in its finally); scrub the model copy below before the thread runs.
+            master_box = [self.model.master_password]
+        except Exception as e:  # noqa: BLE001
+            # Pre-thread failure (bad opts / render KeyError / assert). Re-arm the
+            # controls + page so the operator can fix config and retry; SURFACE the
+            # cause so a genuine misconfiguration is never masked. Do NOT scrub the
+            # model master — the worker never started, so it must survive for retry.
             self._install_busy = False
             for w in (self._install_run_btn, self._install_preview_btn,
                       self._install_dry_chk, self._install_mode_combo):
                 if w is not None:
                     w.set_sensitive(True)
+            self.assistant.set_page_complete(self._install_page, True)
             self._install_set_status(
-                "configure the display + panels first (run the wizard pages), "
-                "then install", bad=True)
+                f"install setup failed: {e.__class__.__name__}: {e}", bad=True)
             return
-
-        # No-plaintext-master guarantee on this path (mirror _write :2028).
-        env_text = self.setup.render_soc_env(soc_env)
-        assert "SOC_VAULT_PASSWORD" not in env_text
-
-        # Capture the master into a mutable holder (so the worker can scrub the
-        # reference in its finally); scrub the model copy below before the thread runs.
-        master_box = [self.model.master_password]
 
         def report(step, status, detail=""):
             # Runs on the WORKER thread — only ever SCHEDULE a main-thread update.

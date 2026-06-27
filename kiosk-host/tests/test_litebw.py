@@ -480,14 +480,18 @@ def test_get_master_falls_back_to_env_when_unsealed(monkeypatch):
     assert litebw.get_master() == "env-master"
 
 
-def test_get_master_degrades_on_secretstore_error(monkeypatch, capsys):
+def test_get_master_fails_closed_on_broken_seal(monkeypatch, capsys):
     def boom(*a, **k):
         raise litebw.secretstore.SecretStoreError("no machine-id")
     monkeypatch.setattr(litebw.secretstore, "is_sealed", lambda *a, **k: True)
     monkeypatch.setattr(litebw.secretstore, "unseal", boom)
     monkeypatch.setenv("SOC_VAULT_PASSWORD", "env-master")
-    # is_sealed True but unseal raises -> degrade to env (like pinentry-vault.py)
-    assert litebw.get_master() == "env-master"
+    # A host-bound seal EXISTS but won't unseal (wrong machine / corrupt). Provenance
+    # fail-closed: do NOT silently downgrade to a weaker source (env / secret-service);
+    # return "" and surface an actionable line so the operator re-seals. (Contract is
+    # still crash-free: get_master never raises.)
+    assert litebw.get_master() == ""
+    assert "did not unseal" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #

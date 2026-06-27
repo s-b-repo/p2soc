@@ -71,11 +71,24 @@ def valid_url(url: str) -> bool:
 def save_overrides(d: dict):
     path = _overrides_path()
     tmp = path + ".tmp"
-    # 0600: panel URLs can reveal internal hostnames; keep them owner-only
+    # 0600: panel URLs can reveal internal hostnames; keep them owner-only.
+    # fsync before replace so a power cut right after the rename can't leave a
+    # zero-length overrides.json (SD-card durability); remove the stale tmp and
+    # re-raise on any failure so a non-serialisable value / ENOSPC surfaces
+    # instead of accumulating orphan .tmp files (mirrors backup / litebw).
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, indent=2, sort_keys=True)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _pin_path() -> str:
@@ -862,7 +875,11 @@ class ConfigWindow(Gtk.Window):
 
         try:
             save_overrides(overrides)
-        except OSError as e:  # noqa: BLE001 — disk full / dir not writable
+        except (OSError, ValueError, TypeError) as e:  # noqa: BLE001 — disk full /
+            # dir not writable (OSError), a circular reference (ValueError) or a
+            # non-serialisable override value (TypeError) from json.dump — all
+            # surface here as a guiding message, not a generic 'apply error' that
+            # would escape to GLib.
             self._msg(f"could not save settings: {e} — check that "
                       f"{state_dir()} is writable (disk space / permissions)",
                       error=True)

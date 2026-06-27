@@ -40,6 +40,7 @@ import json
 import os
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -529,6 +530,20 @@ class LitebwBackend:
         self.interactive = os.environ.get("SOC_VAULT_INTERACTIVE", "0") == "1"
         self._session: ReadSession | None = None
         self._ciphers: dict[str, dict] | None = None
+        # Bounded cooldown for sync()'s full re-unlock (re-unseal scrypt + login)
+        # on a persistent 401, so a 401-storm (clock skew, disabled account,
+        # server bug) can't re-unseal the master on every panel reload and pin
+        # the 1GB Pi's CPU. The lock also stops prewarm's concurrent threads from
+        # all re-unsealing at once. Real VaultErrors still surface (we re-raise a
+        # cached one inside the window) — only the expensive retry is skipped.
+        self._reunlock_lock = threading.Lock()
+        self._reunlock_fail_ts = 0.0
+        self._reunlock_err: Exception | None = None
+        try:
+            self._reunlock_window = float(
+                os.environ.get("SOC_VAULT_REUNLOCK_COOLDOWN", "8") or "8")
+        except ValueError:
+            self._reunlock_window = 8.0
 
     # -- VaultError import is lazy so this module loads before host.vault ---- #
     @staticmethod
@@ -588,6 +603,11 @@ class LitebwBackend:
         except VaultSeedError as e:
             self._session = None
             raise self._vault_error(str(e))
+        # Operator corrected the master — clear the 401 cooldown so the next
+        # sync() retries immediately instead of re-raising a stale cached error.
+        with self._reunlock_lock:
+            self._reunlock_fail_ts = 0.0
+            self._reunlock_err = None
 
     def _ensure_session(self) -> ReadSession:
         if self._session is None:
@@ -623,15 +643,33 @@ class LitebwBackend:
             # see host.vault.VaultError. _HTTPStatusError is a VaultSeedError
             # subclass, so the single except covers both.
             self._session = None
-            try:
-                session = self._ensure_session()
-                items = session.list_ciphers()
-            except VaultLockedError:
-                raise
-            except VaultSeedError as e2:
-                raise self._vault_error(str(e2))
+            # Bounded cooldown: within the window after a failed full re-unlock,
+            # re-raise the cached VaultError instead of re-running scrypt+login.
+            # The lock serialises prewarm's concurrent threads so only one pays
+            # the re-unseal cost. The VaultLockedError "please unlock" signal is
+            # NOT gated by this — its except branch stays ahead of the cooldown.
+            with self._reunlock_lock:
+                if (self._reunlock_err is not None
+                        and time.time() - self._reunlock_fail_ts
+                        < self._reunlock_window):
+                    raise self._reunlock_err
+                try:
+                    session = self._ensure_session()
+                    items = session.list_ciphers()
+                except VaultLockedError:
+                    raise
+                except VaultSeedError as e2:
+                    err = self._vault_error(str(e2))
+                    self._reunlock_fail_ts = time.time()
+                    self._reunlock_err = err
+                    raise err
         except VaultSeedError as e:
             raise self._vault_error(str(e))
+        # Success: clear any cached re-unlock failure so recovery is immediate.
+        if self._reunlock_err is not None:
+            with self._reunlock_lock:
+                self._reunlock_fail_ts = 0.0
+                self._reunlock_err = None
         self._ciphers = {it["name"]: it for it in items}
 
     def _lookup(self, item: str) -> dict | None:

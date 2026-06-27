@@ -64,6 +64,10 @@ fi
 # GUI run: don't exec — a clickable .desktop launch discards stderr, so surface a
 # silent failure in a visible themed dialog (fail-safe).
 ERRLOG="$(mktemp 2>/dev/null || echo "/tmp/soc-wall-appearance.$$.log")"
+# Reap the temp file on EVERY exit — including Ctrl-C / SIGTERM while the blocking
+# guierror dialog is open — so repeated desktop launches don't litter /tmp.
+# Single-quoted so $ERRLOG expands at trap-fire time. (Same idiom as dev/run-wall.sh.)
+trap 'rm -f "$ERRLOG" 2>/dev/null' EXIT INT TERM
 set +e
 "$PYBIN" -m host.appearance "$@" 2>"$ERRLOG"
 rc=$?

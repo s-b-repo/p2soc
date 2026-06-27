@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 from . import config as cfg
 from . import vpndrivers
@@ -46,6 +47,14 @@ EVENT_AUTH = "auth"
 EVENT_CERT = "cert"
 EVENT_DOWN = "down"
 EVENT_CONNECTING = "connecting"     # progress only — never drives backoff/reconnect
+
+
+class OtpUnavailable(Exception):
+    """Raised by _spawn when an OTP is required (otp_from_vault) but could not be
+    fetched after a bounded retry. run() routes this onto the slow vault path
+    instead of spawning a guaranteed blank-OTP auth attempt (which would burn the
+    long auth-lockout backoff and can lock the account). The arg is the vault item."""
+
 
 _PATTERNS = (
     ("Tunnel is up and running", EVENT_UP),
@@ -154,6 +163,9 @@ class Supervisor:
         self.stop_event = threading.Event()
         self.child = None
         self._materialized = None       # transient VPN config file from the vault
+        self._mgmt = None               # transient OpenVPN mgmt socket (best-effort cleanup)
+        self._reader_thread = None      # current child-stdout reader (joined per attempt)
+        self._mgmt_thread = None        # current openvpn mgmt-injector thread
         # ONE Vault for the supervisor's lifetime, opened lazily once and reused
         # across reconnect attempts. A bounded TTL caches the decrypted creds so a
         # flapping link doesn't redo a scrypt unseal + full HTTPS sync per attempt,
@@ -171,6 +183,7 @@ class Supervisor:
         self._tunnel_up = False
         self._up_since = 0.0            # monotonic time the tunnel last reported UP (0 = never up this attempt)
         self._saw = set()
+        self._mgmt_unreachable = False  # openvpn mgmt-socket handshake never connected this attempt
 
     # -- signals ---------------------------------------------------------------
     def install_signal_handlers(self):
@@ -248,9 +261,33 @@ class Supervisor:
         try:
             r = subprocess.run([cli, "code", item], capture_output=True,
                                text=True, stdin=subprocess.DEVNULL, timeout=30)
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except subprocess.TimeoutExpired:
+            self.log(f"WARNING OTP fetch from vault item '{item}' timed out (CLI {cli})")
             return ""
-        return r.stdout.strip() if r.returncode == 0 else ""
+        except FileNotFoundError:
+            self.log(f"WARNING OTP CLI '{cli}' not found — install it or fix "
+                     f"SOC_VAULT_BACKEND")
+            return ""
+        if r.returncode != 0:
+            self.log(f"WARNING OTP fetch from vault item '{item}' failed "
+                     f"(rc {r.returncode}): {(r.stderr or '').strip()}")
+            return ""
+        return r.stdout.strip()
+
+    def _otp_code_retry(self, tries: int = 2) -> str:
+        """Fetch the single-use OTP with a short bounded retry. A transient OTP
+        outage (vault still syncing, momentary CLI failure) should NOT immediately
+        spend a doomed blank-OTP auth attempt and trip the long auth-lockout
+        backoff. Interruptible + watchdog-fed between tries; returns '' only after
+        every try fails (each _otp_code already logged its own cause)."""
+        for i in range(max(1, tries)):
+            code = self._otp_code()
+            if code:
+                return code
+            if i < tries - 1 and not self.stop_event.is_set():
+                self.watchdog.ping()
+                self.stop_event.wait(2)
+        return ""
 
     # -- child output ----------------------------------------------------------
     def _reader(self, pipe):
@@ -295,14 +332,26 @@ class Supervisor:
         if not self.vpn.get("config_from_vault"):
             return True
         item = self.vpn.get("vault_item")
-        try:
-            # Reuse the one already-synced Vault instead of a second fresh
-            # unseal + sync; force a re-open on VaultError (transient outage).
-            content = self._open_vault().notes(item)
-        except VaultError as e:
-            self._vault = None
-            self.log(f"ERROR reading VPN config from vault item '{item}': {e}")
-            return False
+        # Bounded retry, mirroring _resolve_creds: a transient vault blip at
+        # connect time (vaultwarden still starting, a momentary outage) must not
+        # collapse the VPN straight to idle — ride it out to the ready deadline,
+        # falling through to a hard error only if it is genuinely persistent.
+        # Reuse the one already-synced Vault; force a clean re-open on each error.
+        deadline = time.monotonic() + cfg.env_float(
+            "SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
+        while True:
+            try:
+                content = self._open_vault().notes(item)
+                break
+            except VaultError as e:
+                self._vault = None
+                if self.stop_event.is_set() or time.monotonic() > deadline:
+                    self.log(f"ERROR reading VPN config from vault item "
+                             f"'{item}': {e}")
+                    return False
+                self.log(f"vault not ready for VPN config ({e}); retrying in 3s")
+                sd_notify("STATUS=waiting for the vault (VPN config)")
+                self.stop_event.wait(3)
         if not content.strip():
             self.log(f"ERROR vault item '{item}' has no Notes content (the VPN config)")
             return False
@@ -335,6 +384,37 @@ class Supervisor:
                 pass
             self._materialized = None
 
+    def _cleanup_mgmt(self):
+        """Remove the OpenVPN management socket left by the last attempt.
+        Per-attempt cleanup is also done at the top of the next _spawn (line
+        unlinks before re-create); this covers the FINAL socket on clean stop so
+        the 0700 runtime dir doesn't accumulate a stale socket per supervisor."""
+        if self._mgmt:
+            try:
+                os.unlink(self._mgmt)
+            except OSError:
+                pass
+            self._mgmt = None
+
+    def _retire_attempt_threads(self):
+        """Push the previous attempt's child-stdout reader (and the openvpn mgmt
+        thread) to EOF and bounded-join them, so a fast connect/drop flap can't
+        accumulate short-lived daemon threads + open pipe fds. Closing stdout
+        from here forces the reader's blocking readline() to EOF; the join is a
+        SHORT bounded timeout (the threads are daemon, so shutdown is never
+        blocked even if a grandchild holds the pipe open)."""
+        child = self.child
+        if child is not None and child.stdout is not None:
+            try:
+                child.stdout.close()
+            except (OSError, ValueError):
+                pass
+        for attr in ("_reader_thread", "_mgmt_thread"):
+            t = getattr(self, attr, None)
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
+            setattr(self, attr, None)
+
     # -- OpenVPN management socket (secure user/pass injection) -----------------
     def _mgmt_path(self) -> str:
         # The OpenVPN password transits this socket, so keep it in an owner-only
@@ -346,7 +426,38 @@ class Supervisor:
             os.chmod(d, 0o700)
         except OSError:
             d = base
+        self._sweep_orphan_mgmt(d)
         return os.path.join(d, f"openvpn-{os.getpid()}.sock")
+
+    def _sweep_orphan_mgmt(self, d: str):
+        """Best-effort: reap mgmt sockets left by a crashed/SIGKILLed supervisor.
+        The path is pid-scoped, so any openvpn-<pid>.sock whose <pid> is not us
+        and is not a live process is by definition an orphan. Pure stat/unlink —
+        cannot hang; swallow OSError like the other best-effort cleanups."""
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            return
+        for fn in entries:
+            if not (fn.startswith("openvpn-") and fn.endswith(".sock")):
+                continue
+            pid_str = fn[len("openvpn-"):-len(".sock")]
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, 0)
+                continue                 # still alive — not ours to reap
+            except ProcessLookupError:
+                pass                     # dead pid: orphaned socket
+            except OSError:
+                continue                 # EPERM etc: leave it alone
+            try:
+                os.unlink(os.path.join(d, fn))
+            except OSError:
+                pass
 
     def _openvpn_mgmt(self, sock_path: str, creds):
         """Answer OpenVPN's password query over its management socket, so the
@@ -364,7 +475,26 @@ class Supervisor:
                 s = None
                 self.stop_event.wait(0.3)
         if s is None:
-            self.log("WARNING could not reach the OpenVPN management socket")
+            # openvpn was started with --management-hold, so it is sitting HELD
+            # and will never proceed past auth until we send 'hold release' over
+            # this socket — which we just failed to reach. Without this, the
+            # child blocks forever, _watch_child waits forever, no event is
+            # recorded, and the supervisor retries the same broken path with a
+            # short network backoff. Instead: flag the cause, record a DOWN, tell
+            # systemd, and terminate the held child so the watch loop unblocks and
+            # run() can apply a LONG backoff (this is a config/setup fault, not a
+            # transient network drop).
+            if self.stop_event.is_set():
+                return
+            self._mgmt_unreachable = True
+            self._saw.add(EVENT_DOWN)
+            self.log("ERROR could not reach the OpenVPN management socket — the "
+                     "child started --management-hold and cannot authenticate; "
+                     "check that openvpn created the socket (selinux/apparmor, "
+                     "runtime dir perms). Terminating the held child and backing "
+                     "off.")
+            sd_notify("STATUS=OpenVPN management socket unreachable; backing off")
+            self._terminate_child()
             return
         f = s.makefile("rw")
         try:
@@ -395,13 +525,21 @@ class Supervisor:
         self._tunnel_up = False
         self._up_since = 0.0
         self._saw = set()
+        self._mgmt_unreachable = False
         env = dict(os.environ)
         mgmt = None
         if self.driver.kind == "fortinet":
             user, password = creds
-            cmd = self.driver.build_cmd(
-                self.vpn, user, self.pinentry,
-                otp=self._otp_code() if self.vpn.get("otp_from_vault") else "")
+            otp = ""
+            if self.vpn.get("otp_from_vault"):
+                otp = self._otp_code_retry()
+                if not otp:
+                    # We KNOW we have no OTP to send. Do NOT spawn a guaranteed
+                    # bad-auth attempt (records EVENT_AUTH + burns the full
+                    # auth-lockout backoff, and rapid blank-OTP logins can lock
+                    # the account). Signal run() to take the slow vault path.
+                    raise OtpUnavailable(self.vpn.get("vault_item"))
+            cmd = self.driver.build_cmd(self.vpn, user, self.pinentry, otp=otp)
             env["SOC_VPN_PASSWORD"] = password
         elif self.driver.kind == "inode":
             user, password = creds
@@ -414,17 +552,23 @@ class Supervisor:
                     os.unlink(mgmt)
                 except OSError:
                     pass
+                self._mgmt = mgmt          # track for teardown cleanup
                 cmd = self.driver.build_cmd(self.vpn, mgmt_socket=mgmt)
             else:
                 cmd = self.driver.build_cmd(self.vpn)
+        # Actively retire the previous attempt's reader/mgmt threads + pipe before
+        # spawning the next, so a fast flap can't accumulate short-lived threads.
+        self._retire_attempt_threads()
         self.child = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, text=True, bufsize=1, env=env)
-        threading.Thread(target=self._reader, args=(self.child.stdout,),
-                         daemon=True).start()
+        self._reader_thread = threading.Thread(
+            target=self._reader, args=(self.child.stdout,), daemon=True)
+        self._reader_thread.start()
         if mgmt and creds:
-            threading.Thread(target=self._openvpn_mgmt, args=(mgmt, creds),
-                             daemon=True).start()
+            self._mgmt_thread = threading.Thread(
+                target=self._openvpn_mgmt, args=(mgmt, creds), daemon=True)
+            self._mgmt_thread.start()
 
     def _watch_child(self):
         """Wait for the child to exit; meanwhile heartbeat + health-check."""
@@ -490,9 +634,28 @@ class Supervisor:
 
     # -- the loop (process drivers: fortinet / openvpn) ------------------------
     def run(self) -> int:
-        if self.driver.is_interface:
-            return self._run_interface()
+        """Top-level supervise entry. A supervisor thread must NEVER die on an
+        unexpected exception — that would orphan a child and leave this VPN
+        permanently offline (the manager reports it down and never restarts it).
+        Any escape is logged loudly with a traceback, the child/config/socket are
+        cleaned, and we fall into idle() so the thread stays alive and
+        watchdog-pingable instead of dying silently."""
+        try:
+            if self.driver.is_interface:
+                return self._run_interface()
+            return self._run_process()
+        except Exception as e:                          # noqa: BLE001
+            self.log(f"UNEXPECTED supervisor error: {e!r}\n{traceback.format_exc()}")
+            sd_notify("STATUS=internal supervisor error; idling (will not churn)")
+            try:
+                self._terminate_child()
+                self._cleanup_materialized()
+                self._cleanup_mgmt()
+            except Exception:                           # noqa: BLE001
+                pass
+            return self.idle()
 
+    def _run_process(self) -> int:
         timeout = cfg.env_float("SOC_READY_TIMEOUT", 120.0, lo=0.0, hi=3600.0)
         needs = self.driver.needs_creds(self.vpn)
 
@@ -535,20 +698,64 @@ class Supervisor:
             sd_notify(f"STATUS=connecting {target} (attempt {attempt})")
             try:
                 self._spawn(creds)
+            except OtpUnavailable as e:
+                # OTP required but unavailable — no child was started. Take the
+                # slow vault path (like a vault outage) rather than the angry
+                # auth-lockout backoff: this is a transient fetch fault, not a
+                # rejected credential.
+                self.log(f"could not retrieve the OTP from vault item '{e}' — "
+                         f"not attempting a blank-OTP login; retrying shortly")
+                sd_notify(f"STATUS=could not retrieve OTP from vault item {e}")
+                self._sleep(min(self.auth_delay, 60))
+                continue
             except OSError as e:
                 self.log(f"ERROR could not start {self.driver.binary}: {e}")
+                self._sleep(self.backoff.next())
+                continue
+            except Exception as e:                      # noqa: BLE001
+                # An UNEXPECTED spawn error must not escape and kill the
+                # supervisor thread (which would orphan a child + leave the VPN
+                # permanently dead). Log loudly, reap any child we did create,
+                # back off, and keep trying to reconnect — never swallow silently.
+                self.log(f"UNEXPECTED supervisor error during spawn: {e!r}; "
+                         f"terminating child and backing off")
+                self._terminate_child()
                 self._sleep(self.backoff.next())
                 continue
             finally:
                 creds = None  # scrub our copy
 
-            self._watch_child()
+            try:
+                self._watch_child()
+            except Exception as e:                      # noqa: BLE001
+                self.log(f"UNEXPECTED supervisor error while watching the child: "
+                         f"{e!r}; terminating child and backing off")
+                self._terminate_child()
+                self._retire_attempt_threads()
+                self._sleep(self.backoff.next())
+                continue
+            self._retire_attempt_threads()
             rc = self.child.returncode if self.child else -1
             if self.stop_event.is_set():
                 break
 
             # the child is gone — decide how angrily to come back
-            if EVENT_AUTH in self._saw:
+            if self._mgmt_unreachable:
+                # The OpenVPN management socket never became reachable, so auth
+                # was never even attempted — this is a setup/config fault, not a
+                # transient drop. Apply a LONG backoff (like auth/cert) so we
+                # don't spin retrying the same broken path with a short delay.
+                self.log("=" * 70)
+                self.log(f"OPENVPN MANAGEMENT SOCKET UNREACHABLE ({self.driver.kind}, "
+                         f"exit {rc}).")
+                self.log("  openvpn could not be authenticated because its "
+                         "management socket never came up; verify openvpn can "
+                         "create the socket (runtime dir perms, selinux/apparmor).")
+                self.log(f"  Backing off {self.auth_delay:.0f}s before retrying.")
+                self.log("=" * 70)
+                sd_notify("STATUS=OpenVPN management socket unreachable (long backoff)")
+                self._sleep(self.auth_delay)
+            elif EVENT_AUTH in self._saw:
                 item = self.vpn.get("vault_item")
                 self.log("=" * 70)
                 self.log(f"AUTHENTICATION FAILED ({self.driver.kind}, exit {rc}).")
@@ -595,6 +802,7 @@ class Supervisor:
 
         self._terminate_child()
         self._cleanup_materialized()
+        self._cleanup_mgmt()
         self.log("stopped")
         sd_notify("STATUS=stopped")
         return 0
@@ -643,45 +851,71 @@ class Supervisor:
         target = cfg.wireguard_target(self.vpn)
         iface = self.driver.iface(self.vpn)
 
-        while not self.stop_event.is_set():
-            if not self._wg_is_up(iface):
-                self.log(f"bringing up WireGuard ({target})")
-                sd_notify(f"STATUS=connecting WireGuard {iface}")
-                rc, out = self._run_oneshot(self.driver.up_cmd(self.vpn))
-                if rc != 0:
-                    d = self.backoff.next()
-                    self.log(f"wg-quick up failed (rc {rc}): {out}; "
-                             f"retrying in {d:.0f}s")
-                    sd_notify("STATUS=wg-quick up failed; retrying")
-                    self._sleep(d)
-                    continue
-                self.backoff.reset()
-                self.log("WireGuard interface up")
-                sd_notify("STATUS=connected: WireGuard up")
-            failures = 0
-            next_check = time.monotonic() + interval
+        first = True
+        try:
             while not self.stop_event.is_set():
-                self.watchdog.ping()
-                if time.monotonic() >= next_check:
-                    next_check = time.monotonic() + interval
-                    ok = probe_tcp(probe) if probe else self._wg_handshake_ok(iface)
-                    if ok:
-                        failures = 0
-                    else:
-                        failures += 1
-                        self.log(f"WireGuard health check failed "
-                                 f"({failures}/{threshold})")
-                        if failures >= threshold:
-                            self.log("cycling the WireGuard interface")
-                            sd_notify("STATUS=health check failed; reconnecting")
-                            self._run_oneshot(self.driver.down_cmd(self.vpn))
-                            break
-                self.stop_event.wait(1)
-            if self.stop_event.is_set():
-                break
-
-        self._run_oneshot(self.driver.down_cmd(self.vpn))
-        self._cleanup_materialized()
+                if not self._wg_is_up(iface):
+                    self.log(f"bringing up WireGuard ({target})")
+                    sd_notify(f"STATUS=connecting WireGuard {iface}")
+                    rc, out = self._run_oneshot(self.driver.up_cmd(self.vpn))
+                    if rc != 0:
+                        d = self.backoff.next()
+                        self.log(f"wg-quick up failed (rc {rc}): {out}; "
+                                 f"retrying in {d:.0f}s")
+                        sd_notify("STATUS=wg-quick up failed; retrying")
+                        self._sleep(d)
+                        continue
+                    self.backoff.reset()
+                    self.log("WireGuard interface up")
+                    sd_notify("STATUS=connected: WireGuard up")
+                elif first:
+                    # A previous run left the interface up (its teardown never
+                    # ran — e.g. the supervisor crashed). Tear it down ONCE so the
+                    # next iteration reasserts fresh keys/routes instead of
+                    # trusting a stale iface; only ever on the first iteration.
+                    first = False
+                    self.log(f"WireGuard {iface} already up at start — cycling "
+                             f"once to reassert fresh keys/routes")
+                    self._run_oneshot(self.driver.down_cmd(self.vpn))
+                    continue
+                first = False
+                failures = 0
+                next_check = time.monotonic() + interval
+                while not self.stop_event.is_set():
+                    self.watchdog.ping()
+                    if time.monotonic() >= next_check:
+                        next_check = time.monotonic() + interval
+                        ok = probe_tcp(probe) if probe else self._wg_handshake_ok(iface)
+                        if ok:
+                            failures = 0
+                        else:
+                            failures += 1
+                            self.log(f"WireGuard health check failed "
+                                     f"({failures}/{threshold})")
+                            if failures >= threshold:
+                                self.log("cycling the WireGuard interface")
+                                sd_notify("STATUS=health check failed; reconnecting")
+                                drc, dout = self._run_oneshot(
+                                    self.driver.down_cmd(self.vpn))
+                                if drc != 0 and self._wg_is_up(iface):
+                                    # down failed but the iface is still up — the
+                                    # next `wg-quick up` would refuse ('already
+                                    # exists'). Force-remove the device so the
+                                    # cycle recovers (this drops its routes too).
+                                    self.log(f"wg-quick down failed (rc {drc}): "
+                                             f"{dout}; force-removing {iface}")
+                                    self._run_oneshot(["ip", "link", "delete",
+                                                       "dev", iface])
+                                break
+                    self.stop_event.wait(1)
+                if self.stop_event.is_set():
+                    break
+        finally:
+            # Guarantee teardown on EVERY exit path (clean stop, break, or an
+            # escaping exception) so a crash can't leave the interface + its
+            # routes installed for the next process to trip over.
+            self._run_oneshot(self.driver.down_cmd(self.vpn))
+            self._cleanup_materialized()
         self.log("stopped")
         sd_notify("STATUS=stopped")
         return 0
@@ -854,9 +1088,11 @@ def main() -> int:
     last_status = ""
     while not stop.is_set():
         watchdog.ping()
-        # states() may TCP-probe each ready_probe (bounded per-probe), so pet the
-        # watchdog again right after so N probes can't starve a heartbeat.
-        states = mgr.states()
+        # states() may TCP-probe each ready_probe (small bounded per-probe). Pet
+        # the watchdog BETWEEN each per-VPN probe (on_each) as well as before/after
+        # so no batch size — however many VPNs, however many black-holed probes —
+        # can ever starve the heartbeat and self-kill the unit.
+        states = mgr.states(on_each=watchdog.ping)
         watchdog.ping()
         agg = vpnmanager.aggregate_state(states)
         status = (f"STATUS={agg}: "

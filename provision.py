@@ -414,6 +414,22 @@ def step_units(opts: Opts) -> ProvResult:
                       detail=f"units ensured ({', '.join(units)})", cmds=cmds)
 
 
+def _disable_session(opts: Opts) -> None:
+    """Fail-closed boot guard: disable the wall session so an un-sealable box does
+    NOT autostart a session that can't reach the vault and goes dark. Best-effort
+    and idempotent — a no-op without systemd; re-running provision to seal re-enables
+    it. NEVER raises (any systemctl error is swallowed deliberately HERE because the
+    real failure has already been reported by the failing step and is being
+    surfaced in the returned PARTIAL-INSTALL message)."""
+    if not _have("systemctl"):
+        return
+    for u in ("soc-wall.service",):
+        try:
+            _run(["systemctl", "disable", u], dry=False)
+        except Exception:  # noqa: BLE001 — guard must not mask the original failure
+            pass
+
+
 def step_vault_running(opts: Opts) -> ProvResult:
     """Start Vaultwarden + poll /alive (logic lifted from cmd_deploy step 3)."""
     dry = opts.dry
@@ -495,6 +511,7 @@ def step_vault_seed(opts: Opts, master: str, cfg: dict) -> ProvResult:
         return ProvResult(ok=False, changed=False,
                           detail="host.vaultseed unavailable — add logins in the web vault")
     seeded = 0
+    first_err = ""
     for kind, name, uri in items:
         try:
             # Seed an EMPTY placeholder login (operator fills user/pass later via
@@ -502,8 +519,19 @@ def step_vault_seed(opts: Opts, master: str, cfg: dict) -> ProvResult:
             vseed.upsert_login(opts.url, opts.email, master, name, "", "",
                                uri=uri or None)
             seeded += 1
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 — keep the FIRST cause to surface it
+            first_err = first_err or str(e)
+    # Total failure (e.g. wrong master / wrong URL) is NOT success: report ok=False
+    # with the cause so cmd_vault_seed exits 1 and provision_all's report shows it.
+    if seeded == 0:
+        return ProvResult(ok=False, changed=False,
+                          detail=f"seeded 0/{len(items)} — "
+                                 f"{first_err or 'all upserts failed'}")
+    # Partial success stays ok=True but surfaces the degradation + first cause.
+    if seeded < len(items):
+        return ProvResult(ok=True, changed=True,
+                          detail=f"seeded {seeded}/{len(items)} "
+                                 f"(some failed: {first_err})")
     return ProvResult(ok=True, changed=seeded > 0,
                       detail=f"seeded {seeded}/{len(items)} login item(s)")
 
@@ -597,6 +625,26 @@ def provision_all(opts: Opts, *, cfg: "dict | None" = None,
     r = runstep("deploy", lambda: step_deploy(opts))
     if not r.ok:
         return r
+    # step_deploy (via install.sh) has now ENABLED the boot session (soc-wall +,
+    # in kiosk mode, getty@tty1 autologin). If a later seal/account step fails on
+    # a REAL run, the box would autostart a session that can't unseal the vault and
+    # goes dark. From here on, a post-deploy vault failure must leave the box
+    # NOT-SAFE-TO-BOOT-but-disabled rather than enabled-and-dead.
+    deploy_mutated = (not opts.dry) and r.changed
+
+    def _partial(cause: str) -> ProvResult:
+        # Fail closed: disable the wall session so an un-sealable box doesn't
+        # autostart a dead session, then return a clear, actionable result.
+        if deploy_mutated:
+            _disable_session(opts)
+        return ProvResult(
+            ok=False, changed=overall_changed,
+            detail=("PARTIAL INSTALL: deploy succeeded but the vault could not be "
+                    f"finished ({cause}). The wall session was left DISABLED so the "
+                    "box won't boot into a dead wall. Do NOT reboot yet — re-run "
+                    "`sudo setup.py provision --master-fd` (or `setup.py first-run`) "
+                    "to seal the master, which re-enables boot."))
+
     # 4) write_config (needs setup + paths)
     if setup is not None and paths is not None:
         r = runstep("write_config", lambda: step_write_config(opts, cfg, soc_env, paths))
@@ -610,14 +658,14 @@ def provision_all(opts: Opts, *, cfg: "dict | None" = None,
     if master:
         r = runstep("vault_account", lambda: step_vault_account(opts, master))
         if not r.ok and not opts.dry:
-            return r
+            return _partial(f"account: {r.detail}")
         # 7) vault seed
         runstep("vault_seed", lambda: step_vault_seed(opts, master, cfg))
         # 8) seal
         if setup is not None and paths is not None:
             r = runstep("seal", lambda: step_seal(opts, master, paths, soc_env, backend))
             if not r.ok and not opts.dry:
-                return r
+                return _partial(f"seal: {r.detail}")
     else:
         report("vault_account", "skipped", "no master provided (use --master-fd)")
 
