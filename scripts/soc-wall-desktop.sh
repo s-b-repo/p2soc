@@ -47,13 +47,20 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
   exit 1
 fi
 
-# Load the (tmpfs, 0600) env for vault creds, ports and timeouts if it is present.
+# Load the (non-secret) env for vault creds, ports and timeouts if it is present.
 # Absent in dev checkouts — the host falls back to its defaults / dev vault.
 if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+elif [ -e "$ENV_FILE" ]; then
+  # soc.env exists but THIS user cannot read it -> the vault config (email/URL)
+  # never loads and unlock fails with an empty account. soc.env is NON-SECRET
+  # (the master is sealed separately), so surface this loudly instead of silently
+  # skipping it. The #1 cause of "desktop mode can't unlock the vault".
+  echo "WARNING: $ENV_FILE exists but is not readable by $(id -un 2>/dev/null) —" >&2
+  echo "  the wall's vault config will not load. Fix: sudo chmod 0644 $ENV_FILE" >&2
 fi
 
 # Attach to whichever display the DE gave us. If only Wayland is present, use the

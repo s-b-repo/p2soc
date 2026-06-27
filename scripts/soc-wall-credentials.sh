@@ -2,7 +2,7 @@
 # Launch the graphical SOC wall CREDENTIALS & SECURITY control center (host.configcenter).
 # The control center (soc-wall.desktop) and the setup wizard both link to this wrapper
 # for managing vault logins + the security store — there is no separate credentials
-# .desktop entry. Sources the (tmpfs, 0600) env if readable, sets PYTHONPATH to the
+# .desktop entry. Sources the (non-secret) env if readable, sets PYTHONPATH to the
 # in-tree host package, requires a graphical display, runs the center in the foreground;
 # on a non-zero exit it pops the themed guierror so a clickable launch never "does
 # nothing". Honours SOC_RETURN_TO_MENU like setup.
@@ -36,12 +36,19 @@ if [ "$HEADLESS" -eq 0 ]; then
   fi
 fi
 
-# Load the (tmpfs, 0600) env if present (non-secret knobs). Absent in dev checkouts.
+# Load the (non-secret) env if present (non-secret knobs). Absent in dev checkouts.
 if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+elif [ -e "$ENV_FILE" ]; then
+  # soc.env exists but THIS user cannot read it -> the vault config (email/URL)
+  # never loads and unlock fails with an empty account. soc.env is NON-SECRET
+  # (the master is sealed separately), so surface this loudly instead of silently
+  # skipping it. The #1 cause of "desktop mode can't unlock the vault".
+  echo "WARNING: $ENV_FILE exists but is not readable by $(id -un 2>/dev/null) —" >&2
+  echo "  the wall's vault config will not load. Fix: sudo chmod 0644 $ENV_FILE" >&2
 fi
 
 # Attach to a Wayland-only display via the native GTK backend.

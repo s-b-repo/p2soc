@@ -298,7 +298,7 @@ nothing is overwritten or deleted that the manifest did not create.
 ## Checklist before exposing anything
 
 - [ ] `ss -ltnp` shows Vaultwarden on `127.0.0.1` only and **no** extra SOC ports
-- [ ] `soc.env` (now **non-secret**) is `0640`; Vaultwarden has **no `.env`**;
+- [ ] `soc.env` (now **non-secret**) is `0644` (readable by the kiosk/desktop session users so the wall can source it; the master is sealed separately); Vaultwarden has **no `.env`**;
       `/etc/soc-display/secret/` is `0700` (kiosk user), `*.enc` are `0600`
 - [ ] `SIGNUPS_ALLOWED=false` after the kiosk account exists; `/admin` left off
 - [ ] tunnel key is `permitopen`-restricted on the jump host

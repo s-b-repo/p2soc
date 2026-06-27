@@ -29,12 +29,15 @@ PYBIN="$ROOT/.venv/bin/python"
 : "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
 ENV_FILE="$SOC_ENV_FILE"
 
-# Load the (tmpfs, 0600) env if present so the launched wall sees the same config.
+# Load the (non-secret) env if present so the launched wall sees the same config.
 if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+elif [ -e "$ENV_FILE" ]; then
+  echo "WARNING: $ENV_FILE exists but is not readable by $(id -un 2>/dev/null) —" >&2
+  echo "  the wall's vault config will not load. Fix: sudo chmod 0644 $ENV_FILE" >&2
 fi
 
 # Resolve SOC_PANELS_FILE AFTER sourcing (explicit one in soc.env wins) and export

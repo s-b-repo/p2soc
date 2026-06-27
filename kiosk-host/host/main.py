@@ -987,6 +987,20 @@ def _classify_unlock_error(msg: str, url: str) -> str:
         where = f" at {url}" if url else ""
         return (f"Could not reach Vaultwarden{where} — check the server is running "
                 f"and the URL/account in Setup, then try again.")
+    # Rate-limit (HTTP 429): Vaultwarden throttles repeated logins. Even a CORRECT
+    # master fails here — tell the operator to wait, not to re-type, so they don't
+    # spiral into more attempts (which extend the lockout).
+    if "429" in low or "too many" in low:
+        return ("Vaultwarden is rate-limiting logins (too many attempts) — wait "
+                "about a minute, then enter the master once and try again.")
+    # No account email loaded: the wall's env (soc.env) wasn't sourced (e.g. it is
+    # not readable by this user), so the login has no account to target. This is a
+    # config/permissions fault, NOT a wrong master.
+    if "no vault email" in low or "set soc_vault_email" in low or (
+            "email" in low and "no " in low):
+        return ("No vault account email is configured — the wall's env (soc.env) "
+                "was not loaded. Check that /etc/soc-display/soc.env is readable "
+                "and SOC_VAULT_EMAIL is set, then relaunch.")
     return "Master password rejected — check it and try again."
 
 
