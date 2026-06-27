@@ -77,6 +77,35 @@ def _load_setup():
     return mod
 
 
+_PROVISION = None
+
+
+def _load_provision():
+    """Import the repo-root provision.py AS A MODULE (same spec_from_file_location
+    trick as _load_setup). provision.py is a TOP-LEVEL module (NOT under host/) and
+    is import-safe (pure-stdlib top; side effects only under ``if __name__ ==
+    '__main__'``). Cached so repeated calls are cheap. Returns None if absent."""
+    global _PROVISION
+    if _PROVISION is not None:
+        return _PROVISION
+    path = os.path.join(_repo_root(), "provision.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("soc_provision", path)
+    mod = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec: provision.py uses @dataclass, and dataclasses resolves
+    # each class's __module__ via sys.modules — an unregistered module makes
+    # _process_class raise AttributeError('NoneType' has no '__dict__').
+    sys.modules["soc_provision"] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop("soc_provision", None)
+        raise
+    _PROVISION = mod
+    return mod
+
+
 def _ensure_host_on_path():
     """Put ``<repo>/kiosk-host`` on sys.path[0] (idempotent) so ``from host import
     …`` resolves when running outside the package (e.g. the headless CLI)."""
@@ -289,6 +318,9 @@ class WizardModel:
         self.master_pin = ""                 # optional; gen_pin if blank
         # config-to-vault
         self.push_config = False
+        # full-install mode (kiosk = takes over tty1; desktop = runs in a DE session).
+        # Matches provision.Opts default; bound to the Install page's mode combo.
+        self.install_mode = "kiosk"
 
     # ---- cfg ------------------------------------------------------------- #
     def cfg(self) -> dict:
@@ -624,6 +656,16 @@ class SetupAssistant:
             self.vaultsetup = vaultsetup
         except Exception:  # noqa: BLE001 — never block the wizard on this
             self.vaultsetup = None
+        # Full-install / provisioning core (the GUI analogue of `setup.py provision`).
+        # Optional — degrades to "use the CLI: setup.py provision" if absent, so the
+        # config-only Finish never depends on it.
+        self.provision = _load_provision()
+        self._install_dry = True    # dry-run preview by default (safe)
+        self._install_buf = None    # the per-step progress TextView buffer
+        self._install_page = None
+        self._install_run_btn = None
+        self._install_status = None
+        self._install_busy = False  # True while a real (non-dry) run is in flight
         self._pin_shown = ""        # set after a successful seal, shown on review
         self._status = ""
         self.assistant = None
@@ -772,6 +814,7 @@ class SetupAssistant:
         self._page_vault()
         self._page_vpn()
         self._page_review()
+        self._page_install()
 
         # On any non-apply exit, drop the Appearance preview from branding's cache
         # (on_apply mutated it in place) so a same-process re-read isn't poisoned.
@@ -1707,7 +1750,12 @@ class SetupAssistant:
             """Attach a labelled widget; return (label, widget) so a per-type field
             can toggle BOTH visible/hidden together."""
             nonlocal r
-            lbl = Gtk.Label(xalign=0, label=label)
+            # Branding-driven foreground (mirror _row): without an explicit colour
+            # these labels inherit GTK's default text colour and render
+            # light-on-light on the tinted .soc-card surface.
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup(f'<span foreground="{self.branding.color("text")}">'
+                           f'{_esc(label)}</span>')
             lbl.set_size_request(150, -1)
             grid.attach(lbl, 0, r, 1, 1)
             grid.attach(widget, 1, r, 1, 1)
@@ -1896,6 +1944,375 @@ class SetupAssistant:
         self.assistant.set_page_type(page, Gtk.AssistantPageType.CONFIRM)
         self.assistant.set_page_title(page, "Review")
         self._review_page = page
+
+    # ---- Page 7: full install (the GUI analogue of `setup.py provision`) -- #
+    def _page_install(self):
+        """OPTIONAL final page: run the COMPLETE provisioner (packages + users +
+        deploy + units + vault account/seed + seal) from the wizard.
+
+        This is purely ADDITIVE — the config-only Finish (Review -> Apply) still
+        reconfigures/redeploys WITHOUT a full install. The page is CONTENT with its
+        OWN in-page buttons (no Assistant 'apply' collision): a dry-run plan PREVIEW
+        gates an explicit 'Install on this system', which runs provision_all OFF the
+        GTK main thread and marshals per-step progress back via GLib.idle_add."""
+        Gtk = self.Gtk
+        page = self._page(
+            "Install on this system (optional)",
+            "Provision the whole box: create users, install packages, deploy files "
+            "+ units, register the vault account and seal the master. Preview the "
+            "plan first; nothing changes until you confirm.",
+            overline=self._step_overline("install"))
+
+        if self.provision is None:
+            lbl = Gtk.Label(xalign=0, wrap=True)
+            lbl.set_markup(
+                f'<span foreground="{self.branding.color("bad")}">'
+                f'Provisioning core (provision.py) unavailable — run the full install '
+                f'from the CLI: <tt>setup.py provision</tt></span>')
+            page.pack_start(lbl, False, False, 0)
+            self.assistant.append_page(page)
+            self.assistant.set_page_type(page, Gtk.AssistantPageType.CONTENT)
+            self.assistant.set_page_title(page, "Install")
+            self.assistant.set_page_complete(page, True)
+            self._install_page = page
+            return
+
+        # mode chooser (kiosk takes over tty1 / desktop runs in a DE session)
+        mode_combo = Gtk.ComboBoxText()
+        for m in ("kiosk", "desktop"):
+            mode_combo.append(m, m)
+        mode_combo.set_active_id(self.model.install_mode)
+
+        def _on_mode(c):
+            self.model.install_mode = c.get_active_id() or "kiosk"
+        mode_combo.connect("changed", _on_mode)
+        page.pack_start(self._row("Install mode", mode_combo), False, False, 0)
+
+        # dry-run toggle (default CHECKED == safe preview, mutates nothing)
+        dry_chk = Gtk.CheckButton.new_with_label(
+            "Dry-run (preview only — no changes to this system)")
+        dry_chk.set_active(True)
+        self._install_dry = True
+
+        def _on_dry(b):
+            self._install_dry = bool(b.get_active())
+        dry_chk.connect("toggled", _on_dry)
+        page.pack_start(dry_chk, False, False, 0)
+
+        # action buttons
+        btnbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        preview_btn = Gtk.Button.new_with_label("Preview plan")
+        preview_btn.get_style_context().add_class("soc-ghost")
+        run_btn = Gtk.Button.new_with_label("Install on this system")
+        run_btn.get_style_context().add_class("soc-primary")
+        run_btn.set_sensitive(False)   # forced: preview the plan at least once first
+        preview_btn.connect("clicked", self._on_install_preview)
+        run_btn.connect("clicked", self._on_install_run)
+        btnbar.pack_start(preview_btn, False, False, 0)
+        btnbar.pack_start(run_btn, False, False, 0)
+        page.pack_start(btnbar, False, False, 0)
+        self._install_run_btn = run_btn
+        self._install_preview_btn = preview_btn
+        self._install_dry_chk = dry_chk
+        self._install_mode_combo = mode_combo
+
+        # per-step progress view (monospace, scrollable)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(240)
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_monospace(True)
+        view.get_style_context().add_class("soc-mono")
+        self._install_buf = view.get_buffer()
+        scroller.add(view)
+        page.pack_start(scroller, True, True, 0)
+
+        self._install_status = Gtk.Label(xalign=0, wrap=True)
+        page.pack_start(self._install_status, False, False, 0)
+
+        self.assistant.append_page(page)
+        self.assistant.set_page_type(page, Gtk.AssistantPageType.CONTENT)
+        self.assistant.set_page_title(page, "Install")
+        self.assistant.set_page_complete(page, True)
+        self._install_page = page
+
+    # ---- install helpers ------------------------------------------------- #
+    def _install_say(self, text):
+        """Append one line to the progress TextView (MAIN thread only). A
+        Gtk.TextBuffer has no Pango markup, so colour is conveyed by the status word
+        / [CHANGE] mark in the text itself (matches the other mono progress views)."""
+        buf = self._install_buf
+        if buf is None:
+            return
+        buf.insert(buf.get_end_iter(), text + "\n")
+
+    def _install_set_status(self, text, *, bad=False):
+        lbl = self._install_status
+        if lbl is None:
+            return
+        col = (self.branding.color("bad") if bad else self.branding.color("good"))
+        glyph = "✗ " if bad else "● "
+        lbl.set_markup(
+            f'<span font_family="monospace" foreground="{col}">{glyph}</span>'
+            f'<span foreground="{col if bad else self.branding.color("text_dim")}">'
+            f'{_esc(text)}</span>')
+
+    def _build_opts(self):
+        """Build provision.Opts EXACTLY like the CLI's _opts_from_args. The master
+        is NEVER an Opts field (it goes only to the in-process vault/seal steps)."""
+        m = self.model
+        P = self.provision
+        return P.Opts(
+            mode=m.install_mode,
+            email=m.vault_email,
+            url=m.vault_url,
+            pin=m.master_pin or "",
+            seed=bool(m.push_config) or True,
+            target=self.setup._default_target(self.setup.Env()),
+            fresh=False,
+            dry_run=self._install_dry,
+        )
+
+    def _install_dry_env(self):
+        """Deterministically set/clear the process-global SOC_PROVISION_DRY_RUN so
+        Opts.dry AND child pkexec/provision.py processes agree. CRITICAL: cleared
+        before a real run so a later real run can't silently no-op."""
+        if self._install_dry:
+            os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+        else:
+            os.environ.pop("SOC_PROVISION_DRY_RUN", None)
+
+    def _on_install_preview(self, _btn):
+        """DRY-RUN preview: iterate provision.plan(opts).actions and render one
+        themed line per PlanAction. Enables the Install button once shown."""
+        if self.provision is None or self._install_busy:
+            return
+        self._install_dry_env()
+        try:
+            plan = self.provision.plan(self._build_opts())
+        except Exception as e:  # noqa: BLE001
+            self._install_set_status(f"could not compute the plan: {e}", bad=True)
+            return
+        if self._install_buf is not None:
+            self._install_buf.set_text("")
+        changes = 0
+        self._install_say(f"// provisioning plan (mode={self.model.install_mode}, "
+                          f"dry-run={'yes' if self._install_dry else 'NO'})")
+        for a in plan.actions:
+            mark = "[CHANGE]" if a.needed else "[ok]    "
+            if a.needed:
+                changes += 1
+            line = f"  {mark} {a.step}: {a.desc}"
+            if a.needed and a.cmd:
+                line += "\n             $ " + " ".join(str(x) for x in a.cmd)
+            self._install_say(line)
+        if changes == 0:
+            self._install_say("  (nothing to do — already provisioned)")
+        else:
+            self._install_say(f"  {changes} action(s) would change host state.")
+        if self._install_run_btn is not None:
+            self._install_run_btn.set_sensitive(True)
+        self._install_set_status(
+            "plan ready — review it, then click Install on this system"
+            + ("  (dry-run: nothing will change)" if self._install_dry else ""))
+
+    def _on_install_run(self, _btn):
+        """Run the provisioner OFF the GTK main thread; marshal per-step progress
+        back via GLib.idle_add. Root shell steps escalate via pkexec (master NEVER
+        on argv); vault account/seed/seal run in-process with the master in memory."""
+        if self.provision is None or self._install_busy:
+            return
+        self._install_busy = True
+        self._install_dry_env()
+        dry = self._install_dry
+
+        # On a REAL run, lock the controls so a daemon-thread kill can't leave a
+        # half-provisioned box mid-flight.
+        if not dry:
+            for w in (self._install_run_btn, self._install_preview_btn,
+                      self._install_dry_chk, self._install_mode_combo):
+                if w is not None:
+                    w.set_sensitive(False)
+            self.assistant.set_page_complete(self._install_page, False)
+
+        if self._install_buf is not None:
+            self._install_buf.set_text("")
+        self._install_set_status(
+            ("dry-run: simulating — no changes" if dry else "installing…"))
+
+        opts = self._build_opts()
+        # Capture the model's config ONCE, AFTER the wizard pages have populated it,
+        # and HOLD that snapshot for the whole worker run so write_config can never
+        # see a transiently-empty cfg (the "no wizard config yet" artifact).
+        cfg = self.model.cfg()
+        soc_env = self.model.soc_env()
+        paths = self.model.paths
+        backend = soc_env.get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
+
+        # Guard: never launch the worker with nothing to install. Surface a
+        # guiding status instead of a silent "no wizard config yet" line buried in
+        # the per-step log — the operator must configure display + panels first.
+        if not (cfg.get("display") and cfg.get("panels")):
+            self._install_busy = False
+            for w in (self._install_run_btn, self._install_preview_btn,
+                      self._install_dry_chk, self._install_mode_combo):
+                if w is not None:
+                    w.set_sensitive(True)
+            self._install_set_status(
+                "configure the display + panels first (run the wizard pages), "
+                "then install", bad=True)
+            return
+
+        # No-plaintext-master guarantee on this path (mirror _write :2028).
+        env_text = self.setup.render_soc_env(soc_env)
+        assert "SOC_VAULT_PASSWORD" not in env_text
+
+        # Capture the master into a mutable holder (so the worker can scrub the
+        # reference in its finally); scrub the model copy below before the thread runs.
+        master_box = [self.model.master_password]
+
+        def report(step, status, detail=""):
+            # Runs on the WORKER thread — only ever SCHEDULE a main-thread update.
+            self.GLib.idle_add(self._provision_report, step, status, detail)
+
+        def _worker():
+            P = self.provision
+            ok = True
+            try:
+                # 1) Privileged shell steps (packages/users/deploy/units).
+                #    In DRY-RUN they mutate nothing and only PRINT — so run them
+                #    in-process (no pkexec prompt for a preview). On a REAL run they
+                #    need root: escalate via pkexec (provision.py --provision; NO
+                #    secret on argv — that entrypoint has no master flag).
+                if opts.dry:
+                    for nm, fn in (("packages", P.step_packages),
+                                   ("users", P.step_users),
+                                   ("deploy", P.step_deploy),
+                                   ("units", P.step_units)):
+                        report(nm, "running")
+                        r = fn(opts)
+                        report(nm, "ok" if r.ok else "FAILED", r.detail)
+                        ok = ok and r.ok
+                else:
+                    report("escalate", "running",
+                           "requesting system password (pkexec)")
+                    rc, errtxt = self._provision_shell_via_pkexec(opts)
+                    if rc != 0:
+                        report("escalate", "FAILED",
+                               errtxt or f"pkexec returned {rc}")
+                        ok = False
+                    else:
+                        report("escalate", "ok",
+                               "packages/users/deploy/units complete")
+
+                # 2) Unprivileged in-process vault/seal steps (master in memory only).
+                #    Do NOT call the top-level provision_all here — its shell steps
+                #    would PermissionError unprivileged; we ran them via pkexec above.
+                if ok:
+                    r = P.step_write_config(opts, cfg, soc_env, paths)
+                    report("write_config", "ok" if r.ok else "FAILED", r.detail)
+                    # vault_running probe (soft — a down vault is a warning, not fatal)
+                    rv = P.step_vault_running(opts)
+                    report("vault_running", "ok" if rv.ok else "skipped", rv.detail)
+                    master_ = master_box[0]
+                    # In DRY-RUN the vault/seal steps mutate nothing and touch no
+                    # network — show them in the preview even without a master entered
+                    # (a non-empty placeholder that NEVER leaves the dry-run branch).
+                    if not master_ and opts.dry:
+                        master_ = "(dry-run-placeholder)"
+                    if master_:
+                        r = P.step_vault_account(opts, master_)
+                        report("vault_account", "ok" if r.ok else "FAILED", r.detail)
+                        if r.ok or opts.dry:
+                            r = P.step_vault_seed(opts, master_, cfg)
+                            report("vault_seed", "ok" if r.ok else "FAILED", r.detail)
+                            r = P.step_seal(opts, master_, paths, soc_env, backend)
+                            # step_seal's detail carries the one-time PIN — surface it.
+                            report("seal", "ok" if r.ok else "FAILED", r.detail)
+                            if not r.ok and not opts.dry:
+                                ok = False
+                        elif not opts.dry:
+                            ok = False
+                    else:
+                        report("vault_account", "skipped",
+                               "no master entered — seal/account skipped")
+            except Exception as e:  # noqa: BLE001
+                report("install", "FAILED", str(e) or e.__class__.__name__)
+                ok = False
+            finally:
+                # Scrub the master holder (mirror _write :2104-2105). The model copy
+                # was already scrubbed below before the thread started.
+                master_box[0] = ""
+                self.GLib.idle_add(self._install_finish, ok, opts.dry)
+
+        # Scrub the model's long-lived copy now that the worker holds its own.
+        self.model.master_password = ""
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _provision_shell_via_pkexec(self, opts):
+        """Run the privileged shell steps (packages/users/deploy/units) via the
+        existing provision.py --provision entrypoint under pkexec. NO secret on argv
+        (that entrypoint has no master flag). By ABSOLUTE PATH (pkexec strips
+        PYTHONPATH). Returns (returncode, stderr). Worker-thread safe (no widgets)."""
+        if not shutil.which("pkexec"):
+            return (127, "pkexec is unavailable — cannot escalate the install")
+        helper = os.path.join(_repo_root(), "provision.py")
+        py = shutil.which("python3") or sys.executable
+        argv = ["pkexec", py, helper, "--provision",
+                "--mode", opts.mode,
+                "--kiosk-user", opts.kiosk_user,
+                "--desktop-user", opts.desktop_user,
+                "--svc-user", opts.svc_user]
+        if opts.dry:
+            argv.append("--dry-run")
+        if opts.fresh:
+            argv.append("--fresh")
+        try:
+            p = subprocess.run(argv, text=True, capture_output=True, timeout=600)
+        except Exception as e:  # noqa: BLE001 — treat any spawn fault as declined/failed
+            return (126, f"pkexec escalation failed: {e}")
+        return (p.returncode, (p.stderr or "").strip())
+
+    def _provision_report(self, step, status, detail=""):
+        """MAIN-thread: append a plain 'step: status — detail' line to the progress
+        view. A Gtk.TextBuffer has no Pango markup, so the status word itself
+        ('ok'/'FAILED'/'skipped') carries the meaning — matching the other mono
+        progress views. (Never receives the master — only the report() details the
+        steps emit; step_seal's detail carries the one-time PIN.)"""
+        if self._install_buf is not None:
+            end = self._install_buf.get_end_iter()
+            self._install_buf.insert(
+                end, f"{step}: {status}{(' — ' + detail) if detail else ''}\n")
+        return False
+
+    def _install_finish(self, ok, dry):
+        """MAIN-thread completion: on a successful REAL run, RETURN TO THE START
+        MENU (clean Gtk.main_quit -> the launcher wrapper relaunches the menu)."""
+        self._install_busy = False
+        # Re-arm controls (so a failed/dry run can be retried).
+        for w in (self._install_run_btn, self._install_preview_btn,
+                  self._install_dry_chk, self._install_mode_combo):
+            if w is not None:
+                w.set_sensitive(True)
+        if self._install_page is not None:
+            self.assistant.set_page_complete(self._install_page, True)
+        if ok and dry:
+            self._install_set_status(
+                "dry-run complete — no host state changed. Uncheck Dry-run to install.")
+        elif ok:
+            self._install_set_status("Installed — returning to menu…")
+            # Drop the Appearance preview poison (mirror _on_quit) then quit cleanly;
+            # the setup-gui wrapper (SOC_RETURN_TO_MENU=1) relaunches the start menu.
+            try:
+                self.branding.load(refresh=True)
+            except Exception:  # noqa: BLE001
+                pass
+            self.GLib.timeout_add(900, lambda: (self.Gtk.main_quit(), False)[1])
+        else:
+            self._install_set_status("install FAILED — see the log above", bad=True)
+        return False
 
     # ---- dynamic refresh ------------------------------------------------- #
     def _refresh_dynamic_pages(self):
