@@ -41,6 +41,13 @@ def decode_bmp(data: bytes) -> Tuple[int, int, List[List[Pixel]]]:
     ``rows[y][x] == (r, g, b)`` and row 0 is the TOP of the image."""
     if data[:2] != b"BM":
         raise ValueError("not a BMP image")
+    # SECURITY: bound every fixed-offset header read below. 54 = end of
+    # BITMAPFILEHEADER(14)+BITMAPINFOHEADER(40), the minimum size of any real
+    # BMP, and covers the deepest fixed read (ncol@46, ends at 50). Without
+    # this a 2-53 byte 'BM...' body would leak struct.error from unpack_from
+    # instead of the module's documented ValueError contract.
+    if len(data) < 54:
+        raise ValueError("BMP header truncated")
     pix_off = struct.unpack_from("<I", data, 10)[0]
     dib = struct.unpack_from("<I", data, 14)[0]
     width = struct.unpack_from("<i", data, 18)[0]
@@ -70,8 +77,14 @@ def decode_bmp(data: bytes) -> Tuple[int, int, List[List[Pixel]]]:
 
     palette: List[Pixel] = []
     if bpp <= 8:
-        ncol = struct.unpack_from("<I", data, 46)[0] or (1 << bpp)
+        # SECURITY: ncol@46 is an attacker-controlled 32-bit field. A real colour
+        # table never exceeds 1<<bpp entries; an over-declared count would build a
+        # multi-million-entry list (hundreds of MB of transient tuples) before an
+        # IndexError fires — an OOM/CPU DoS on a 1 GB board. Cap to the legitimate
+        # maximum AND to what the body actually holds before iterating.
         poff = 14 + dib
+        ncol = struct.unpack_from("<I", data, 46)[0] or (1 << bpp)
+        ncol = min(ncol, 1 << bpp, max(0, (len(data) - poff) // 4))
         for i in range(ncol):
             b, g, r = data[poff + i * 4], data[poff + i * 4 + 1], data[poff + i * 4 + 2]
             palette.append((r, g, b))
@@ -92,7 +105,8 @@ def decode_bmp(data: bytes) -> Tuple[int, int, List[List[Pixel]]]:
                 row.append((data[o + 2], data[o + 1], data[o]))
         elif bpp == 8:
             for x in range(width):
-                row.append(palette[data[base + x]])
+                idx = data[base + x]
+                row.append(palette[idx] if idx < len(palette) else (0, 0, 0))
         else:
             raise ValueError(f"unsupported BMP depth {bpp}")
         rows.append(row)

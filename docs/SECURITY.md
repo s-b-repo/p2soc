@@ -30,8 +30,9 @@ derived (scrypt) from this host's `machine-id` **and** a one-time PIN that
 PIN is itself sealed under a machine-id-only key, so the wall self-unlocks at
 boot with no prompt, while the sealed files (`/etc/soc-display/secret/*.enc`,
 `0600`, owned by the kiosk user) are **useless if copied to another machine** — a
-different `machine-id` makes the GCM authentication fail. `rbw` gets the master
-password from `scripts/pinentry-vault.py`, which unseals it in memory.
+different `machine-id` makes the GCM authentication fail. `litebw` (default) — or
+the legacy `rbw` — gets the master password from `scripts/pinentry-vault.py`,
+which unseals it in memory.
 
 The wall **config** is the vault's too: a secure-note (`SOC Wall Config`) is the
 source of truth, fetched after unlock; the local `panels.yaml` is only an offline
@@ -95,7 +96,7 @@ unattended appliance.
 
 If even that is unacceptable:
 
-- Do not seal: keep the wall attended and run `rbw unlock` once after each reboot
+- Do not seal: keep the wall attended and run `litebw unlock` (or `rbw unlock`) once after each reboot
   (e.g. over SSH) within `SOC_READY_TIMEOUT` — the host retries opening the vault
   and logs in only once it is unlocked.
 - Keep the one-time PIN off the device; you need it only to re-seal (re-deploy,
@@ -131,6 +132,44 @@ The wall can be repointed at the glass — convenient, but a surface to control:
   never entered here — only the *name* of the Vaultwarden login to use; the
   secrets stay in Vaultwarden.
 
+## Renderer hardening & site containment
+
+Each panel renders a third-party-fronted SOC dashboard that could be compromised
+or buggy. The renderer reduces blast radius without breaking the dashboard; the
+defaults are safe and every loosening is explicit opt-in (see
+[CONFIGURATION.md](CONFIGURATION.md#renderer-security--site-restriction) for the
+knobs). The trust model:
+
+- **Hardening is pure attack-surface reduction** — no plugins/Java, no file://
+  escalation, no mixed content on HTTPS, no downloads/file pickers, the WebKit
+  sandbox where available. None of these are features a SOC dashboard uses, so
+  the defaults are invisible. TLS certs are verified (fail-closed); a panel opts
+  out per-tile with `allow_insecure` / `insecure_tls` (trusted LAN only).
+- **The navigation allowlist is the containment boundary.** A hijacked page can
+  still reach its own CDNs/SSO (allowed) but cannot drive the wall's top-level
+  frame to an arbitrary attacker site (refused + logged). Only main-frame
+  top-level navigation is gated; sub-resources, XHR, websockets and SSO redirect
+  chains pass through, so real logins and live dashboards keep working. The
+  bundled cloud-SSO list (`security/allowlist-sso.txt`) covers the common case;
+  self-hosted origins are one `allow:` line; `SOC_NAV_ALLOWLIST=0` is the
+  kill-switch for an unmapped dashboard.
+- **Tracker blocking is defence + perf.** The curated top-20 analytics/tracker
+  domains (`security/trackers-top20.json`) are dropped as third-party requests —
+  less third-party JS means a smaller attack surface and less RAM/CPU. A
+  dashboard's own first-party telemetry is never caught (`load-type:third-party`);
+  `block_trackers: false` / `unblock:` are the escape hatches.
+- **Persistent web data holds session tokens**, so it is the most sensitive new
+  data on disk: stored under a `0700` kiosk-user-only `webdata/` dir, a **sibling**
+  of the sealed-master `secret/` dir (never inside it — the no-plaintext-master
+  guarantee is untouched), outside the repo, never world-readable, never logged,
+  and per-panel isolated (`webdata/<panel-id>/`) so one panel cannot read
+  another's session. The cookie accept policy is `NO_THIRD_PARTY`. A panel opts
+  out of on-disk sessions with `persist: false` (ephemeral).
+
+Both render engines enforce these identically: WebKit via settings / a
+`decide-policy` nav guard / a `WKContentRuleList`, Chromium via launch flags /
+a CDP nav guard / `Network.setBlockedURLs`.
+
 ## Network hardening (`HARDEN=1`)
 
 Installs:
@@ -158,24 +197,53 @@ So even if the Pi is compromised, that key cannot open a shell or forward
 anywhere except the whitelisted panels. Full steps in
 [`security/tunnel_key.note`](../security/tunnel_key.note).
 
-## Fortinet VPN credentials
+## VPN credentials
 
-`forti-vpn.service` logs into the FortiGate with a username + password kept in the
-**same vault** as the panels (`vpn.vault_item`). The password is read into memory
-and handed to `openfortivpn` through a **pinentry helper** (`forti-pinentry.sh`) —
-the identical mechanism that unlocks `rbw`. So the FortiGate password is **never
-on the command line** (where `ps`/`/proc` would expose it) and **never written to
-disk**; only the gateway, username, and routing flags appear in the process list.
+The supervised VPN supports `vpn.type: fortinet` (openfortivpn), `openvpn`,
+`wireguard`, and `inode` (the bundled H3C client). Whichever backend is in use, the
+username + password live in the **same vault** as the panels (`vpn.vault_item`) and
+are read into memory — they **never reach `argv`** (where `ps`/`/proc` would expose
+them) and are **never written to disk**. Each backend has a secret path that keeps
+the password off the command line:
+
+- **fortinet:** handed to `openfortivpn` through a **pinentry helper** (`pinentry-env`
+  / `forti-pinentry.sh`) — the same unseal-in-memory mechanism that unlocks the vault.
+- **openvpn:** delivered over openvpn's **management socket** (`mgmt-socket`), not via
+  `--auth-user-pass` on a world-readable file or argv.
+- **inode (H3C):** read from `$H3C_SVPN_PASSWORD` in the process environment, never argv.
+
+Only the gateway, username, and routing flags appear in the process list. The
+gateway is validated as a hostname / IPv4 / IPv6 before use, and the trusted cert is
+pinned by **SHA-1 *or* SHA-256** with a **constant-time compare** so a pin check is
+not a timing oracle.
 
 Two caveats specific to the VPN unit:
 
 - **It runs as root.** Unlike `autossh-tunnel` (unprivileged), openfortivpn must
   run `pppd` and rewrite the routing table, so the unit runs as root with only
-  light sandboxing. Its rbw profile (under `/root`) is a second client of the same
+  light sandboxing. Its vault profile (under `/root`) is a second client of the same
   kiosk account.
 - **OTP on argv (opt-in).** `otp_from_vault: true` passes a one-time `--otp=` code
   on the command line. It is single-use and short-lived, but briefly visible in
   the process list — leave it off unless your gateway requires TOTP.
+
+### Bundled iNode / H3C client hardening
+
+The `inode` backend ships a pure-Python, aarch64-portable H3C SSL-VPN client
+(`vendor/iNode-VPN-Client`) that was security-hardened because it parses
+attacker-influenced network frames and server-supplied images:
+
+- **Frame-reassembly cap (1 MiB).** The wire reader caps reassembled frame size so a
+  malicious/compromised gateway cannot drive unbounded memory growth (the SPA
+  wire-format was also corrected).
+- **BMP dimension caps.** Server-supplied CAPTCHA bitmaps (decoded with tesseract)
+  have their width/height bounded before allocation, blocking decompression-bomb /
+  giant-allocation inputs at the parse boundary.
+- **Root-RCE-hardened privileged helper.** The root helper that applies routes was
+  hardened against argument/command injection so a compromised unprivileged caller
+  cannot turn it into local root code execution.
+- **Constant-time cert-pin compare.** The trusted-cert pin check uses a constant-time
+  comparison, so it cannot be probed as a timing side channel.
 
 **Account-lockout protection.** The supervisor classifies an auth failure and
 then *stops trying* for `SOC_VPN_AUTH_RETRY_DELAY` (default 300 s) rather than
@@ -205,8 +273,9 @@ The `forti-vpn` unit is deliberately lighter (`ProtectSystem=true`, `PrivateTmp`
 restricted address families incl. `AF_NETLINK`/`AF_PPPOX`) because `pppd` needs
 `/dev/ppp`, netlink, and write access to `/etc/resolv.conf` — over-hardening it
 breaks the tunnel. The vault master password is never in the unit nor in
-`soc.env`: the wrapper unlocks `rbw` via the same host-bound sealed secret +
-`pinentry-vault.py` as the kiosk host, so it never appears in `systemctl show`
+`soc.env`: the wrapper unlocks `litebw` (default; legacy `rbw`) via the same
+host-bound sealed secret + `pinentry-vault.py` as the kiosk host, so it never
+appears in `systemctl show`
 or the process environment.
 
 The kiosk session itself can run as a supervised unit (`soc-wall.service`,
@@ -216,10 +285,20 @@ recovers rather than leaving a black screen. The vault master is never among
 those `Environment=` lines — it stays host-sealed. (Switching the boot from
 getty-autologin to this service is validated per-deployment on the target Pi.)
 
+## Uninstall preserves operator secrets
+
+`./uninstall.sh` (and `make uninstall`) is **manifest-driven** (it removes only what
+`install.sh` recorded in `/etc/soc-display/.install-manifest`) and **preserves
+operator data by default** — the sealed master secret + PIN (`/etc/soc-display/secret/*.enc`),
+the vault data, and your config are left in place, and the boot target / autologin
+are restored. Pass `--purge` to deliberately wipe operator secrets and data. So a
+routine uninstall/reinstall does **not** silently destroy the sealed credentials, and
+nothing is overwritten or deleted that the manifest did not create.
+
 ## Checklist before exposing anything
 
 - [ ] `ss -ltnp` shows Vaultwarden on `127.0.0.1` only and **no** extra SOC ports
-- [ ] `soc.env` (now **non-secret**) is `0640`; Vaultwarden has **no `.env`**;
+- [ ] `soc.env` (now **non-secret**) is `0644` (readable by the kiosk/desktop session users so the wall can source it; the master is sealed separately); Vaultwarden has **no `.env`**;
       `/etc/soc-display/secret/` is `0700` (kiosk user), `*.enc` are `0600`
 - [ ] `SIGNUPS_ALLOWED=false` after the kiosk account exists; `/admin` left off
 - [ ] tunnel key is `permitopen`-restricted on the jump host

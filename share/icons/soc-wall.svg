@@ -1,16 +1,43 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="SOC Wall">
-  <!-- shield backdrop -->
-  <path d="M32 3 L56 11 V31 C56 46 46 56 32 61 C18 56 8 46 8 31 V11 Z"
-        fill="#0f2740" stroke="#2f9e8f" stroke-width="2"/>
-  <!-- 2x2 video-wall grid of panels -->
-  <g fill="#2f9e8f">
-    <rect x="18" y="18" width="12" height="9" rx="1.5"/>
-    <rect x="34" y="18" width="12" height="9" rx="1.5"/>
-    <rect x="18" y="31" width="12" height="9" rx="1.5"/>
-    <rect x="34" y="31" width="12" height="9" rx="1.5"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none" role="img" aria-label="SOC Video Wall">
+  <title>SOC Video Wall</title>
+  <defs>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#1FA463" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#1FA463" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.2"/>
+    </filter>
+  </defs>
+
+  <!-- app tile: clean light/white field, low radius technical look -->
+  <rect x="4" y="4" width="120" height="120" rx="16" fill="#FFFFFF"/>
+  <rect x="5" y="5" width="118" height="118" rx="15" fill="none" stroke="#CFE0D4" stroke-width="2"/>
+  <!-- thin green top-rule accent (kept signature) -->
+  <rect x="5" y="5" width="118" height="4" rx="2" fill="#1FA463"/>
+
+  <!-- ambient green glow behind the live panel -->
+  <circle cx="88" cy="88" r="34" fill="url(#glow)"/>
+
+  <!-- 2x2 video-wall grid; bottom-right panel is "live" / online -->
+  <g>
+    <rect x="21" y="21" width="38" height="38" rx="6" fill="#F4F8F5" stroke="#CFE0D4" stroke-width="1.5"/>
+    <rect x="69" y="21" width="38" height="38" rx="6" fill="#F4F8F5" stroke="#CFE0D4" stroke-width="1.5"/>
+    <rect x="21" y="69" width="38" height="38" rx="6" fill="#F4F8F5" stroke="#CFE0D4" stroke-width="1.5"/>
+    <rect x="69" y="69" width="38" height="38" rx="6" fill="#1FA463" filter="url(#soft)" opacity="0.55"/>
+    <rect x="69" y="69" width="38" height="38" rx="6" fill="#1FA463"/>
+    <rect x="74" y="75" width="28" height="3.4" rx="1.7" fill="#FFFFFF" opacity="0.85"/>
+    <rect x="74" y="83" width="20" height="3.4" rx="1.7" fill="#FFFFFF" opacity="0.6"/>
   </g>
-  <!-- SOC badge label -->
-  <text x="32" y="53" text-anchor="middle" font-family="monospace"
-        font-size="11" font-weight="bold" fill="#e8f4f1">SOC</text>
+
+  <!-- scan rows on the dim panels -->
+  <g fill="#5B7567" opacity="0.55">
+    <rect x="27" y="31" width="26" height="2.6" rx="1.3"/>
+    <rect x="27" y="38" width="18" height="2.6" rx="1.3"/>
+    <rect x="75" y="31" width="26" height="2.6" rx="1.3"/>
+    <rect x="75" y="38" width="18" height="2.6" rx="1.3"/>
+    <rect x="27" y="79" width="26" height="2.6" rx="1.3"/>
+    <rect x="27" y="86" width="18" height="2.6" rx="1.3"/>
+  </g>
 </svg>

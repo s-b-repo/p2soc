@@ -1,0 +1,15 @@
+#!/usr/bin/env xdg-open
+# Secondary, hidden — the "SOC Video Wall" control center (soc-wall.desktop) is the
+# single advertised entry point and opens Appearance in-process. NoDisplay keeps this
+# out of application menus while the .sh it execs stays in use (the control center +
+# any direct exec). Reachable directly only by path if ever needed.
+[Desktop Entry]
+Name=SOC Wall Appearance
+Comment=Theme colours and presets for the SOC video wall
+Exec=/opt/soc-display/scripts/soc-wall-appearance.sh
+Icon=soc-wall
+Terminal=false
+Type=Application
+NoDisplay=true
+Categories=Settings;
+Keywords=soc;theme;appearance;colors;colours;

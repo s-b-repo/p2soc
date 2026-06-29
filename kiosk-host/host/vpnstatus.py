@@ -55,12 +55,17 @@ def _iface_up(iface: str) -> bool:
     return bool(iface) and os.path.isdir(f"/sys/class/net/{iface}")
 
 
-def vpn_state(vpn: dict) -> str:
+def vpn_state(vpn: dict, timeout: float = 2.0) -> str:
+    # `timeout` bounds the ready_probe TCP connect. The status path (polled per
+    # VPN by the supervisor under a systemd watchdog) passes a small value so a
+    # batch of black-holed probes across many VPNs cannot starve the heartbeat;
+    # a reachable probe still connects far inside any sub-second timeout, so the
+    # online/offline classification is unchanged.
     if not vpn or not vpn.get("enabled"):
         return STATE_NOT_CONFIGURED
     probe = (vpn.get("ready_probe") or "").strip()
     if probe:
-        return STATE_ONLINE if _tcp_ok(probe) else STATE_OFFLINE
+        return STATE_ONLINE if _tcp_ok(probe, timeout=timeout) else STATE_OFFLINE
     return STATE_ONLINE if _iface_up(_expected_iface(vpn)) else STATE_OFFLINE
 
 

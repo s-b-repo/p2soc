@@ -1,0 +1,118 @@
+/* =========================================================================
+ * SOC kiosk — Click-zone CALIBRATE mode (Phase 8).
+ *
+ * Injected into a panel ONLY when the operator clicks
+ *   ⚙ Settings → Panels → Advanced → "Calibrate login zones".
+ *
+ * Behaviour:
+ *   1. Overlays a translucent crosshair-cursor layer on top of the page.
+ *   2. Shows a banner that walks the operator through three clicks:
+ *        a) the USERNAME field
+ *        b) the PASSWORD field
+ *        c) the SUBMIT (Login) button
+ *   3. For each click: hit-tests the element below the overlay, takes the
+ *      element's centre, divides by viewport size, stores the (x_pct,
+ *      y_pct) ratio. Ratios are resolution-independent so a resize keeps
+ *      the calibration accurate.
+ *   4. On the 3rd successful click, stuffs the three zones into
+ *      window.__SOC_CALIBRATE_RESULT as JSON and removes the overlay.
+ *
+ * The host (WebKit / Chromium) polls window.__SOC_CALIBRATE_RESULT for
+ * the final value; on receipt it parses the JSON, writes it into the
+ * panel's login_zones override, and persists.
+ *
+ * The overlay is intentionally cancellable: Esc dismisses without
+ * saving. The operator can also retry by re-running the calibrate flow.
+ * ========================================================================= */
+(function () {
+  if (window.__SOC_CALIBRATE_ACTIVE) return;
+  window.__SOC_CALIBRATE_ACTIVE = true;
+  window.__SOC_CALIBRATE_RESULT = null;
+
+  var STEPS = ["user", "pass", "submit"];
+  var LABELS = {
+    user:   "Click the USERNAME field  (1 / 3)",
+    pass:   "Click the PASSWORD field  (2 / 3)",
+    submit: "Click the SUBMIT (Login) button  (3 / 3)"
+  };
+  var captured = {};
+  var step = 0;
+
+  // Translucent layer with crosshair cursor; sits above everything via the
+  // max signed-int z-index. pointer-events stays auto so we receive the
+  // click; on hit-test we briefly toggle pointer-events: none so
+  // elementFromPoint returns the underlying element, not the overlay.
+  var overlay = document.createElement("div");
+  overlay.id = "__soc_calibrate";
+  overlay.style.cssText = [
+    "position:fixed", "left:0", "top:0", "right:0", "bottom:0",
+    "z-index:2147483647", "background:rgba(0,0,0,0.32)",
+    "cursor:crosshair", "color:#fff",
+    "font:14px -apple-system,Segoe UI,sans-serif"
+  ].join(";");
+
+  var banner = document.createElement("div");
+  banner.style.cssText = [
+    "position:fixed", "top:20px", "left:50%",
+    "transform:translateX(-50%)",
+    "padding:12px 18px", "background:#1565c0", "color:#fff",
+    "border-radius:6px", "box-shadow:0 4px 12px rgba(0,0,0,0.35)",
+    "pointer-events:none"
+  ].join(";");
+  overlay.appendChild(banner);
+
+  var hint = document.createElement("div");
+  hint.style.cssText = [
+    "position:fixed", "bottom:20px", "left:50%",
+    "transform:translateX(-50%)", "padding:8px 14px",
+    "background:rgba(0,0,0,0.6)", "color:#ddd", "border-radius:4px",
+    "pointer-events:none", "font-size:12px"
+  ].join(";");
+  hint.textContent = "Press Esc to cancel — no calibration saved.";
+  overlay.appendChild(hint);
+
+  function update() { banner.textContent = LABELS[STEPS[step]]; }
+  update();
+
+  function teardown() {
+    try { overlay.remove(); } catch (e) {}
+    document.removeEventListener("keydown", onKey, true);
+    window.__SOC_CALIBRATE_ACTIVE = false;
+  }
+
+  function onKey(e) {
+    if (e.key === "Escape" || e.keyCode === 27) {
+      e.preventDefault(); e.stopPropagation();
+      window.__SOC_CALIBRATE_RESULT = JSON.stringify({cancelled: true});
+      teardown();
+    }
+  }
+  document.addEventListener("keydown", onKey, true);
+
+  overlay.addEventListener("click", function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    // Briefly disable pointer-events so elementFromPoint sees the page,
+    // not the overlay; restore immediately.
+    overlay.style.pointerEvents = "none";
+    var el = document.elementFromPoint(e.clientX, e.clientY);
+    overlay.style.pointerEvents = "auto";
+    if (!el) return;
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width / 2;
+    var cy = r.top + r.height / 2;
+    captured[STEPS[step]] = {
+      x_pct: Math.max(0, Math.min(1, cx / window.innerWidth)),
+      y_pct: Math.max(0, Math.min(1, cy / window.innerHeight))
+    };
+    step += 1;
+    if (step >= STEPS.length) {
+      window.__SOC_CALIBRATE_RESULT = JSON.stringify(captured);
+      teardown();
+    } else {
+      update();
+    }
+  }, true);
+
+  document.documentElement.appendChild(overlay);
+})();

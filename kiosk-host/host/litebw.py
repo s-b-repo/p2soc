@@ -40,6 +40,7 @@ import json
 import os
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -104,10 +105,6 @@ def resolve_url() -> str:
     return os.environ.get("SOC_VAULT_URL") or load_config().get("base_url", "")
 
 
-def resolve_pinentry() -> str:
-    return os.environ.get("SOC_PINENTRY") or load_config().get("pinentry", "")
-
-
 # --------------------------------------------------------------------------- #
 # Master password acquisition (host-bound; never a plaintext file)
 # --------------------------------------------------------------------------- #
@@ -146,7 +143,14 @@ def derive_master_key(password: str, email: str, kdf: int, iterations: int,
     email_l = email.lower()
     pw = password.encode()
     if kdf == 0:
-        return hashlib.pbkdf2_hmac("sha256", pw, email_l.encode(), iterations, 32)
+        # Clamp server-supplied iteration count: the prelogin response is
+        # UNAUTHENTICATED network input, and a hostile/MITM'd Vaultwarden can
+        # declare kdfIterations in the billions to pin the CPU for minutes and
+        # wedge every unlock()/boot. The 10M ceiling keeps the floor (>=1) and
+        # changes nothing for any real vault (Bitwarden default 600k); the KDF
+        # math itself is untouched.
+        iters = min(max(1, iterations), 10_000_000)
+        return hashlib.pbkdf2_hmac("sha256", pw, email_l.encode(), iters, 32)
     if kdf == 1:
         if not _argon2id_available():
             raise VaultSeedError(
@@ -156,12 +160,19 @@ def derive_master_key(password: str, email: str, kdf: int, iterations: int,
                 "Vaultwarden account to the PBKDF2 KDF.")
         from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
         salt = hashlib.sha256(email_l.encode()).digest()
+        # Clamp the server-supplied Argon2id parameters. memory is in MiB and
+        # becomes memory_cost = memory*1024 KiB fed to .derive(): an unbounded
+        # kdfMemory (e.g. 8_000_000) makes cryptography attempt a multi-TB
+        # allocation -> instant OOM-kill of the 1GB kiosk at boot. The ceilings
+        # (1024 MiB ~= 1GB-equivalent work, 10M iters, 16 lanes) mirror sane
+        # Bitwarden limits and leave the MiB->KiB *1024 mapping and every value
+        # <= the ceiling (all KATs + real vaults) byte-for-byte identical.
         return Argon2id(
             salt=salt,
             length=32,
-            iterations=max(1, iterations),
-            lanes=max(1, parallelism or 1),
-            memory_cost=max(8, memory) * 1024,   # MiB -> KiB
+            iterations=min(max(1, iterations), 10_000_000),
+            lanes=min(max(1, parallelism or 1), 16),
+            memory_cost=min(max(8, memory), 1024) * 1024,   # MiB -> KiB, <=1 GiB
         ).derive(pw)
     raise VaultSeedError(f"unsupported KDF type {kdf} (only PBKDF2 and Argon2id)")
 
@@ -270,10 +281,27 @@ def generate_totp(totp_secret: str, at: float | None = None) -> str:
         secret = (q.get("secret", [""])[0]) or ""
         if not secret:
             raise ValueError("otpauth URI has no secret")
+        # digits/period are attacker-controlled (the otpauth URI comes from a
+        # vault item that a compromised/MITM'd server or shared org item can
+        # set). Guard + range-clamp BEFORE the dangerous 10**digits / // period
+        # math below: a huge digits builds a 100M-digit int (hard DoS on the
+        # 1GB board), period=0 is a ZeroDivisionError, and non-numeric raises.
+        # The bounds cover every legitimate code (digits 6-8, period 15-60), so
+        # no real secret is affected and no wire/crypto behaviour changes.
         if q.get("digits"):
-            digits = int(q["digits"][0])
+            try:
+                digits = int(q["digits"][0])
+            except ValueError:
+                raise ValueError("TOTP digits is not an integer")
+            if not (1 <= digits <= 10):
+                raise ValueError("TOTP digits out of range")
         if q.get("period"):
-            period = int(q["period"][0])
+            try:
+                period = int(q["period"][0])
+            except ValueError:
+                raise ValueError("TOTP period is not an integer")
+            if period < 1:
+                raise ValueError("TOTP period out of range")
         if q.get("algorithm"):
             alg = q["algorithm"][0].upper()
             if alg == "STEAM":
@@ -344,7 +372,12 @@ class ReadSession:
         req = urllib.request.Request(url, data=body, headers=h, method=method)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
-                raw = r.read().decode()
+                buf = r.read(vaultseed.MAX_RESPONSE_BYTES + 1)
+                if len(buf) > vaultseed.MAX_RESPONSE_BYTES:
+                    raise VaultSeedError(
+                        f"{method} {url}: vault response exceeds "
+                        f"{vaultseed.MAX_RESPONSE_BYTES} bytes")
+                raw = buf.decode()
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as e:
             detail = e.read().decode()[:200]
@@ -474,6 +507,14 @@ class _HTTPStatusError(VaultSeedError):
         self.code = code
 
 
+class VaultLockedError(VaultSeedError):
+    """Raised in interactive mode when a session is needed but no master is
+    available yet — a catchable signal that the host should pop the themed
+    'Unlock Vaultwarden' dialog and feed the master back via unlock_with(),
+    NOT a hard misconfig. Distinct class so the host can tell 'prompt the
+    operator' apart from 'server unreachable / wrong URL'."""
+
+
 # --------------------------------------------------------------------------- #
 # In-process backend (mirrors vault.RbwBackend's interface)
 # --------------------------------------------------------------------------- #
@@ -489,6 +530,20 @@ class LitebwBackend:
         self.interactive = os.environ.get("SOC_VAULT_INTERACTIVE", "0") == "1"
         self._session: ReadSession | None = None
         self._ciphers: dict[str, dict] | None = None
+        # Bounded cooldown for sync()'s full re-unlock (re-unseal scrypt + login)
+        # on a persistent 401, so a 401-storm (clock skew, disabled account,
+        # server bug) can't re-unseal the master on every panel reload and pin
+        # the 1GB Pi's CPU. The lock also stops prewarm's concurrent threads from
+        # all re-unsealing at once. Real VaultErrors still surface (we re-raise a
+        # cached one inside the window) — only the expensive retry is skipped.
+        self._reunlock_lock = threading.Lock()
+        self._reunlock_fail_ts = 0.0
+        self._reunlock_err: Exception | None = None
+        try:
+            self._reunlock_window = float(
+                os.environ.get("SOC_VAULT_REUNLOCK_COOLDOWN", "8") or "8")
+        except ValueError:
+            self._reunlock_window = 8.0
 
     # -- VaultError import is lazy so this module loads before host.vault ---- #
     @staticmethod
@@ -519,22 +574,50 @@ class LitebwBackend:
         self.configure()
         master = get_master()
         if not master:
+            # Interactive: defer to the host's themed Unlock dialog, which feeds
+            # the master back via unlock_with(). _ensure_session signals this
+            # with VaultLockedError rather than masquerading as "unlocked".
             if self.interactive:
-                return   # operator unlocks later; mirror RbwBackend best-effort
+                return
             raise self._vault_error(
                 "no vault master password (host not sealed and no "
                 "$SOC_VAULT_PASSWORD)")
         try:
             self._session = ReadSession(self.url, self.email, master)
         except VaultSeedError as e:
-            if self.interactive:
-                return
+            # A sealed/env master that fails to log in is a real auth/connect
+            # error even in interactive mode — propagate it as-is so the host
+            # tells the operator *which* (wrong password vs. unreachable),
+            # instead of silently looping on a dead session.
             raise self._vault_error(str(e))
+
+    def unlock_with(self, master: str):
+        """Open the session with an operator-supplied master (from the host's
+        Unlock dialog). Kept in RAM only — never written to a file, preserving
+        the no-plaintext-master guarantee. Raises on bad password / unreachable
+        server so the dialog can report the failure and re-prompt."""
+        if not master:
+            raise self._vault_error("empty master password")
+        try:
+            self._session = ReadSession(self.url, self.email, master)
+        except VaultSeedError as e:
+            self._session = None
+            raise self._vault_error(str(e))
+        # Operator corrected the master — clear the 401 cooldown so the next
+        # sync() retries immediately instead of re-raising a stale cached error.
+        with self._reunlock_lock:
+            self._reunlock_fail_ts = 0.0
+            self._reunlock_err = None
 
     def _ensure_session(self) -> ReadSession:
         if self._session is None:
             self.unlock()
         if self._session is None:
+            # Interactive + no master yet: a catchable "please unlock" signal,
+            # not a dead end. Non-interactive: the generic locked fatal.
+            if self.interactive:
+                raise VaultLockedError(
+                    "vault is locked — Vaultwarden master needed")
             raise self._vault_error("vault is locked")
         return self._session
 
@@ -544,6 +627,12 @@ class LitebwBackend:
         try:
             session = self._ensure_session()
             items = session.list_ciphers()
+        except VaultLockedError:
+            # Interactive "please unlock" signal — propagate AS-IS (never wrap it
+            # into a generic VaultError) so the host can tell it apart from a real
+            # misconfig and pop the themed Unlock dialog. Caught before the broad
+            # VaultSeedError branch below because it IS a VaultSeedError subclass.
+            raise
         except _HTTPStatusError as e:
             if e.code != 401:
                 raise self._vault_error(str(e))
@@ -554,13 +643,33 @@ class LitebwBackend:
             # see host.vault.VaultError. _HTTPStatusError is a VaultSeedError
             # subclass, so the single except covers both.
             self._session = None
-            try:
-                session = self._ensure_session()
-                items = session.list_ciphers()
-            except VaultSeedError as e2:
-                raise self._vault_error(str(e2))
+            # Bounded cooldown: within the window after a failed full re-unlock,
+            # re-raise the cached VaultError instead of re-running scrypt+login.
+            # The lock serialises prewarm's concurrent threads so only one pays
+            # the re-unseal cost. The VaultLockedError "please unlock" signal is
+            # NOT gated by this — its except branch stays ahead of the cooldown.
+            with self._reunlock_lock:
+                if (self._reunlock_err is not None
+                        and time.time() - self._reunlock_fail_ts
+                        < self._reunlock_window):
+                    raise self._reunlock_err
+                try:
+                    session = self._ensure_session()
+                    items = session.list_ciphers()
+                except VaultLockedError:
+                    raise
+                except VaultSeedError as e2:
+                    err = self._vault_error(str(e2))
+                    self._reunlock_fail_ts = time.time()
+                    self._reunlock_err = err
+                    raise err
         except VaultSeedError as e:
             raise self._vault_error(str(e))
+        # Success: clear any cached re-unlock failure so recovery is immediate.
+        if self._reunlock_err is not None:
+            with self._reunlock_lock:
+                self._reunlock_fail_ts = 0.0
+                self._reunlock_err = None
         self._ciphers = {it["name"]: it for it in items}
 
     def _lookup(self, item: str) -> dict | None:

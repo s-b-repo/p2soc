@@ -63,6 +63,10 @@ contents:
     file_info: { mode: 0755 }
   - src: ./setup.py
     dst: /opt/soc-display/setup.py
+  # provision.py — the shared provisioning core setup.py imports (`import provision`)
+  # AND the deploy engine the GUI's Install resolves through; must ship beside setup.py.
+  - src: ./provision.py
+    dst: /opt/soc-display/provision.py
   - src: ./Makefile
     dst: /opt/soc-display/Makefile
   - src: ./README.md
@@ -97,11 +101,19 @@ contents:
     dst: /opt/soc-display/vendor
   - src: ./docs/**
     dst: /opt/soc-display/docs
+  # ---- branding source (rebrand via branding/branding.yaml) ----
+  # Reskins the launcher, the desktop entry and the setup wizard. Operators
+  # override per-box with /etc/soc-display/branding.yaml or SOC_BRANDING_FILE.
+  - src: ./branding/**
+    dst: /opt/soc-display/branding
 
-  # ---- clickable launcher: XDG .desktop entry + icon ----
-  # The .desktop file (and its icon under share/) ship inside the prod tree;
-  # postinstall (install.sh, SOC_SKIP_PACKAGES=1) installs the entry onto the
-  # system apps menu against the operator's existing DE.
+  # ---- clickable launcher: the XDG .desktop entry + icon ----
+  # soc-wall.desktop is the SINGLE advertised entry — the "SOC Video Wall" control
+  # center (run / configure / appearance / install / uninstall in one window). It
+  # execs the setup + appearance scripts directly, so no secondary .desktop files
+  # ship. The entry + the icon under share/ ship inside the prod tree; postinstall
+  # (install.sh, SOC_SKIP_PACKAGES=1) installs the entry onto the system apps menu
+  # against the operator's existing DE.
   - src: ./soc-wall.desktop
     dst: /opt/soc-display/soc-wall.desktop
   - src: ./share/**
@@ -162,6 +174,8 @@ overrides:
       - gir1.2-gtk-3.0
       - gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0
       - python3-cryptography
+      - python3-yaml
+      - python3-websocket
       - autossh
       # VPN clients — one per vpn.type (fortinet/openvpn/wireguard); ppp is the
       # PPP backend openfortivpn drives. tesseract-ocr solves the iNode SSL-VPN
@@ -178,7 +192,6 @@ overrides:
       - cage
       - labwc
       - pinentry-tty
-      - jq
       - curl
       - ca-certificates
   rpm:
@@ -188,6 +201,8 @@ overrides:
       - gtk3
       - webkit2gtk4.1
       - python3-cryptography
+      - python3-pyyaml
+      - python3-websocket-client
       - autossh
       # VPN clients — one per vpn.type (fortinet/openvpn/wireguard); ppp is the
       # PPP backend openfortivpn drives. tesseract solves the iNode SSL-VPN
@@ -203,7 +218,6 @@ overrides:
       - cage
       - labwc
       - pinentry
-      - jq
       - curl
       - ca-certificates
   apk:
@@ -213,6 +227,8 @@ overrides:
       - gtk+3.0
       - webkit2gtk-4.1
       - py3-cryptography
+      - py3-yaml
+      - py3-websocket-client
       - autossh
       # VPN clients — one per vpn.type (fortinet/openvpn/wireguard); ppp is the
       # PPP backend openfortivpn drives. tesseract-ocr solves the iNode SSL-VPN
@@ -228,6 +244,5 @@ overrides:
       - cage
       - labwc
       - pinentry
-      - jq
       - curl
       - ca-certificates

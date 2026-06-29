@@ -32,7 +32,7 @@ dev-vault:  ## write dev/run/dev-vault.json (dev vault backend, no server needed
 	@echo "wrote dev/run/dev-vault.json"
 
 .PHONY: vault
-vault: .venv  ## start Vaultwarden in Docker + seed it via rbw (full vault path)
+vault: .venv  ## start Vaultwarden in Docker + seed it via litebw (full vault path)
 	docker rm -f soc-vaultwarden 2>/dev/null || true
 	mkdir -p dev/run/vw-data
 	docker run -d --name soc-vaultwarden -e ADMIN_TOKEN=devadmintoken \
@@ -46,6 +46,24 @@ vault: .venv  ## start Vaultwarden in Docker + seed it via rbw (full vault path)
 .PHONY: dev
 dev: .venv dev-vault  ## run the wall in a Xephyr window (interactive; Ctrl-C to stop)
 	bash dev/run-wall.sh
+
+.PHONY: wizard-gui
+wizard-gui: .venv  ## graphical setup wizard (presets + live validation; needs a display)
+	PYTHONPATH=kiosk-host $(PY) -m host.setupgui
+
+.PHONY: appearance
+appearance: .venv  ## graphical theme editor (presets + per-colour pickers; needs a display)
+	PYTHONPATH=kiosk-host $(PY) -m host.appearance
+
+.PHONY: desktop-dev
+desktop-dev: .venv  ## install user-level app icons pointing at THIS checkout (no sudo)
+	@mkdir -p $(HOME)/.local/share/applications $(HOME)/.local/share/icons/hicolor/scalable/apps
+	@install -m0644 share/icons/soc-wall.svg $(HOME)/.local/share/icons/hicolor/scalable/apps/soc-wall.svg
+	@PYTHONPATH=kiosk-host SOC_ROOT="$(CURDIR)" $(PY) -m host.branding desktop \
+	  "$(CURDIR)/scripts/soc-wall-menu" soc-wall > $(HOME)/.local/share/applications/soc-wall.desktop
+	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
+	@command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
+	@echo "dev app icons installed -> $(HOME)/.local/share/applications (only 'SOC Video Wall' ships; Setup + Appearance are reached from inside the control center)"
 
 .PHONY: verify
 verify: .venv dev-vault  ## headless end-to-end check (Xvfb) — asserts logins + tunnel + screenshot
@@ -94,10 +112,20 @@ lint: .venv verify-arm  ## syntax-check shell + python + run the aarch64 gate
 	@bash -n install.sh && echo "install.sh: ok"
 	@for s in scripts/*.sh dev/*.sh; do bash -n "$$s" && echo "$$s: ok"; done
 	@$(PY) -m py_compile setup.py kiosk-host/host/*.py scripts/*.py dev/*.py && echo "python: ok"
+	@# headless wiring smokes (no GTK / no display): config resolver, launcher,
+	@# health dot, the privileged sysaction runner.
+	@PYTHONPATH=kiosk-host $(PY) -m host.configpaths --check
+	@PYTHONPATH=kiosk-host $(PY) -m host.health --check
+	@PYTHONPATH=kiosk-host $(PY) -m host.sysaction --check
+	@PYTHONPATH=kiosk-host $(PY) -m host.launchermenu --check
 
 .PHONY: install
 install:  ## install on the Pi (run as root)
 	sudo ./install.sh
+
+.PHONY: uninstall
+uninstall:  ## uninstall from the Pi (root; preserves data — ARGS="--purge" to wipe)
+	sudo ./uninstall.sh $(ARGS)
 
 .PHONY: clean
 clean:  ## stop dev procs and remove dev runtime state
@@ -107,6 +135,11 @@ clean:  ## stop dev procs and remove dev runtime state
 	-pkill -f "Xephyr :8" 2>/dev/null; pkill -f "Xvfb :7" 2>/dev/null
 	rm -rf dev/run/xdgrt/soc-profiles dev/run/*.log dev/run/*.png
 	@echo "cleaned"
+
+.PHONY: package-clean
+package-clean:  ## remove build cruft (__pycache__/*.pyc/.egg-info) so nfpm packages a clean tree
+	@find . -path ./.venv -prune -o \( -name '__pycache__' -o -name '*.py[cod]' -o -name '*.egg-info' -o -name '.pytest_cache' \) -print0 2>/dev/null | xargs -0 rm -rf 2>/dev/null || true
+	@echo "package-clean: stripped __pycache__/*.pyc/.pytest_cache"
 
 .PHONY: distclean
 distclean: clean  ## also remove venv and all dev/run state

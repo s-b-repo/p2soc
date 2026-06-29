@@ -207,6 +207,16 @@ def get_master(source: str | None = None) -> str:
                 pw = _from_sealed()
                 if pw:
                     return pw
+                # A seal EXISTS but did not unseal (wrong machine / corrupt blob).
+                # Fail closed for provenance: do NOT silently downgrade to a weaker
+                # source (a leftover wallet entry or a dev SOC_VAULT_PASSWORD).
+                # Returning '' keeps the crash-free contract — callers (litebw /
+                # main.py) then surface the themed Unlock prompt, which can re-seal.
+                sys.stderr.write(
+                    "mastersource: a host-bound seal exists but did not unseal "
+                    "(wrong machine / corrupt) — not falling back to a weaker "
+                    "source; re-run setup.py first-run to re-seal\n")
+                return ""
         except secretstore.SecretStoreError as e:
             sys.stderr.write(f"mastersource: {e}\n")
         if _have_secret_tool():

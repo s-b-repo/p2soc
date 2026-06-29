@@ -1,0 +1,44 @@
+# Lets the SOC wall (running as user `soc`) restart specific services
+# without a password — needed so the ⚙ Settings tab's "Save" applies
+# VPN / tunnel / tarpit changes LIVE instead of just queuing a "PENDING
+# restart" message for the operator to run by hand.
+#
+# Scope is intentionally MINIMAL — exactly three units:
+#   * forti-vpn.service         VPN config change   → restart the VPN unit
+#   * autossh-tunnel.service    tunnel config change → restart autossh
+#   * soc-tarpit.service        tarpit knob change  → restart tarpit
+#
+# This deploy line uses the SINGLE-VPN model (forti-vpn.service), not the
+# templated soc-vpn@<name> stack — so there are NO @-instance entries here.
+#
+# soc CANNOT use this drop-in to restart anything else (no soc-wall
+# itself — that's done via sys.exit + launcher loop; no random units;
+# no privilege escalation beyond these specific commands).
+#
+# Installed by install.sh to /etc/sudoers.d/soc-wall-restart, mode 0440,
+# parsed under visudo so a syntax error blocks the install rather than
+# breaking the whole sudoers stack.
+#
+# Defaults env_reset is implicit; we don't need any env vars passed.
+
+soc ALL=(root) NOPASSWD: /usr/bin/systemctl restart forti-vpn.service, \
+                         /usr/bin/systemctl restart autossh-tunnel.service, \
+                         /usr/bin/systemctl restart soc-tarpit.service, \
+                         /usr/bin/systemctl start   forti-vpn.service, \
+                         /usr/bin/systemctl start   autossh-tunnel.service, \
+                         /usr/bin/systemctl start   soc-tarpit.service, \
+                         /usr/bin/systemctl stop    forti-vpn.service, \
+                         /usr/bin/systemctl stop    autossh-tunnel.service, \
+                         /usr/bin/systemctl stop    soc-tarpit.service, \
+                         /usr/bin/systemctl enable  forti-vpn.service, \
+                         /usr/bin/systemctl enable  autossh-tunnel.service, \
+                         /usr/bin/systemctl enable  soc-tarpit.service, \
+                         /usr/bin/systemctl disable forti-vpn.service, \
+                         /usr/bin/systemctl disable autossh-tunnel.service, \
+                         /usr/bin/systemctl disable soc-tarpit.service, \
+                         /usr/bin/systemctl status  forti-vpn.service, \
+                         /usr/bin/systemctl status  autossh-tunnel.service, \
+                         /usr/bin/systemctl status  soc-tarpit.service, \
+                         /usr/bin/journalctl -u forti-vpn.service *, \
+                         /usr/bin/journalctl -u autossh-tunnel.service *, \
+                         /usr/bin/journalctl -u soc-tarpit.service *

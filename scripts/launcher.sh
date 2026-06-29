@@ -6,14 +6,34 @@
 set -u
 
 ROOT="${SOC_ROOT:-/opt/soc-display}"
-ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
+
+# Resolve which soc.env / panels.yaml the wall reads through the SAME resolver the
+# wizard writes with (host.configpaths), so the shell and Python can never drift.
+# PYBIN/PYTHONPATH are needed for the module import — set them early.
+export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
+PYBIN="$ROOT/.venv/bin/python"
+[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+
+# Resolve SOC_ENV_FILE BEFORE sourcing it (so we source the right env). `|| true`
+# + the literal fallback (== read tier #3) keeps the non-systemd/pre-install path
+# working when the resolver module isn't importable yet.
+: "${SOC_ENV_FILE:=$("$PYBIN" -m host.configpaths --env 2>/dev/null || true)}"
+: "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
+ENV_FILE="$SOC_ENV_FILE"
 
 # Load environment (vault creds, ports, timeouts). Keep this file on tmpfs 0600.
-if [ -f "$ENV_FILE" ]; then
+if [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+elif [ -e "$ENV_FILE" ]; then
+  # soc.env exists but THIS user cannot read it -> the vault config (email/URL)
+  # never loads and unlock fails with an empty account. soc.env is NON-SECRET
+  # (the master is sealed separately), so surface this loudly instead of silently
+  # skipping it. The #1 cause of "desktop mode can't unlock the vault".
+  echo "WARNING: $ENV_FILE exists but is not readable by $(id -un 2>/dev/null) —" >&2
+  echo "  the wall's vault config will not load. Fix: sudo chmod 0644 $ENV_FILE" >&2
 fi
 
 # Send everything to the journal when possible: `journalctl -t soc-kiosk -f`
@@ -22,8 +42,11 @@ if [ "${SOC_NO_JOURNAL:-0}" != "1" ] && command -v systemd-cat >/dev/null 2>&1; 
   exec > >(systemd-cat -t soc-kiosk) 2>&1
 fi
 
-export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
-export SOC_PANELS_FILE="${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}"
+# Resolve SOC_PANELS_FILE AFTER sourcing soc.env, so an explicit SOC_PANELS_FILE
+# baked into the env (read tier #1) wins over the resolver's choice.
+: "${SOC_PANELS_FILE:=$("$PYBIN" -m host.configpaths --panels 2>/dev/null || true)}"
+: "${SOC_PANELS_FILE:=/etc/soc-display/panels.yaml}"
+export SOC_PANELS_FILE SOC_ENV_FILE
 export SOC_INJECT_TMPL="${SOC_INJECT_TMPL:-$ROOT/inject/login.js.tmpl}"
 
 # Cap glibc malloc arenas. The default (8*ncpu = 32 on a 4-core Pi 5) lets each
@@ -31,9 +54,6 @@ export SOC_INJECT_TMPL="${SOC_INJECT_TMPL:-$ROOT/inject/login.js.tmpl}"
 # allocations across arenas that each grow a 64MB heap and never give it back —
 # tens to >100MB of RSS bloat on a 1GB board. 2 arenas keeps that headroom.
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
-
-PYBIN="$ROOT/.venv/bin/python"
-[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
 
 cd "$ROOT" || exit 1
 
@@ -56,6 +76,17 @@ while true; do
   "$PYBIN" -m host.main
   code=$?
   ran=$(( $(date +%s) - started ))
+
+  # Exit 2 = a fail-safe screen the operator already saw + dismissed (bad config,
+  # vault locked, or the Unlock-Vaultwarden prompt cancelled). Relaunching would
+  # just re-pop it forever ("won't close"), so STOP supervising and hand back to
+  # the launcher menu ("start") instead of restarting the wall.
+  if [ "$code" -eq 2 ]; then
+    echo "[launcher] host exited with the operator-action code (2); returning to the menu" >&2
+    menu="$ROOT/scripts/soc-wall-menu"
+    [ -x "$menu" ] && exec "$menu"
+    exit 0
+  fi
 
   # native Wayland that fails fast twice -> switch to XWayland (auto only)
   if [ "$wl" = auto ] && [ "${GDK_BACKEND:-}" = wayland ] && [ "$ran" -lt 8 ]; then

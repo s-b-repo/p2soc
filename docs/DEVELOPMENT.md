@@ -22,10 +22,13 @@ dummy panels — no Pi or real infrastructure required.
 | `make vpn-check` | dry-run the Fortinet VPN: resolve vault creds + print the openfortivpn command (no connect; password never shown) |
 | `make verify-vpn` | behavioral check of **all three** VPN backends (fortinet/openvpn/wireguard) with fake clients: log classification, mgmt-socket creds, config-from-vault, connect/reconnect |
 | `make gen-labwc` / `make gen-openbox` | render the Wayland/X11 window-placement rules from `config/panels.yaml` |
+| `make wizard-gui` | launch the GTK setup wizard (presets + live validation; needs a display) |
 | `make dev` | **interactive**: the wall in a Xephyr window (Openbox if installed) |
 | `make vault` | start Vaultwarden in Docker, register an account, seed via API, verify `litebw` reads it |
 | `make test` | unit tests (geometry, injection escaping, vault, config validation, VPN supervisor, proxy, perf, WM generators) |
-| `make lint` | `bash -n` + `py_compile` everything |
+| `make verify-arm` | aarch64 gate: assert no compile-on-Pi / wrong-arch regression (no display/root) — runs `dev/verify-arm.sh` |
+| `make lint` | `bash -n` + `py_compile` everything, then runs the `verify-arm` aarch64 gate |
+| `make uninstall` | uninstall from the Pi (root; preserves operator data — `ARGS="--purge"` to wipe; runs `uninstall.sh`) |
 | `make clean` / `make distclean` | stop dev procs / also remove venv + Docker container |
 
 ## How the dev harness works
@@ -81,3 +84,7 @@ Both engines inject the same `inject/login.js.tmpl` bootstrap (rendered by
   `add` and `sshd_config` paths break — the Pi install path `/opt/soc-display` has
   none. Seed Vaultwarden via `dev/seed-ciphers.py`, not `rbw add`.
 - Keep the Chromium **sandbox on** in production (never set `--no-sandbox`).
+- **Rebranding** is one file: `branding/branding.yaml` (read by `host/branding.py`)
+  sets the name, tagline, icon, and accent colours that flow into the launcher,
+  the generated desktop entry, and the setup wizard. Override at runtime with
+  `/etc/soc-display/branding.yaml` or `SOC_BRANDING_FILE`.

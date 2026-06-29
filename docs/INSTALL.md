@@ -64,7 +64,8 @@ Knobs (env vars):
 | `SESSION` | `auto` | display stack: `auto` (install both; at runtime try **Wayland → XWayland → XLibre → Xorg**), or force one of `wayland` / `xwayland` / `xlibre` / `xorg` / `x11` |
 | `VW_MODE` | `docker` | `docker` (official image) or `native` (binary at `/usr/local/bin/vaultwarden`) |
 | `HARDEN` | `0` | `1` also installs the nftables firewall + key-only sshd |
-| `KIOSK_USER` | `soc` | kiosk login user (autologin on tty1) |
+| `KIOSK_USER` | `soc` | kiosk-mode appliance user (autologin on tty1 in kiosk mode) |
+| `DESKTOP_USER` | `socwall` | desktop-mode user that runs the wall windowed in your DE session (no autologin) |
 | `SVC_USER` | `socsvc` | service user that owns the autossh tunnel |
 | `COMPOSITOR` | `labwc` | Wayland compositor to install (e.g. `sway`); runtime override is `SOC_COMPOSITOR` |
 | `SOC_SKIP_PACKAGES` | `0` | `1` to skip all OS-package installs (deps already present / unknown distro) |
@@ -78,22 +79,181 @@ autologin and sets `multi-user.target` as the default; in the default
 **desktop** mode it does neither (your DE is untouched). The chosen `SESSION` is
 written to `soc.env` as `SOC_SESSION` and can be changed there any time.
 
-The installer records every file it lays down and every system change it makes
-in a manifest at `/etc/soc-display/install-manifest` — that is what
-[`uninstall.sh`](#uninstall) replays to revert cleanly.
+The installer records every file it lays down, every system change it makes, and
+every user it creates in a manifest at `/etc/soc-display/.install-manifest` — that
+is what [`uninstall.sh`](#uninstall) replays to revert cleanly (it removes exactly
+what the manifest records, nothing more).
+
+#### Users created (both modes, removed on uninstall)
+
+Setup creates three dedicated, **unprivileged** users — both modes create both
+wall users so a box can switch modes later without re-provisioning, but only the
+chosen mode wires up autologin/session takeover:
+
+| User | Default | Role | Groups | Autologin |
+|---|---|---|---|---|
+| `KIOSK_USER` | `soc` | kiosk-mode appliance user | `video render input tty audio seat` | tty1 (kiosk mode only) |
+| `DESKTOP_USER` | `socwall` | runs the wall windowed inside your existing DE session | `video render input` (no tty/seat takeover) | none — started on demand |
+| `SVC_USER` | `socsvc` | system `nologin` user that owns the autossh tunnel | — | none |
+
+Every created user, its home and any per-user unit is recorded in the manifest, so
+`uninstall.sh --purge` removes them all together (`userdel -r`) with no orphans.
+
+### The control center (one entry for everything)
+
+The install advertises a **single** desktop entry — **SOC Video Wall** (category:
+System) — which opens the **control center**: one themed window that is the place
+to do everything, grouped under quiet `//` sections:
+
+| `// run` | `// configure` | `// system` |
+|----------|----------------|-------------|
+| Desktop mode, Kiosk mode | Setup / Configure, Appearance | Install / Update, Uninstall |
+
+It is **adaptive** to the install state: on a box that isn't installed yet,
+**Install** is the highlighted action and the Run tiles are dimmed with an
+"install first" hint; once installed, Run takes over, Install reads
+**Reinstall / Update**, and **Uninstall** appears (in red) in the quiet `// system`
+group. A health dot + active-config line show what will launch, and **Validate**
+runs the doctor checks in place. The privileged **Install / Update** and
+**Uninstall** actions never silently `sudo`: they prompt via graphical polkit
+(`pkexec`), fall back to a terminal, or — if neither is available — show the exact
+shell line. Either way the script's output streams **live** into a themed progress
+window, and you land back on a refreshed control center when it finishes.
+
+The **Setup** and **Appearance** entries are still installed but ship hidden
+(`NoDisplay=true`) — the control center is the way in (it launches the wizard and
+opens Appearance in-process), so only **SOC Video Wall** shows in your menu.
+
+### Headless / SSH install (CLI parity with the GUI)
+
+**Setup does everything** — every prereq, dependency and step the graphical
+control center performs is reachable non-interactively from `setup.py`, calling
+the *same* shared provisioning core (no parallel implementation that can drift),
+so a headless/SSH install ends with the same fully-working, launchable wall as the
+GUI. On a fresh box:
+
+```bash
+sudo python3 setup.py provision --mode kiosk \
+     --email kiosk@soc.local --url http://127.0.0.1:8222
+```
+
+`provision` runs the whole fresh-box flow in order — install OS packages → create
+the kiosk + desktop (+ service) users → deploy `/opt` + build the venv + install
+the mode's units → write `panels.yaml`/`soc.env` → start Vaultwarden → create the
+vault account → seed the panel-login items → seal the master host-bound → run the
+doctor checks. Each step reports progress and is **idempotent** (re-running is a
+no-op on already-done steps).
+
+Every individual action is also reachable on its own, so a partial or scripted
+install can do just one step — these are exactly the actions the GUI's Setup
+buttons trigger:
+
+| Command | Does |
+|---|---|
+| `setup.py provision --mode {kiosk\|desktop}` | the whole fresh-box flow above |
+| `setup.py create-users` | create the kiosk + desktop (+ service) users |
+| `setup.py write-config` | render + write `panels.yaml` / `soc.env` / the wall unit |
+| `setup.py vault-register --email … --url …` | create the Vaultwarden account if absent (distinguishes *account missing* from *wrong master*) |
+| `setup.py vault-seed` | seed a vault login item per configured panel |
+| `setup.py seal` | seal the vault master host-bound (PIN via `--pin`, master over an FD/stdin) |
+| `setup.py uninstall [--purge]` | run the manifest-driven uninstaller (headless removal == GUI Uninstall) |
+
+Flags: `--mode {kiosk,desktop}`, `--email`, `--url`, `--pin`, `--seed`/`--no-seed`,
+`--yes` (non-interactive accept). The **master password is never an argv flag** —
+it is read from a file descriptor / stdin (`--master-fd`) or the sealed source, so
+it never lands in the process table, in `soc.env`, or in any file. A
+`--dry-run` (or `SOC_PROVISION_DRY_RUN=1`) flips provisioning into print-don't-run
+mode: it prints the exact `useradd` / package / `systemctl` / `pkexec` commands it
+*would* run and the vault/seal targets it *would* touch, mutating nothing — useful
+to preview a fresh-box install or in CI.
+
+The control center's privileged steps escalate via graphical polkit (`pkexec`)
+with secrets passed over **stdin, never argv**; the CLI runs the same core as root
+directly. Either way the two paths call identical functions, so the GUI and the
+headless install can't drift.
+
+**One shared deploy engine.** The privileged *package install + user creation +
+`/opt` deploy + unit install + manifest* work is owned by a single script,
+`install.sh`. The CLI reaches it through `provision.step_packages` /
+`provision.step_deploy` (which shell `install.sh`); the control center's **Install**
+button reaches the *same* `install.sh` resolved through the *same*
+`provision.install_sh()` helper, threading the *same* env knobs
+(`provision.install_env_knobs()` — `INSTALL_MODE` + the kiosk/desktop/service
+usernames). There is therefore exactly one implementation of "deploy the wall",
+invoked identically from both the GUI and the CLI — install.sh is the shared deploy
+engine, and `provision.step_users` is its idempotent stdlib mirror used only for the
+granular `create-users` / `--dry-run` paths.
 
 ### Launching the wall (desktop mode)
 
-After a desktop-mode install, open your applications menu and click **SOC Wall**
-(category: System / Network). The launcher sources `/etc/soc-display/soc.env` and
-runs the kiosk host against your **current** display (`$DISPLAY` /
-`$WAYLAND_DISPLAY`) — no tty1, no separate login. Run it from a terminal the same
-way with `/opt/soc-display/scripts/soc-wall-desktop.sh`. Close the windows to
-stop the wall; it leaves your desktop session as it was.
+From the control center, click **Desktop mode** (windowed) or **Kiosk mode**
+(fullscreen). The launcher sources `/etc/soc-display/soc.env` and runs the kiosk
+host against your **current** display (`$DISPLAY` / `$WAYLAND_DISPLAY`) — no tty1,
+no separate login. Run it from a terminal the same way with
+`/opt/soc-display/scripts/soc-wall-desktop.sh`. Close the windows to stop the
+wall; it leaves your desktop session as it was.
 
 > Easiest path: after the installer, run the guided wizard
 > `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
 > the config interactively (Vaultwarden's own config is in its systemd unit).
+
+The control center's **Setup / Configure** card opens the **graphical**
+configuration wizard — the same flow in a desktop window, with **presets** and
+live-validated fields. It writes the *identical* artifacts as the text wizard (it
+reuses `setup.py`'s renderers/validators and the host secret store, so the two
+can't drift), and on finishing it returns you to the control center so you can
+launch the wall with the fresh config. The matching **SOC Wall Setup** desktop
+entry is installed but hidden (`NoDisplay=true`) — reach it through the control
+center. Launch it any of these ways:
+
+```bash
+make wizard-gui                      # from the repo (dev)
+python3 setup.py wizard-gui          # degrades to the text wizard with no display
+/opt/soc-display/scripts/soc-wall-setup-gui.sh   # on a deployed box
+```
+
+### Appearance (theme colours & presets)
+
+The control center's **Appearance** card opens the **graphical theme editor**
+in-process (a live colour change recolours the open control center). The matching
+**SOC Wall Appearance** desktop entry is installed but hidden (`NoDisplay=true`) —
+reach it through the control center. Pick a
+built-in **theme preset** (`SOC Green/White` [default], `Midnight` [dark],
+`High Contrast`, `Amber Ops`) or fine-tune any of the 14 palette colours with the
+per-colour pickers. Changes preview **live** on a sample card, and **Save**
+persists them to `branding.yaml` — which **is** the startup theme: every launch
+(launcher, wizard, error dialogs) reads its colours, so a saved theme applies on
+the next boot with no extra step. The wizard's first-run flow shows the same
+Appearance page. Launch it any of these ways:
+
+```bash
+make appearance                                   # from the repo (dev)
+python3 -m host.appearance --list-presets         # discover presets (no display)
+python3 -m host.appearance --preset midnight --output ./branding.yaml  # headless write
+/opt/soc-display/scripts/soc-wall-appearance.sh   # on a deployed box
+```
+
+Save targets the same file the loader reads: `$SOC_BRANDING_FILE` if set, else
+`/etc/soc-display/branding.yaml` on a deployed box (when writable), else the repo
+`branding/branding.yaml`. Only the colour palette is rewritten — the file's
+comments, `name`/`tagline`/`icon` and key order are preserved; no secrets are
+ever written. If the target isn't writable the editor tells you the exact path
+and to re-run elevated rather than failing silently.
+
+### Rebranding
+
+The whole product — the launcher menu, the installed desktop entries, the setup
+wizard and the appearance editor — reskins from one file, `branding/branding.yaml` (packaged to
+`/opt/soc-display/branding/branding.yaml`). Edit its `name`, `short_name`,
+`tagline`, `icon` and `colors` (a partial file is fine — anything omitted falls
+back to the built-in defaults). The app icon is `share/icons/soc-wall.svg`;
+replace that file (or repoint `icon:`) to change it.
+
+On a deployed box, override without touching `/opt` by dropping a
+`branding.yaml` at `/etc/soc-display/branding.yaml`, or point
+`SOC_BRANDING_FILE=/path/to/branding.yaml` at any file. Re-run the installer (or
+`python -m host.branding desktop …`) to re-render the desktop entry with the new
+name/icon.
 
 ## 3. Configure (the installer prints this list)
 
@@ -103,6 +263,22 @@ stop the wall; it leaves your desktop session as it was.
    `SOC_SECRET_DIR`, `SOC_CONFIG_VAULT_ITEM` (**non-secret**; `chmod 0640`). The
    master password is sealed separately — see step 4b.
 3. **Vaultwarden** — config is inline in its systemd unit (no `.env`); `/admin` off.
+
+You can write 1–2 with either wizard. The **graphical** wizard
+(`python3 setup.py wizard-gui`, or the **SOC Wall Setup** icon) starts from a
+**preset** — `wazuh-zabbix-2x2` (a 2×2 SOC starter), `single-panel`, or `empty`
+— then lets you customize every field with live validation before writing. The
+presets ship at `/opt/soc-display/config/presets/*.yaml` and are themselves valid
+`panels.yaml` files. For scripted/CI use, the wizard also has a **headless** path
+(no window, no display needed) that renders a preset straight to disk:
+
+```bash
+python3 -m host.setupgui --list-presets                 # discover presets
+python3 -m host.setupgui --preset empty --output ./out --non-interactive
+```
+
+The master password is **never** part of the headless path — sealing/storing only
+happens in the graphical Write step (and never lands in any file).
 
 ## 4. Create the vault + add logins
 
@@ -193,24 +369,42 @@ The install is fully reversible via the manifest-driven uninstaller:
 sudo ./uninstall.sh          # or: sudo make uninstall
 ```
 
-By default it **preserves operator data**: the `soc`/`socsvc` users, the
-`/etc/soc-display` secrets (sealed master password, config), and the Vaultwarden
-data at `/var/lib/vaultwarden` are kept, so you can re-install without re-sealing
-the vault. Everything else the installer added is reversed: it stops/disables the
-units and removes them, removes the `/opt/soc-display` tree, the `litebw`
-launcher, the "SOC Wall" menu entry, and — if this was a **kiosk** install —
-restores the previous systemd default target and removes the tty1 autologin
-drop-in, handing the console back to your DE/login manager.
+The uninstaller is **manifest-driven**: it removes exactly the files, systemd
+units and users that `install.sh` recorded in `/etc/soc-display/.install-manifest`,
+so whatever Setup created — including the **desktop-mode user** and any **per-user
+units** — is reversed with no special-casing, and nothing the installer did *not*
+record is ever touched (it never `rm`s an unrecorded path).
 
-To wipe everything, including the operator data above:
+By default it **preserves operator data**: every install-created user (the
+kiosk-mode user `soc`, the desktop-mode user `socwall`, the service user `socsvc`,
+and — `VW_MODE=native` — `vaultwarden`) and their homes, the `/etc/soc-display`
+secrets (sealed master password, config), and the Vaultwarden data at
+`/var/lib/vaultwarden` are kept, so you can re-install without re-sealing the
+vault. Everything else the installer added is reversed: it stops/disables and
+removes the units (the core set **plus any unit the manifest recorded**), removes
+the `/opt/soc-display` tree, the `litebw` launcher, the single **SOC Video Wall**
+menu entry (`soc-wall.desktop`) and every other file the manifest recorded, and —
+if this was a **kiosk** install — restores the previous systemd default target and
+removes the tty1 autologin drop-in, handing the console back to your DE/login
+manager.
+
+To wipe everything Setup created, including the operator data above:
 
 ```bash
 sudo ./uninstall.sh --purge      # or: sudo make uninstall PURGE=1
 ```
 
-`--purge` additionally deletes `/etc/soc-display`, the Vaultwarden data
-directory, and the kiosk/service users. Use it only when you are decommissioning
-the box — sealed vault credentials are gone after a purge.
+`--purge` additionally deletes `/etc/soc-display` (config **and** the sealed
+secret), the Vaultwarden data directory, the Vaultwarden Docker container/image
+(when `VW_MODE=docker`), and **every install-created user and home** — driven by
+the manifest's `USER` rows, so the kiosk + desktop + service (+ vaultwarden) users
+all go together (`userdel -r` removes each recorded home). On a pre-manifest /
+manifest-less install it falls back to the known kiosk/service/vault users so an
+old box still cleans up. Use `--purge` only when decommissioning the box — sealed
+vault credentials are gone after a purge.
+
+It is fully **idempotent**: a second run is a no-op, and it tolerates partly-
+removed state at every step.
 
 > Without systemd, the uninstaller reverses the file deploy and prints the
 > autostart/supervision lines to remove by hand, mirroring the install.

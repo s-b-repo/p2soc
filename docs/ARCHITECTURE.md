@@ -4,8 +4,15 @@
 a Security-Operations-Center video wall: four web panels in a 2×2 grid, each
 auto-logged-in from a local secrets vault, self-healing for 24/7 operation. It
 runs on X11 (X.Org or XLibre) and Wayland (cage/labwc), with optional reach
-through an SSH jump host, a supervised Fortinet SSL-VPN, and/or an authenticated
-outbound proxy.
+through an SSH jump host, a supervised VPN (Fortinet / OpenVPN / WireGuard /
+iNode-H3C), and/or an authenticated outbound proxy.
+
+It installs in one of two modes (`INSTALL_MODE`, see `install.sh`): **desktop**
+(the default — deploy everything but leave the boot target / DE untouched; the
+wall launches from a desktop icon or `systemctl start soc-wall`) or **kiosk**
+(the tty1-autologin appliance takeover described below). Identity (name,
+tagline, accent colours, icon) comes from a single branding layer
+(`branding/branding.yaml` + `host/branding.py`).
 
 ## Runtime topology
 
@@ -17,11 +24,12 @@ Raspberry Pi 5 (Raspberry Pi OS, desktop session disabled)
 │   ├─ vaultwarden.service ───────────────► 127.0.0.1:8222  encrypted vault  │
 │   ├─ autossh-tunnel.service ────────────► autossh -L 127.0.0.1:191xx:…     │
 │   │                                          user@jump  (per-panel forwards)│
-│   └─ forti-vpn.service (root) ──────────► openfortivpn → FortiGate SSL-VPN  │
+│   └─ forti-vpn.service (root) ──────────► VPN driver → gateway (SSL-VPN/…)  │
 │                                              login from vault, via pinentry │
 │                                                                            │
-│   forti-vpn.service runs a SUPERVISOR (host/fortivpn.py): classifies          │
-│   openfortivpn output, reconnects with backoff, holds ~5 min on auth failure, │
+│   forti-vpn.service runs a SUPERVISOR (host/fortivpn.py): drives one of the   │
+│   VPN drivers (host/vpndrivers.py — Fortinet/OpenVPN/WireGuard/iNode-H3C),     │
+│   classifies output, reconnects with backoff, holds ~5 min on auth failure,   │
 │   Type=notify + watchdog, reports state to `systemctl status` (STATUS=)        │
 │                                                                            │
 │ getty@tty1 autologin (soc) → start-session.sh dispatcher (per SOC_SESSION) │
@@ -35,6 +43,13 @@ Raspberry Pi 5 (Raspberry Pi OS, desktop session disabled)
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
+The tty1-autologin path above is the **kiosk** install mode. In **desktop**
+mode (the default) the boot target is left as-is and the wall is launched
+on demand: the `soc-wall.desktop` icon opens a small GTK chooser
+(`scripts/soc-wall-menu` → `host/launchermenu.py`) offering **Setup**,
+**Desktop mode** (windowed) and **Kiosk mode** (fullscreen), all branded from
+`host/branding.py`.
+
 Without systemd the same processes run under any init (the launcher and the VPN
 supervisor self-restart); only autologin + unit supervision are wired by hand.
 
@@ -46,7 +61,11 @@ supervisor self-restart); only autologin + unit supervision are wired by hand.
 3. **launcher.sh** sources `/etc/soc-display/soc.env`, then runs the kiosk host in
    a restart loop (self-heals on crash).
 4. The **host** (`kiosk-host/host/main.py`):
-   - opens the vault (`litebw unlock` + `sync`) — **required**, retried until ready;
+   - opens the vault (`litebw` unlock + `sync`) — **required**, retried until ready.
+     The master password comes from `host/mastersource.py` (`SOC_MASTER_SOURCE`,
+     default `auto`): a host-bound AES-256-GCM **sealed** seal, the freedesktop
+     **secret-service** (KWallet / GNOME-keyring / KeePassXC via `secret-tool`),
+     or `env` (dev-only). Never plaintext in `.env` / `soc.env` in production;
    - if a Fortinet VPN is enabled with a `ready_probe`, **polls** it until the
      VPN-side network answers (best-effort) so no window loads a dead route;
    - **polls** each tunnel's local port until it answers (best-effort, timed) so
@@ -62,7 +81,10 @@ supervisor self-restart); only autologin + unit supervision are wired by hand.
 | Component | File(s) | Responsibility |
 |---|---|---|
 | Config | `kiosk-host/host/config.py`, `config/panels.yaml` | parse panels, derive effective URL + 2×2 geometry |
-| Vault | `kiosk-host/host/vault.py` | read creds via `litebw` (default; pure-Python Vaultwarden client) or the legacy `rbw`, or a JSON file (dev); RAM-only TTL cache |
+| Vault | `kiosk-host/host/vault.py`, `kiosk-host/host/litebw.py` | read creds via `litebw` (**default**; pure-Python, rbw-compatible Vaultwarden client + CLI — no Rust toolchain on the Pi) or the legacy `rbw`, or a JSON file (`dev`); selected by `SOC_VAULT_BACKEND`; RAM-only TTL cache |
+| Master source | `kiosk-host/host/mastersource.py`, `kiosk-host/host/secretstore.py` | resolve the vault master password (`SOC_MASTER_SOURCE=auto\|sealed\|secret-service\|env`): host-bound AES-GCM seal (default), freedesktop Secret Service, or env (dev-only) |
+| Branding | `branding/branding.yaml`, `kiosk-host/host/branding.py`, `share/icons/soc-wall.svg` | one file sets name/tagline/icon/accent colours; flows into the launcher, the generated desktop entry, and setup. Override via `/etc/soc-display/branding.yaml` or `SOC_BRANDING_FILE` |
+| Launcher menu | `scripts/soc-wall-menu`, `kiosk-host/host/launchermenu.py`, `soc-wall.desktop` | GTK chooser (Setup / Desktop / Kiosk) opened by the desktop icon in desktop install mode |
 | Injection | `kiosk-host/host/inject.py`, `inject/login.js.tmpl` | render the bootstrap + the just-in-time `socLogin` call (JSON-escaped) |
 | WebKit panel | `kiosk-host/host/webkit_panel.py` | WebKitWebView (own window or embedded) + `socCreds` handler, proxy auth, crash-reload, status overlay |
 | Chromium panel | `kiosk-host/host/chromium_panel.py` | spawn `chromium --app`, drive login + proxy auth over CDP, respawn on death |
@@ -74,7 +96,7 @@ supervisor self-restart); only autologin + unit supervision are wired by hand.
 | Window mgmt (X11) | `openbox/rc.xml.tmpl`, `scripts/gen-openbox-rc.py` | no-panel WM, forced 2×2 placement by WM_CLASS, draggable |
 | Window mgmt (Wayland) | `labwc/rc.xml.tmpl`, `scripts/gen-labwc-rc.py` | generated labwc window rules (app_id/title) tile panel windows |
 | Tunnel | `scripts/tunnel-args.py`, `scripts/autossh-tunnel.sh` | build `-L` forwards from config, run autossh |
-| VPN supervisor | `kiosk-host/host/fortivpn.py`, `kiosk-host/host/vpndrivers.py`, `scripts/forti-vpn-connect.py` | one supervisor for Fortinet/OpenVPN/WireGuard: classify output, reconnect with backoff, auth-lockout protection, sd_notify watchdog; creds via pinentry (Fortinet) or management socket (OpenVPN) |
+| VPN supervisor | `kiosk-host/host/fortivpn.py`, `kiosk-host/host/vpndrivers.py`, `scripts/forti-vpn-connect.py` | one supervisor for Fortinet/OpenVPN/WireGuard/iNode-H3C: classify output, reconnect with backoff, auth-lockout protection, sd_notify watchdog; creds via pinentry (Fortinet), management socket (OpenVPN), or `$H3C_SVPN_PASSWORD` (iNode) — never on argv; SHA-1/SHA-256 cert pins, gateway validated as hostname/IPv4/IPv6 |
 | Session | `scripts/start-session.sh`, `scripts/wayland-session.sh`, `scripts/xinitrc`, `scripts/launcher.sh`, `systemd/soc-wall.service` | dispatch X11/Wayland per `SOC_SESSION`, pick compositor, start + supervise the wall. Optionally run as a supervised systemd unit (`soc-wall.service`, generated by `setup.py`) with config baked in as `Environment=` (no `soc.env`) and `Restart=always` so a dead session self-recovers |
 
 ## Design rationale (Pi 5, 1 GB)
@@ -98,10 +120,13 @@ supervisor self-restart); only autologin + unit supervision are wired by hand.
 
 ## VPN supervisor
 
-openfortivpn has no stable exit codes for "auth failed" vs "network blip", so
-`host/fortivpn.py` runs it as a child and **classifies its log lines** (exact
-strings from openfortivpn 1.24: tunnel-up, two auth-failure variants, cert
-validation, closed-connection). The supervisor:
+The supervisor (`host/fortivpn.py`) drives one of four VPN backends selected by
+`vpn.type` (`fortinet` | `openvpn` | `wireguard` | `inode`), each a driver in
+`host/vpndrivers.py`. Process drivers (Fortinet, OpenVPN, iNode-H3C) have no
+stable exit codes for "auth failed" vs "network blip", so the supervisor runs
+them as a child and **classifies the log lines** (for openfortivpn 1.24: tunnel-up,
+two auth-failure variants, cert validation, closed-connection); WireGuard is a
+one-shot interface brought up/down and health-probed. The supervisor:
 
 - reconnects with **exponential backoff** on a normal drop;
 - on an **auth failure** holds for `SOC_VPN_AUTH_RETRY_DELAY` (default 300 s) —
@@ -112,8 +137,9 @@ validation, closed-connection). The supervisor:
 - speaks the **systemd notify** protocol (`Type=notify`, `READY=1`, `STATUS=…`,
   `WATCHDOG=1`) so `systemctl status forti-vpn` shows live state and a hung
   process is killed and restarted by the watchdog. Fresh vault creds (and OTP)
-  are fetched per attempt; the password only ever reaches openfortivpn through
-  the pinentry helper.
+  are fetched per attempt; the password reaches the backend only through the
+  pinentry helper (Fortinet), the management socket (OpenVPN), or
+  `$H3C_SVPN_PASSWORD` (iNode) — never on argv.
 
 ## Sessions, compositors & layout
 

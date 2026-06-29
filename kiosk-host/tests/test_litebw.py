@@ -84,6 +84,45 @@ def test_unsupported_kdf_raises():
         litebw.derive_master_key("pw", "a@b.com", 7, 1000)
 
 
+def test_pbkdf2_iterations_clamped_to_ceiling():
+    # A hostile prelogin can declare kdfIterations in the billions to pin the
+    # CPU for minutes. The 10M ceiling means anything above it computes the
+    # SAME key as exactly-10M (and never more work). Verified WITHOUT actually
+    # running a billion-iteration KDF by comparing against the explicit cap.
+    capped = litebw.derive_master_key("pw", "a@b.com", 0, 10_000_000)
+    over = litebw.derive_master_key("pw", "a@b.com", 0, 2_000_000_000)
+    assert over == capped
+    # And a value at/below the ceiling is unchanged (real vaults unaffected).
+    assert (litebw.derive_master_key("pw", "a@b.com", 0, 600000)
+            != capped)  # different iters -> different key (sanity)
+
+
+@_requires_argon2
+def test_argon2id_params_clamped_without_huge_allocation(monkeypatch):
+    # An unbounded kdfMemory (MiB) becomes memory_cost = memory*1024 KiB and a
+    # multi-TB allocation -> instant OOM. Capture the params handed to Argon2id
+    # instead of running them: memory clamps to 1024 MiB (-> 1024*1024 KiB),
+    # iterations to 10M, lanes to 16. derive() is stubbed so no real work runs.
+    import cryptography.hazmat.primitives.kdf.argon2 as argon2mod
+    seen = {}
+
+    class _FakeArgon2id:
+        def __init__(self, *, salt, length, iterations, lanes, memory_cost):
+            seen.update(iterations=iterations, lanes=lanes,
+                        memory_cost=memory_cost)
+
+        def derive(self, pw):
+            return b"\x00" * 32
+
+    monkeypatch.setattr(argon2mod, "Argon2id", _FakeArgon2id)
+    litebw.derive_master_key("pw", "a@b.com", 1,
+                             iterations=9_999_999_999,
+                             memory=8_000_000, parallelism=9999)
+    assert seen["iterations"] == 10_000_000
+    assert seen["lanes"] == 16
+    assert seen["memory_cost"] == 1024 * 1024   # 1024 MiB cap, in KiB
+
+
 # --------------------------------------------------------------------------- #
 # EncString decrypt — type 2 round-trip, MAC tamper, types 0/empty
 # --------------------------------------------------------------------------- #
@@ -264,6 +303,23 @@ def test_totp_uri_without_secret_raises():
         litebw.generate_totp("otpauth://totp/L?digits=6", at=59)
 
 
+# A poisoned otpauth URI (from a compromised/MITM'd server or a shared org item)
+# must NOT be able to DoS the 1GB board via 10**digits / // period. Each
+# malicious input becomes a clean ValueError BEFORE the dangerous math runs.
+@pytest.mark.parametrize("bad", [
+    f"otpauth://totp/L?secret={_RFC_SECRET}&digits=100000000",  # huge int/str
+    f"otpauth://totp/L?secret={_RFC_SECRET}&digits=0",          # 10**0 mod
+    f"otpauth://totp/L?secret={_RFC_SECRET}&digits=-1",         # negative
+    f"otpauth://totp/L?secret={_RFC_SECRET}&digits=abc",        # non-numeric
+    f"otpauth://totp/L?secret={_RFC_SECRET}&period=0",          # ZeroDivision
+    f"otpauth://totp/L?secret={_RFC_SECRET}&period=-5",         # negative
+    f"otpauth://totp/L?secret={_RFC_SECRET}&period=xyz",        # non-numeric
+])
+def test_totp_malicious_digits_period_rejected(bad):
+    with pytest.raises(ValueError):
+        litebw.generate_totp(bad, at=59)
+
+
 # --------------------------------------------------------------------------- #
 # config set — persists JSON, honors XDG_CONFIG_HOME, env override at read time
 # --------------------------------------------------------------------------- #
@@ -424,14 +480,18 @@ def test_get_master_falls_back_to_env_when_unsealed(monkeypatch):
     assert litebw.get_master() == "env-master"
 
 
-def test_get_master_degrades_on_secretstore_error(monkeypatch, capsys):
+def test_get_master_fails_closed_on_broken_seal(monkeypatch, capsys):
     def boom(*a, **k):
         raise litebw.secretstore.SecretStoreError("no machine-id")
     monkeypatch.setattr(litebw.secretstore, "is_sealed", lambda *a, **k: True)
     monkeypatch.setattr(litebw.secretstore, "unseal", boom)
     monkeypatch.setenv("SOC_VAULT_PASSWORD", "env-master")
-    # is_sealed True but unseal raises -> degrade to env (like pinentry-vault.py)
-    assert litebw.get_master() == "env-master"
+    # A host-bound seal EXISTS but won't unseal (wrong machine / corrupt). Provenance
+    # fail-closed: do NOT silently downgrade to a weaker source (env / secret-service);
+    # return "" and surface an actionable line so the operator re-seals. (Contract is
+    # still crash-free: get_master never raises.)
+    assert litebw.get_master() == ""
+    assert "did not unseal" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -567,3 +627,51 @@ def test_sync_401_reunlock_retry_success(monkeypatch):
 
     be.sync()
     assert be.get("wazuh") == ("admin", "s3cr3t")
+
+
+# --------------------------------------------------------------------------- #
+# Interactive unlock — sync() with no master must raise the catchable
+# VaultLockedError (NOT a generic VaultError), so the host can pop the themed
+# Unlock dialog instead of a cryptic fatal. Then unlock_with() opens a session.
+# --------------------------------------------------------------------------- #
+def test_sync_interactive_no_master_raises_vaultlocked(monkeypatch):
+    # Regression: sync()'s broad `except VaultSeedError` used to catch + wrap the
+    # VaultLockedError into a plain VaultError, swallowing the 'please unlock'
+    # signal so the host never popped the prompt. It must now propagate as-is.
+    monkeypatch.setenv("SOC_VAULT_INTERACTIVE", "1")
+    monkeypatch.setattr(litebw, "get_master", lambda *a, **k: "")  # no master
+    be = litebw.LitebwBackend()
+    be.unlock()                       # interactive + no master -> defers (no raise)
+    assert be._session is None
+    with pytest.raises(litebw.VaultLockedError):
+        be.sync()
+
+
+def test_unlock_with_opens_session(monkeypatch):
+    # The operator-supplied master from the Unlock dialog opens a ReadSession,
+    # then sync() populates the cache. The master is never written to a file.
+    be = litebw.LitebwBackend()
+    be.url, be.email = "http://vault.local", "kiosk@soc.local"
+    captured = {}
+
+    def fake_session(url, email, master):
+        captured.update(url=url, email=email, master=master)
+        return _FakeSession()
+    monkeypatch.setattr(litebw, "ReadSession", fake_session)
+    be.unlock_with("operator-typed-master")
+    assert captured["master"] == "operator-typed-master"
+    be.sync()
+    assert be.get("wazuh") == ("admin", "s3cr3t")
+
+
+def test_unlock_with_bad_password_raises_vaulterror(monkeypatch):
+    from host.vault import VaultError
+    be = litebw.LitebwBackend()
+    be.url, be.email = "http://vault.local", "kiosk@soc.local"
+
+    def bad_session(url, email, master):
+        raise VaultSeedError("login failed — check the email/master password")
+    monkeypatch.setattr(litebw, "ReadSession", bad_session)
+    with pytest.raises(VaultError):
+        be.unlock_with("wrong")
+    assert be._session is None

@@ -1,9 +1,155 @@
 # Changelog
 
 All notable changes to **p2soc** (the SOC video-wall kiosk). Format follows
-[Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0.
+[Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.2.0] - 2026-06-26
+
+A GUI + renderer overhaul: one unified control center, an honest launcher, a
+theme editor, browser security hardening, and a quieter, faster runtime.
+
+### Added
+
+- **Unified control center** — a single `.desktop` opens one themed launcher with
+  grouped *run / configure / system* sections: Setup, Appearance, Desktop/Kiosk
+  mode, **Install** and **Uninstall**. It adapts to install state (Install is the
+  hero on a fresh box, Run once installed). Privileged Install/Uninstall run via
+  `pkexec` and stream into a live themed progress window (PASS/FAIL + real exit
+  code); Uninstall double-confirms and lists exactly what it removes.
+- **Appearance editor** — theme presets + per-colour pickers with live preview,
+  persisted to `branding.yaml`; reachable at startup (own entry) and in-menu
+  (launcher tile + a wizard page).
+- **Honest launcher** — meaningful mode glyphs replace the numerals, a real health
+  dot (green/amber/red from vault + VPN + config state), an active-config line
+  showing what will actually launch, a pre-launch **Validate**, and a first-run
+  empty state that steers to Setup.
+- **Interactive "Unlock Vaultwarden" prompt** — when the wall starts and the vault
+  is locked / no master is sealed, it shows a themed master-password dialog (with
+  an opt-in "seal on this host for next boot") instead of the cryptic "no vault
+  master password" error. Setup now also configures Vaultwarden with a required
+  connection **Test** before it seals.
+- **Renderer site support** — persistent cookies + web storage so dashboards stay
+  logged in across reloads/restarts, JS + the features dashboards need, and
+  optional per-panel knobs (`persist`/`user_agent`/`allow`/`block_trackers`/`insecure_tls`).
+- **Dependabot** — weekly grouped dependency-update PRs (pip + GitHub Actions),
+  gated by CI; a tracked `requirements.txt` manifest.
+
+### Changed
+
+- **Config write = read** — one shared resolver (`host.configpaths`) used by both
+  the wizard (write) and the wall (read), so the config you save is the one the
+  wall launches; a fresh user config is never shadowed by a stale `/etc` one, and
+  the wizard tells you visibly if a save can't reach the wall.
+- **Lighter, smoother runtime** (baseline-benchmarked, no latency regression) — the
+  manifest drift-hash of the whole deploy tree moved off the GTK main thread (no
+  startup stall); FortiVPN reconnect reuses one bounded-TTL vault instead of a full
+  unseal+sync per attempt; a duplicate `panels.yaml` parse per health probe removed.
+
+### Security
+
+- **WebKit hardening + safe-site allowlist + tracker blocking** — sandbox,
+  fail-closed TLS (no silent cert bypass; opt-in per panel), no file/universal
+  access, mixed content blocked; top-level navigation restricted to an allowlist
+  (panel domain + SSO/redirects + config); the top-20 analytics/trackers are
+  dropped (smaller attack surface + less RAM/CPU). All session/web data lives in a
+  private `0700` dir.
+- Dependency audit — dropped unused `jq`/`wmctrl`/`xdotool` from every distro
+  family + package format; verified every remaining package name resolves.
+
+### Fixed
+
+- **Setup's Next/Back buttons were gone** — a custom `Gtk.HeaderBar` set via
+  `set_titlebar()` replaced the `Gtk.Assistant`'s own header bar, which is where it
+  keeps the navigation buttons, leaving the wizard with no way to advance. Dropped
+  the custom titlebar; the branded title is kept by a `notify::title` clamp.
+- **Setup config didn't reach the wall when run as a desktop user** — apply now
+  writes to a per-user location (with an `active` marker) that the resolver reads,
+  so a non-root Setup takes effect without needing root.
+- The launcher is now a **single `.desktop`** entry — Setup and Appearance are
+  reached through the control center, not separate desktop icons.
+- **Setup `.desktop` did nothing** — stale `/opt` code plus `Terminal=false`
+  hiding stderr; the launch path now surfaces any failure in a visible themed
+  dialog and returns to the launcher after Setup completes.
+- **`doctor` hid the real config error** — a `NameError` from an `except … as e`
+  lambda evaluated after the block exits masked the actual `panels.yaml` parse
+  error this check exists to report; fixed.
+- Dead code + unused imports removed across the host (each adversarially verified).
+
+## [1.1.0] - 2026-06-25
+
+The first feature release after the 1.0 baseline — and the fix for a 1.0.0
+packaging bug that omitted the host-bound seal module.
+
+### Added
+
+- **Pure-Python `litebw` vault backend + universal master source** — replaces the
+  Rust `rbw` (no compile/OOM on the 1 GB Pi); master from the sealed host-bound store /
+  freedesktop Secret Service (KWallet/GNOME-keyring/KeePassXC) / env, never plaintext `.env`.
+- **On-screen controls** (ported + adapted to single-VPN): kiosk **Lock** overlay
+  (PIN/TOTP), live **VPN-log viewer**, the **reconnect fix** (scoped sudoers + `sudo -n`
+  probe), `allowedOrigin` autofill gate, **nftables** fail-closed egress lockdown,
+  **manifest** tamper-detection, encrypted off-box **vault backup**, scanner **tarpit**.
+- **GTK setup wizard** (presets + live validation), a **green/white console theme**
+  (branding-driven + customizable), a clickable launcher menu, and a manifest-driven **uninstall**.
+- **Fail-safe launch** — a clear on-screen error (cause + **Open Setup**) when the wall
+  can't start, instead of a silent restart loop.
+- **Multi-arch release CI** — `deb`/`rpm`/`apk` (arm64/armhf/amd64) + source tarball on each `vX.Y.Z` tag.
+
+### Fixed
+
+- **Ship `kiosk-host/host/secretstore.py`** — the host-bound seal module was swallowed by
+  an over-broad `.gitignore` and missing from v1.0.0's repo + CI packages, breaking the
+  vault path on a fresh clone. `.gitignore` narrowed; the module is now tracked.
+
+### Security
+
+- Input/memory-safety hardening across the vault, VPN, and iNode parsers (KDF/TOTP/HTTP
+  DoS caps, atomic `0600` config-cache write), an adversarial whole-repo bug-hunter sweep,
+  and `make package-clean` so `__pycache__`/`.pyc` can never ship into packages.
+
+### Added (desktop/install batch)
+
+- **Desktop-friendly install + kiosk opt-in.** `install.sh` takes
+  `INSTALL_MODE=desktop|kiosk` (default **desktop**): desktop deploys everything
+  but leaves the systemd default target / tty1 autologin alone, so the existing
+  desktop environment keeps working; `INSTALL_MODE=kiosk` is the tty1-autologin
+  appliance takeover.
+- **Clickable launcher menu.** The `soc-wall.desktop` entry opens a small GTK
+  chooser (`scripts/soc-wall-menu` → `kiosk-host/host/launchermenu.py`) with
+  three actions — **Setup**, **Desktop mode** (windowed), **Kiosk mode**
+  (fullscreen) — in a modern style, with the SVG icon at
+  `share/icons/soc-wall.svg`.
+- **Manifest-driven uninstall + easy revert.** `./uninstall.sh` (and
+  `make uninstall`) removes the wall from the manifest recorded by `install.sh`
+  at `/etc/soc-display/.install-manifest`, **preserving operator data by
+  default** (`--purge` to wipe), restoring the boot target, and is idempotent.
+- **Rebranding via one file.** `branding/branding.yaml` + `host/branding.py` set
+  the name, tagline, icon, and accent colours in one place; it flows into the
+  launcher, the generated desktop entry, and the setup wizard. Override with
+  `/etc/soc-display/branding.yaml` or `SOC_BRANDING_FILE`.
+- **Fortinet `EVENT_CONNECTING` progress event** so the on-wall VPN pill reflects
+  the in-progress connect state, not just up/down.
+- **`tesseract` dependency** added to the installer for the iNode/H3C login
+  CAPTCHA path.
+
+### Changed
+
+- **Fortinet/openfortivpn robustness.** Trusted-cert pins accept **SHA-1 or
+  SHA-256**; the gateway is validated as a hostname / IPv4 / IPv6; a new optional
+  `vpn.interface` override; `--persistent` is opt-in.
+- **iNode/H3C client hardening sync** (`vendor/iNode-VPN-Client`): SPA wire-format
+  fix, 1 MiB frame-reassembly cap and BMP-dimension caps, a root-RCE-hardened
+  helper, and constant-time cert-pin comparison.
+
+### Security
+
+- iNode/H3C client: bounded frame reassembly (1 MiB) and BMP-dimension caps at the
+  parse boundary, a root-RCE-hardened privileged helper, and constant-time
+  cert-pin compare (no timing oracle).
+- Fortinet cert-pin compare made robust across SHA-1 and SHA-256 pins with strict
+  gateway validation.
+
+## [1.0.0] - 2026-06-25
 
 ### Release-readiness pass (Pi-5 / aarch64, pure-Python vault, packaged release)
 
@@ -128,7 +274,7 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
 - **All secrets in Vaultwarden, writable** (`host/vaultseed.py`): setup.py
   (`creds`) and the on-screen Settings can store each panel/VPN/proxy
   username+password (and a VPN config in Notes) directly in Vaultwarden over its
-  REST API — the wall still reads via rbw. Optional (`cryptography`); operator
+  REST API — the wall still reads via litebw (rbw legacy). Optional (`cryptography`); operator
   can still add logins in the web vault. The only on-disk secret is the
   unattended-unlock master password.
 - **Tabbed on-screen ⚙ Settings**: Panels (URL/title/vault/engine + advanced

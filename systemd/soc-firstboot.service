@@ -1,0 +1,42 @@
+# SOC video-wall first-boot setup page (runs once, on tty1).
+#
+# The "setup page is part of the app, used once": on a freshly-imaged host the
+# very first boot runs the interactive configuration (screen preset + panels, and
+# the vault PIN if it was not sealed at install) on the console BEFORE the kiosk
+# session takes tty1; it writes /etc/soc-display/.configured and every later boot
+# goes straight to the wall. The terminal equivalent is `./launch.sh` (which runs
+# the same setup.py firstboot when the marker is absent).
+#
+# install.sh templates @SOC_ROOT@ / @ETC@ and enables this unit. Ordering only:
+# a skipped / timed-out / failed setup never blocks the wall from coming up — the
+# kiosk session still starts (start-session.sh prints how to configure).
+[Unit]
+Description=SOC video-wall first-boot setup (once, on tty1)
+# Run ONLY while unconfigured — the condition self-skips once the marker exists.
+ConditionPathExists=!@ETC@/.configured
+# Configure before the kiosk session grabs tty1, under either boot model (getty
+# autologin or the supervised soc-wall.service). Before/After are ordering only —
+# nothing here is a hard dependency of the session.
+Before=getty@tty1.service
+Before=soc-wall.service
+After=network-online.target vaultwarden.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# Interactive on tty1.
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal+console
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+# Operator-driven wizard: give them time, but don't hang a headless boot forever.
+# Nothing is written until the wizard's final confirm, so a timeout writes no
+# partial config; the wall then comes up unconfigured and start-session.sh says how.
+TimeoutStartSec=1800
+ExecStart=@SOC_ROOT@/.venv/bin/python @SOC_ROOT@/setup.py firstboot --target pi
+
+[Install]
+WantedBy=multi-user.target

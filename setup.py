@@ -17,6 +17,7 @@ Usage:
   python3 setup.py                 # interactive menu (deploy / configure / diagnose / ...)
   python3 setup.py deploy          # full automated deployment, end to end
   python3 setup.py wizard          # just the configuration wizard
+  python3 setup.py wizard-gui      # the graphical configuration wizard (desktop window)
   python3 setup.py doctor          # diagnose an existing install
   python3 setup.py repair          # fix what doctor flags (packages / venv / keys)
   python3 setup.py creds           # store logins in Vaultwarden
@@ -41,6 +42,46 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.abspath(__file__))
+
+# The SHARED PROVISIONING CORE. Re-exported so the GUI (which loads setup.py as a
+# module) reaches the same step functions via `self.setup.provision_*` /
+# `self.setup.step_*` — the single place CLI + GUI call, no parallel logic. Pure
+# stdlib, so importing it here (before the venv) is safe. Best-effort: if the
+# file is ever missing, the CLI subcommands degrade rather than crash setup.py.
+try:
+    sys.path.insert(0, REPO)
+    import provision  # noqa: E402  — same dir as setup.py
+    # Flat re-export so the GUI (which loads setup.py as a module) can reach the
+    # core either as `self.setup.provision.step_users` OR `self.setup.step_users`
+    # / `self.setup.Opts` — both resolve to the SAME object, no drift.
+    Opts = provision.Opts
+    ProvResult = provision.ProvResult
+    Plan = provision.Plan
+    step_packages = provision.step_packages
+    step_users = provision.step_users
+    step_deploy = provision.step_deploy
+    step_units = provision.step_units
+    step_vault_running = provision.step_vault_running
+    step_vault_account = provision.step_vault_account
+    step_vault_seed = provision.step_vault_seed
+    step_seal = provision.step_seal
+    step_write_config = provision.step_write_config
+    provision_all = provision.provision_all
+    provision_plan = provision.plan
+except Exception:  # noqa: BLE001
+    provision = None  # type: ignore
+
+
+def _configpaths():
+    """The shared read/write-location resolver (host.configpaths). Imported lazily
+    via the same kiosk-host sys.path shim the rest of setup.py uses for host.* —
+    it is pure stdlib, so this works before the venv exists. The writer and the
+    reader resolve through this ONE module so they cannot disagree."""
+    if os.path.join(REPO, "kiosk-host") not in sys.path:
+        sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
+    from host import configpaths  # type: ignore
+    return configpaths
+
 
 # --------------------------------------------------------------------------- #
 # Terminal helpers
@@ -271,9 +312,37 @@ def write_file(path: str, content: str, mode: int, dry: bool):
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
     backup(path)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    os.chmod(path, mode)
+    # Atomic write (mirror backup.write_backup): stage into <path>.tmp in the SAME
+    # dir (so os.replace is a same-fs rename, no EXDEV), fsync, force the final
+    # mode, then replace — so an interrupted write (power loss / ENOSPC / kill) on
+    # the Pi's SD card never leaves a truncated panels.yaml/soc.env live. A real
+    # failure still surfaces (the tmp is removed and the error re-raised — never
+    # swallowed); the old file stays intact.
+    tmp = path + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.write(fd, content.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # Durability across a power cut: fsync the parent dir so the rename is on disk.
+    try:
+        dfd = os.open(parent or ".", os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass  # not all platforms/filesystems allow dir-fsync; best effort only
     ok(f"wrote {path}  ({oct(mode)[2:]})")
 
 
@@ -370,6 +439,92 @@ def envq(v) -> str:
     return "'" + v.replace("'", "'\\''") + "'"
 
 
+# Cap mirrors kiosk-host/host/config.py MAX_VPNS; a name must start alphanumeric
+# (it becomes the supervisor key / status-pill row / log tag downstream).
+MAX_VPNS = 8
+_VPN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def cfg_vpns(cfg: dict) -> list:
+    """The authoritative vpns[] list for a setup cfg, normalising a legacy single
+    `vpn: {}` (back-compat) into a one-entry list. Mirrors config._normalize_vpns
+    so the CLI/GUI agree with what the wall actually parses."""
+    if cfg.get("vpns") is not None:
+        v = cfg.get("vpns")
+        return list(v) if isinstance(v, list) else []
+    single = cfg.get("vpn")
+    if isinstance(single, dict) and single:
+        return [single]
+    return []
+
+
+def _vpn_is_plain_single(v: dict) -> bool:
+    """True when a lone VPN can round-trip as a legacy `vpn: {}` block: its only
+    extra keys (name/default_route) are the parse-time defaults. Mirrors
+    config._vpn_is_plain_single so single-VPN configs stay byte-stable."""
+    if not isinstance(v, dict):
+        return False
+    if v.get("default_route"):
+        return False
+    nm = str(v.get("name", "") or "").strip()
+    return nm in ("", "vpn")
+
+
+def _emit_vpn_body(L: list, v: dict, *, with_name: bool, pad: str):
+    """Append the body of ONE VPN entry, each key prefixed with `pad` (two spaces
+    for a single `vpn:` block, four for a `vpns:` list item). `with_name` emits the
+    `name`/`default_route` identity keys (list form only)."""
+    vtype = v.get("type", "fortinet")
+    if with_name:
+        L.append(f"{pad}name: {yq(v.get('name', ''))}")
+    L.append(f"{pad}enabled: {str(bool(v.get('enabled'))).lower()}")
+    if not v.get("enabled"):
+        return
+    L.append(f"{pad}type: {vtype}")
+    if with_name and v.get("default_route"):
+        L.append(f"{pad}default_route: true")
+    if vtype == "openvpn":
+        L.append(f"{pad}config: {yq(v['config'])}")
+        L.append(f"{pad}vault_item: {yq(v.get('vault_item', ''))}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}set_routes: {str(bool(v.get('set_routes', True))).lower()}")
+        L.append(f"{pad}extra_args: []")
+    elif vtype == "wireguard":
+        L.append(f"{pad}config: {yq(v['config'])}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}health_check_interval: {v.get('health_check_interval', 30)}")
+        L.append(f"{pad}health_check_failures: {v.get('health_check_failures', 3)}")
+    elif vtype == "inode":
+        L.append(f"{pad}gateway: {yq(v['gateway'])}")
+        L.append(f"{pad}port: {v.get('port', 443)}")
+        L.append(f"{pad}vault_item: {yq(v['vault_item'])}")
+        if v.get("config"):
+            L.append(f"{pad}config: {yq(v['config'])}")
+        if v.get("domain"):
+            L.append(f"{pad}domain: {yq(v['domain'])}")
+        L.append(f"{pad}trusted_cert: {yq(v.get('trusted_cert', ''))}")
+        L.append(f"{pad}insecure: {str(bool(v.get('insecure', False))).lower()}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}health_check_interval: {v.get('health_check_interval', 0)}")
+        L.append(f"{pad}health_check_failures: {v.get('health_check_failures', 3)}")
+        L.append(f"{pad}extra_args: []")
+    else:  # fortinet
+        L.append(f"{pad}gateway: {yq(v['gateway'])}")
+        L.append(f"{pad}port: {v['port']}")
+        L.append(f"{pad}vault_item: {yq(v['vault_item'])}")
+        L.append(f"{pad}trusted_cert: {yq(v.get('trusted_cert', ''))}")
+        L.append(f"{pad}realm: {yq(v.get('realm', ''))}")
+        L.append(f"{pad}set_routes: {str(bool(v['set_routes'])).lower()}")
+        L.append(f"{pad}set_dns: {str(bool(v['set_dns'])).lower()}")
+        L.append(f"{pad}half_internet_routes: {str(bool(v['half_internet_routes'])).lower()}")
+        L.append(f"{pad}persistent: {v['persistent']}")
+        L.append(f"{pad}otp_from_vault: {str(bool(v['otp_from_vault'])).lower()}")
+        L.append(f"{pad}ready_probe: {yq(v.get('ready_probe', ''))}")
+        L.append(f"{pad}health_check_interval: {v.get('health_check_interval', 0)}")
+        L.append(f"{pad}health_check_failures: {v.get('health_check_failures', 3)}")
+        L.append(f"{pad}extra_args: []")
+
+
 def render_panels_yaml(cfg: dict) -> str:
     d = cfg["display"]
     L = []
@@ -429,54 +584,27 @@ def render_panels_yaml(cfg: dict) -> str:
         L.append(f"  identity: {yq(t['identity'])}")
         L.append("  extra_forwards: []")
     L.append("")
-    # vpn
-    v = cfg["vpn"]
-    vtype = v.get("type", "fortinet")
-    L.append("# VPN — supervised tunnel (Fortinet / OpenVPN / WireGuard / iNode), run as root")
-    L.append("vpn:")
-    L.append(f"  enabled: {str(bool(v['enabled'])).lower()}")
-    if v["enabled"]:
-        L.append(f"  type: {vtype}")
-        if vtype == "openvpn":
-            L.append(f"  config: {yq(v['config'])}")
-            L.append(f"  vault_item: {yq(v.get('vault_item', ''))}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  set_routes: {str(bool(v.get('set_routes', True))).lower()}")
-            L.append("  extra_args: []")
-        elif vtype == "wireguard":
-            L.append(f"  config: {yq(v['config'])}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  health_check_interval: {v.get('health_check_interval', 30)}")
-            L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
-        elif vtype == "inode":
-            L.append(f"  gateway: {yq(v['gateway'])}")
-            L.append(f"  port: {v.get('port', 443)}")
-            L.append(f"  vault_item: {yq(v['vault_item'])}")
-            if v.get("config"):
-                L.append(f"  config: {yq(v['config'])}")
-            if v.get("domain"):
-                L.append(f"  domain: {yq(v['domain'])}")
-            L.append(f"  trusted_cert: {yq(v.get('trusted_cert', ''))}")
-            L.append(f"  insecure: {str(bool(v.get('insecure', False))).lower()}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  health_check_interval: {v.get('health_check_interval', 0)}")
-            L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
-            L.append("  extra_args: []")
-        else:  # fortinet
-            L.append(f"  gateway: {yq(v['gateway'])}")
-            L.append(f"  port: {v['port']}")
-            L.append(f"  vault_item: {yq(v['vault_item'])}")
-            L.append(f"  trusted_cert: {yq(v.get('trusted_cert', ''))}")
-            L.append(f"  realm: {yq(v.get('realm', ''))}")
-            L.append(f"  set_routes: {str(bool(v['set_routes'])).lower()}")
-            L.append(f"  set_dns: {str(bool(v['set_dns'])).lower()}")
-            L.append(f"  half_internet_routes: {str(bool(v['half_internet_routes'])).lower()}")
-            L.append(f"  persistent: {v['persistent']}")
-            L.append(f"  otp_from_vault: {str(bool(v['otp_from_vault'])).lower()}")
-            L.append(f"  ready_probe: {yq(v.get('ready_probe', ''))}")
-            L.append(f"  health_check_interval: {v.get('health_check_interval', 0)}")
-            L.append(f"  health_check_failures: {v.get('health_check_failures', 3)}")
-            L.append("  extra_args: []")
+    # vpn / vpns — emit a single `vpn:` block when there is exactly one plainly
+    # named, non-default-route VPN (byte-stable with legacy one-VPN tooling), else
+    # a `vpns:` list. Mirrors config._emit_vpns so the wall re-parses it identically.
+    vpns = cfg_vpns(cfg)
+    if len(vpns) == 1 and _vpn_is_plain_single(vpns[0]):
+        L.append("# VPN — supervised tunnel (Fortinet / OpenVPN / WireGuard / iNode), run as root")
+        L.append("vpn:")
+        _emit_vpn_body(L, vpns[0], with_name=False, pad="  ")
+    elif vpns:
+        L.append("# VPNs — N supervised tunnels; each VPN owns its own (split-tunnel) routes.")
+        L.append("# Mark exactly one default_route: true to give it the catch-all 0.0.0.0/0 route.")
+        L.append("vpns:")
+        for v in vpns:
+            start = len(L)
+            _emit_vpn_body(L, v, with_name=True, pad="    ")
+            # turn the first body line of this entry into the `- ` list item
+            L[start] = "  - " + L[start][4:]
+    else:
+        # vpn-less config stays vpn-less — emit NO vpn:/vpns: block so the wall
+        # parses conf.vpns == [] (no VPN service wanted), not a disabled stub.
+        L.append("# VPN — none configured.")
     L.append("")
     # proxy
     pr = cfg.get("proxy") or {"enabled": False}
@@ -734,12 +862,75 @@ def _fetch_cert_digest(host: str, port: int) -> str:
     return ""
 
 
-def section_vpn(prev) -> dict:
-    step(4, 7, "VPN (Fortinet / OpenVPN / WireGuard / iNode)")
-    note("One supervised tunnel so VPN-side panels can use mode: direct.")
-    pv = (prev or {}).get("vpn", {}) if prev else {}
-    if not ask_bool("Enable a VPN?", bool(pv.get("enabled", False))):
-        return dict(enabled=False)
+def section_vpns(prev) -> list:
+    """Configure the vpns[] LIST: add up to MAX_VPNS independent VPNs (any mix of
+    types), each named, validated, with an at-most-one default_route owner. Returns
+    a list of per-entry dicts. Back-compat: a legacy single `vpn: {}` in `prev` is
+    surfaced as the first entry's defaults via cfg_vpns()."""
+    step(4, 7, "VPNs (Fortinet / OpenVPN / WireGuard / iNode)")
+    note("Each VPN is an independent supervised tunnel; VPN-side panels use mode: direct.")
+    note("Multiple VPNs split-tunnel by default — each owns only its own routes.")
+    prev_vpns = cfg_vpns(prev or {})
+    if not prev_vpns:
+        if not ask_bool("Enable a VPN?", False):
+            return []
+    else:
+        note(f"{len(prev_vpns)} VPN(s) configured previously.")
+        if not ask_bool("Keep VPN(s) enabled?", True):
+            return []
+
+    out: list = []
+    used_names: set = set()
+    # default_route is re-decided fresh below so the at-most-one guard is honest.
+    route_taken = False
+    i = 0
+    while len(out) < MAX_VPNS:
+        pv = prev_vpns[i] if i < len(prev_vpns) else {}
+        print()
+        print(cyan(f"   ── VPN {len(out) + 1} ──"))
+        # name — unique, identity key for the supervisor/pill/logs
+        default_name = str(pv.get("name", "") or "").strip() or (
+            "vpn" if not out else f"vpn{len(out) + 1}")
+
+        def _v_name(s, _used=used_names):
+            s = s.strip()
+            if not _VPN_NAME_RE.match(s):
+                return "name must start alphanumeric (letters/digits/._- only, no spaces)"
+            if s.lower() in _used:
+                return f"name {s!r} already used — each VPN name must be unique"
+            return None
+        name = ask("VPN name (identity key)", default_name, allow_empty=False,
+                   validate=_v_name)
+        used_names.add(name.lower())
+
+        entry = _prompt_one_vpn(pv)
+        entry["name"] = name
+        # default_route — at most one owner; suppress the prompt once taken
+        if not route_taken:
+            if ask_bool("Make this the default-route owner (full-tunnel 0.0.0.0/0)?",
+                        bool(pv.get("default_route", False))):
+                entry["default_route"] = True
+                route_taken = True
+            else:
+                entry["default_route"] = False
+        else:
+            entry["default_route"] = False
+        out.append(entry)
+        ok(f"VPN {name} configured")
+
+        i += 1
+        if len(out) >= MAX_VPNS:
+            note(f"reached the {MAX_VPNS}-VPN cap.")
+            break
+        if not ask_bool("Add another VPN?", i < len(prev_vpns)):
+            break
+    return out
+
+
+def _prompt_one_vpn(pv: dict) -> dict:
+    """Prompt the per-type fields for ONE VPN (the body shared by the list loop).
+    Returns the type-specific dict with enabled=True (no name/default_route — the
+    caller adds those)."""
     vtype = ask_choice("VPN type", ["fortinet", "openvpn", "wireguard", "inode"],
                        pv.get("type", "fortinet"))
     if vtype == "openvpn":
@@ -940,7 +1131,7 @@ def validate_panels(panels_path: str):
                  for p in conf.panels]
         ok(f"config parses — {len(conf.panels)} panels, "
            f"tunnel={'on' if conf.tunnel.get('enabled') else 'off'}, "
-           f"vpn={'on' if (conf.vpn or {}).get('enabled') else 'off'}")
+           f"vpn={sum(1 for v in (conf.vpns or []) if v.get('enabled'))} enabled")
         note("geometry: " + "  ".join(geoms))
     except Exception as e:  # noqa: BLE001
         err(f"generated config did NOT parse: {e}")
@@ -963,12 +1154,11 @@ def post_actions(env: Env, cfg: dict, target: str, dry: bool):
         note("dry-run: skipping actions")
         return
     if env.has_apt and ask_bool("Run the installer (sudo ./install.sh) now?", False):
-        installer = os.path.join(REPO, "install.sh")
         _run((["./install.sh"] if env.is_root else ["sudo", "./install.sh"]))
     if target == "dev":
         if ask_bool("Seed the dev vault (make dev-vault)?", True):
             _run(["make", "dev-vault"])
-        if cfg["vpn"].get("enabled") and ask_bool("Dry-run the VPN wiring (make vpn-check)?", True):
+        if any(v.get("enabled") for v in cfg_vpns(cfg)) and ask_bool("Dry-run the VPN wiring (make vpn-check)?", True):
             _run(["make", "vpn-check"])
         if ask_bool("Run the headless end-to-end check (make verify)?", False):
             _run(["make", "verify"])
@@ -989,9 +1179,10 @@ def _vault_items(cfg: dict):
     for p in cfg.get("panels", []):
         if p.get("vault_item"):
             items.append(("panel", p["vault_item"], p.get("url", "")))
-    v = cfg.get("vpn") or {}
-    if v.get("enabled") and v.get("vault_item"):
-        items.append(("vpn", v["vault_item"], ""))
+    for v in cfg_vpns(cfg):
+        if v.get("enabled") and v.get("vault_item"):
+            label = "vpn:" + str(v.get("name", "")) if v.get("name") else "vpn"
+            items.append((label, v["vault_item"], ""))
     pr = cfg.get("proxy") or {}
     if pr.get("enabled") and pr.get("vault_item"):
         items.append(("proxy", pr["vault_item"], pr.get("url", "")))
@@ -1010,6 +1201,18 @@ def _resolve_master(soc_env: dict) -> str:
             return secretstore.unseal(sd)
     except Exception as e:  # noqa: BLE001
         warn(f"could not unseal the master ({e}); enter it manually")
+    # No usable seal. In a NON-INTERACTIVE context (--defaults, or piped/EOF
+    # stdin) we must NOT invent a master: ask_secret would return the literal
+    # "CHANGE-ME" default (a truthy placeholder that downstream would register as
+    # the real master) or block on getpass. Fail closed — return "" so the caller
+    # skips the account/seal step and the operator seals it explicitly instead.
+    non_interactive = ASSUME_DEFAULTS or not (
+        sys.stdin.isatty() and sys.stdout.isatty())
+    if non_interactive:
+        warn("no usable vault master (not sealed) and not interactive — refusing "
+             "to use a placeholder; seal it first (python3 setup.py first-run) "
+             "or pass --master-fd")
+        return ""
     return ask_secret("vault master password (used now, not stored)")
 
 
@@ -1132,11 +1335,24 @@ def _alive(url):
 
 def cmd_doctor(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
-    soc_env = load_env_file(paths["soc_env"])
+    # Doctor must diagnose the file the WALL ACTUALLY READS (the shared resolver),
+    # not just where the wizard would write — so a write/read mismatch surfaces
+    # instead of being masked. Fall back to the write target if nothing is resolved.
+    cp = _configpaths()
+    read_env, env_label = cp.resolve_read("env")
+    read_panels, panels_label = cp.resolve_read("panels")
+    soc_env_path = read_env or paths["soc_env"]
+    panels_path = read_panels or paths["panels_installed"]
+    soc_env = load_env_file(soc_env_path)
     banner("SOC video-wall · doctor")
-    print(f"   target {bold(target)}   soc.env {paths['soc_env']}")
+    print(f"   target {bold(target)}   soc.env {soc_env_path} ({env_label})")
+    print(f"   panels {panels_path} ({panels_label})")
+    # If the wizard's write target differs from what the wall reads, say so loudly.
+    if (read_panels and os.path.abspath(read_panels) != os.path.abspath(paths["panels_installed"])):
+        warn(f"the wall reads {read_panels} but the wizard would write "
+             f"{paths['panels_installed']} — run `python3 -m host.configpaths --explain`")
     d = _Doc()
 
     d.check("venv + Python deps", lambda: _probe_venv(paths.get("soc_root", REPO) + "/.venv/bin/python")
@@ -1173,28 +1389,32 @@ def cmd_doctor(args) -> int:
     try:
         sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
         from host import config as hostcfg  # type: ignore
-        conf = hostcfg.load(paths["panels_installed"])
+        conf = hostcfg.load(panels_path)
         d.check("panels.yaml parses", lambda: (
             "OK", f"{len(conf.panels)} panels"
             + (f", {len(conf.warnings)} warning(s)" if conf.warnings else ""), ""))
-        vpn = conf.vpn or {}
-        if vpn.get("enabled"):
+        # Per-VPN client checks — iterate the WHOLE vpns[] list so a missing client
+        # for the 3rd VPN is caught, not just the primary (conf.vpns[0]).
+        for vpn in (conf.vpns or []):
+            if not vpn.get("enabled"):
+                continue
             kind = hostcfg.vpn_kind(vpn)
+            nm = str(vpn.get("name", "") or "vpn")
             if kind == "inode":
                 script = hostcfg.inode_script(vpn)
-                d.check("iNode client (svpn-connect.sh)", lambda: (
+                d.check(f"iNode client (svpn-connect.sh) [{nm}]", lambda script=script: (
                     ("OK", script, "")
                     if os.path.isfile(script) and os.access(script, os.X_OK)
                     else ("FAIL", f"missing/not executable: {script}",
                           "ship vendor/iNode-VPN-Client or set vpn.config")))
-                d.check("tesseract (iNode login CAPTCHA)", lambda: (
+                d.check(f"tesseract (iNode login CAPTCHA) [{nm}]", lambda: (
                     ("OK", "on PATH", "") if _have("tesseract")
                     else ("WARN", "not installed", "install tesseract-ocr — the "
                           "gateway CAPTCHA cannot be auto-solved without it")))
             else:
                 need = {"fortinet": "openfortivpn", "openvpn": "openvpn",
                         "wireguard": "wg-quick"}[kind]
-                d.check(f"VPN client ({kind})", lambda: (
+                d.check(f"VPN client ({kind}) [{nm}]", lambda need=need: (
                     ("OK", f"{need} present", "") if _have(need)
                     else ("FAIL", f"{need} not installed",
                           f"install {need} (setup.py repair)")))
@@ -1210,7 +1430,10 @@ def cmd_doctor(args) -> int:
                 else ("FAIL", f"missing: {ident or '(unset)'}",
                       "setup.py repair  (generates a restricted ed25519 key)")))
     except Exception as e:  # noqa: BLE001
-        d.check("panels.yaml parses", lambda: ("FAIL", str(e),
+        # Bind the message now: `e` is del'd when this except block exits, so a
+        # lambda closing over `e` would NameError when d.check runs it later.
+        err = str(e)
+        d.check("panels.yaml parses", lambda: ("FAIL", err,
                 "fix the config / run the wizard: setup.py"))
 
     # vault reachability + master password sanity
@@ -1274,8 +1497,9 @@ def cmd_doctor(args) -> int:
         d.check("config source", lambda: (
             "OK", f"vault note '{item}' (local file fallback)", ""))
 
-    # file perms
-    for f, want in ((paths["soc_env"], 0o640),):
+    # file perms — soc.env is non-secret (master sealed separately) and 0644 so
+    # the desktop/kiosk user can source it; the check ceiling allows 0644.
+    for f, want in ((paths["soc_env"], 0o644),):
         if os.path.exists(f):
             d.check(f"perms {os.path.basename(f)}", (lambda f=f, want=want: (
                 ("OK", oct(os.stat(f).st_mode & 0o777), "")
@@ -1292,7 +1516,79 @@ def cmd_doctor(args) -> int:
                 subprocess.run(["systemctl", "is-active", u], capture_output=True,
                                text=True).stdout.strip() or "unknown")))
 
+    # Reconnect path: the sudoers drop-in is what lets the unprivileged kiosk
+    # user restart forti-vpn / autossh-tunnel / soc-tarpit live (the ⚙ Settings
+    # "Save"/reconnect button) and read their journal. Report whether the rule
+    # is present AND, when we can test it, whether `sudo -n systemctl restart`
+    # actually resolves for the kiosk user. install.sh drops it in via a
+    # visudo-validated temp-file move; a missing/invalid file just degrades the
+    # button to a "PENDING restart" message (no functional break).
+    if _have("sudo"):
+        dropin = "/etc/sudoers.d/soc-wall-restart"
+        kiosk_user = soc_env.get("SOC_KIOSK_USER") or os.environ.get("SOC_KIOSK_USER") or "soc"
+
+        def _sudoers_reconnect():
+            if not os.path.exists(dropin):
+                return ("WARN", f"{dropin} not present",
+                        "install.sh installs it (visudo-validated); the reconnect "
+                        "button falls back to a PENDING-restart message without it")
+            # File present. Try a non-interactive dry probe of the granted command
+            # so we report whether the rule actually RESOLVES for the kiosk user.
+            #   * running AS the kiosk user (or dev): probe directly.
+            #   * running as root: probe via `sudo -u <kiosk> -n` so we test the
+            #     rule, not root's blanket privileges.
+            probe = ["sudo", "-n", "-l", "/usr/bin/systemctl", "restart",
+                     "forti-vpn.service"]
+            import getpass
+            try:
+                cur = getpass.getuser()
+            except Exception:  # noqa: BLE001
+                cur = ""
+            if env.is_root and cur != kiosk_user:
+                # Only test through the kiosk user if it exists.
+                user_ok = subprocess.run(["id", "-u", kiosk_user],
+                                         capture_output=True, text=True).returncode == 0
+                if user_ok:
+                    probe = ["sudo", "-u", kiosk_user, "-n", "-l",
+                             "/usr/bin/systemctl", "restart", "forti-vpn.service"]
+                else:
+                    return ("OK", f"{dropin} present (kiosk user "
+                            f"'{kiosk_user}' not created yet)", "")
+            try:
+                r = subprocess.run(probe, capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as e:
+                return ("WARN", f"present but probe failed ({e})", "")
+            if r.returncode == 0:
+                return ("OK", f"{dropin} present; sudo -n systemctl restart works", "")
+            return ("WARN",
+                    f"{dropin} present but `sudo -n systemctl restart` denied for "
+                    f"'{kiosk_user}'",
+                    "visudo -c /etc/sudoers.d/soc-wall-restart; check the user field "
+                    "matches your kiosk user")
+        d.check("reconnect sudoers rule", _sudoers_reconnect)
+
+    # Fresh-box detection: if the kiosk/desktop/service users or /opt/soc-display
+    # are missing, this box has never been fully installed — `repair` only patches
+    # an existing install, so steer the operator to the full-install path
+    # (provision == the GUI's "Install on this system": users + packages + deploy +
+    # vault + seal). repair/doctor alone won't create users or deploy /opt.
+    fresh_box = False
+    if provision is not None:
+        try:
+            kiosk_u = soc_env.get("SOC_KIOSK_USER") or "soc"
+            no_users = not any(provision._user_exists(u)
+                               for u in (kiosk_u, "socwall", "socsvc"))
+            no_opt = not os.path.isdir("/opt/soc-display")
+            fresh_box = no_users or no_opt
+        except Exception:  # noqa: BLE001
+            fresh_box = False
+
     print()
+    if fresh_box:
+        warn("this box is not fully installed yet (missing users and/or /opt/soc-display)")
+        print(dim("   run: setup.py provision  "
+                   "(full install: users + packages + deploy + vault + seal)"))
+        print(dim("   or:  setup.py provision --dry-run   (preview, changes nothing)"))
     if d.fails:
         print(red(f"   {d.fails} problem(s), {d.warns} warning(s) — run: setup.py repair"))
         return 1
@@ -1302,7 +1598,7 @@ def cmd_doctor(args) -> int:
 
 def cmd_repair(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
     root = paths.get("soc_root", REPO)
     banner("SOC video-wall · repair")
@@ -1349,8 +1645,9 @@ def cmd_repair(args) -> int:
             _run([backend, "config", "set", "pinentry", paths["pinentry"]])
             ok(f"{backend} pinentry -> pinentry-vault.py")
 
-    # 4) file perms
-    for f, mode in ((paths["soc_env"], 0o640),):
+    # 4) file perms — soc.env 0644 (non-secret) so the desktop/kiosk user can
+    #    source it; repairing to 0640 would re-break desktop-mode vault unlock.
+    for f, mode in ((paths["soc_env"], 0o644),):
         if os.path.exists(f) and not env.is_root and target == "pi":
             note(f"(need root to chmod {f})")
         elif os.path.exists(f):
@@ -1387,6 +1684,21 @@ def cmd_repair(args) -> int:
 
     print()
     note("re-run `setup.py doctor` to confirm.")
+    # repair only patches an EXISTING install (venv/packages/keys/perms). A fresh
+    # box with no kiosk/desktop/service users or no /opt/soc-display needs the
+    # full-install path instead — the same provisioner the GUI's "Install on this
+    # system" runs (users + packages + deploy + vault + seal).
+    if provision is not None:
+        try:
+            kiosk_u = soc_env.get("SOC_KIOSK_USER") or "soc"
+            fresh_box = (not os.path.isdir("/opt/soc-display")) or not any(
+                provision._user_exists(u) for u in (kiosk_u, "socwall", "socsvc"))
+        except Exception:  # noqa: BLE001
+            fresh_box = False
+        if fresh_box:
+            note("this looks like a fresh box — a full install needs "
+                 "`setup.py provision` (users + packages + deploy + vault + seal), "
+                 "not just repair.")
     return 0
 
 
@@ -1407,10 +1719,38 @@ def cmd_install(args) -> int:
     return cmd_doctor(args)
 
 
+def _gui_available() -> bool:
+    """True if a graphical setup is launchable: a display AND GTK3 importable.
+    Pure stdlib — we only check for $DISPLAY/$WAYLAND_DISPLAY here; the actual
+    gi import is left to the GUI process (which degrades on its own too)."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def cmd_wizard_gui(args) -> int:
+    """Launch the graphical setup wizard (scripts/soc-wall-setup-gui.sh).
+
+    The GUI reuses this module's renderers/validators + the host secret store,
+    so it writes the SAME artifacts as `wizard`. Pure stdlib here: if there is
+    no display (or the launcher script is missing), degrade gracefully to the
+    TTY wizard so scripted/headless runs still work."""
+    gui_sh = os.path.join(REPO, "scripts", "soc-wall-setup-gui.sh")
+    if not _gui_available():
+        note("no graphical display detected — falling back to the text wizard")
+        return cmd_wizard(args)
+    if not os.path.exists(gui_sh):
+        note(f"GUI launcher not found ({gui_sh}) — falling back to the text wizard")
+        return cmd_wizard(args)
+    rc = _run([gui_sh])
+    if rc not in (0, None):
+        warn("the graphical wizard exited with an error — falling back to the text wizard")
+        return cmd_wizard(args)
+    return rc or 0
+
+
 def cmd_menu(args) -> int:
     """Interactive launcher — the default when run with no subcommand on a TTY."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     banner("SOC video-wall · setup")
     print(f"   target   : {bold(target)}  "
           f"({'Raspberry Pi / root' if target == 'pi' else 'dev workstation'})")
@@ -1420,6 +1760,7 @@ def cmd_menu(args) -> int:
         ("deploy", "Deploy", "full automated install + configure + seal PIN + credentials"),
         ("clean", "Clean deploy", "wipe generated config/state, then deploy fresh"),
         ("wizard", "Configure", "edit panels, vault, VPN, proxy (writes the config files)"),
+        ("wizard-gui", "Configure (graphical)", "the same wizard in a desktop window (presets + live validation)"),
         ("first-run", "First-time setup", "generate the one-time PIN + seal the master password"),
         ("doctor", "Diagnose", "check this install and report problems"),
         ("repair", "Repair", "install missing packages / venv / keys doctor flagged"),
@@ -1449,7 +1790,8 @@ def cmd_menu(args) -> int:
     if choice == "clean":
         args.clean = True
         return cmd_deploy(args)
-    return {"deploy": cmd_deploy, "wizard": cmd_wizard, "doctor": cmd_doctor,
+    return {"deploy": cmd_deploy, "wizard": cmd_wizard,
+            "wizard-gui": cmd_wizard_gui, "doctor": cmd_doctor,
             "repair": cmd_repair, "creds": cmd_creds,
             "first-run": cmd_firstrun}[choice](args)
 
@@ -1468,12 +1810,141 @@ def _unseal_master(secret_dir, prompt_label=None) -> str:
     return ask_secret(prompt_label) if prompt_label else ""
 
 
+class SealMasterError(Exception):
+    """A seal/store step failed (bad input, locked wallet, missing crypto, …).
+    Carries a human-readable message both wizards surface to the operator."""
+
+
+def seal_master(pw, *, source, pin, paths, soc_env, backend, dry) -> str:
+    """Non-interactive seal/store CORE shared by the TTY first-run wizard and the
+    GUI, so the two CANNOT drift. Given an already-collected master ``pw`` and the
+    chosen ``source`` (auto|sealed|secret-service|env), it performs the mechanical
+    work: seal/store + verify-unseal + ``rewrite_env(SOC_MASTER_SOURCE)`` + (for
+    rbw/litebw) the email/base_url/pinentry client config + scrubbing any leftover
+    plaintext ``SOC_VAULT_PASSWORD`` out of soc.env once the seal is confirmed.
+
+    It NEVER prompts and NEVER writes the master to a file (only the SOURCE name
+    is recorded). Returns the PIN actually used (the passed-in PIN, or a freshly
+    generated one for the sealed path; '' for the secret-service / env sources).
+    Raises ``SealMasterError`` on any hard failure. ``dry`` short-circuits every
+    side effect (no seal, no store, no rewrite) but still returns the PIN that
+    would have been used so a caller can preview it.
+
+    ``source`` 'auto' is materialised by sealing host-bound (the unattended
+    default) while RECORDING 'auto' in soc.env (so the secret-service -> env
+    runtime fallbacks survive if the seal is ever removed)."""
+    sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
+    try:
+        from host import mastersource, secretstore  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        raise SealMasterError(f"cannot load the secret store ({e})")
+
+    record_src = source
+    eff_src = "sealed" if source == "auto" else source
+    env_mode = paths.get("env_mode", 0o600)
+
+    if eff_src == "env":
+        # DEV/seeding only — nothing to seal/store; record the source choice.
+        if not dry:
+            rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": "env"},
+                        mode=env_mode)
+        return ""
+
+    if eff_src == "secret-service":
+        if not mastersource._have_secret_tool():
+            raise SealMasterError(
+                "secret-tool (libsecret) is not on PATH — install it "
+                "(apt: libsecret-tools; dnf/pacman/apk/xbps: libsecret), or pick "
+                "the 'sealed' source. Nothing stored.")
+        if not pw:
+            raise SealMasterError("no master password entered — nothing stored")
+        if not dry:
+            try:
+                mastersource.store_master(pw, "secret-service")
+                if mastersource.get_master("secret-service") != pw:
+                    raise mastersource.MasterSourceError(
+                        "stored value did not read back — wallet locked?")
+            except mastersource.MasterSourceError as e:
+                raise SealMasterError(f"could not store the master in the wallet: {e}")
+            updates = {"SOC_MASTER_SOURCE": "secret-service"}
+            removes = ("SOC_VAULT_PASSWORD",) if soc_env.get("SOC_VAULT_PASSWORD") else ()
+            rewrite_env(paths["soc_env"], remove=removes, set_kv=updates, mode=env_mode)
+            if backend in ("rbw", "litebw") and _have(backend):
+                _run([backend, "config", "set", "pinentry", paths["pinentry"]])
+        return ""
+
+    # eff_src == 'sealed' — the host-bound seal path. Needs cryptography.
+    if not secretstore.available():
+        raise SealMasterError(
+            "the 'cryptography' package is required to seal the master password "
+            "(pip install cryptography)")
+    if not pw:
+        raise SealMasterError("no master password entered — nothing sealed")
+
+    # Honor a custom SOC_SECRET_DIR — doctor, the credential store, and the
+    # boot-time pinentry all read it, so we MUST seal to the SAME place or the
+    # wall seals here but looks for the secret elsewhere and can't self-unlock.
+    sd = soc_env.get("SOC_SECRET_DIR") or paths["secret_dir"]
+    use_pin = pin or secretstore.gen_pin()
+    if not dry:
+        try:
+            secretstore.seal(pw, use_pin, sd)
+            # Verify it unseals on THIS host before we trust it (and before any
+            # plaintext gets scrubbed) — never lock the wall out.
+            if secretstore.unseal(sd) != pw:
+                raise secretstore.SecretStoreError("seal did not unseal to the same value")
+        except secretstore.SecretStoreError as e:
+            raise SealMasterError(f"could not seal: {e}")
+        _seal_housekeeping(secretstore, sd, record_src, paths, soc_env, backend)
+    return use_pin
+
+
+def _seal_housekeeping(secretstore, sd, record_src, paths, soc_env, backend) -> None:
+    """Post-seal client wiring shared by ``seal_master`` (after a fresh seal) and
+    ``cmd_firstrun`` (when the operator KEEPS an existing seal): point the rbw/
+    litebw client at the unsealing pinentry (+ email/base_url), scrub any leftover
+    plaintext ``SOC_VAULT_PASSWORD`` once the seal is confirmed to unseal, and
+    record the chosen source. The master itself is never written — only wiring."""
+    # point the vault client at the unsealing pinentry + bake email/url
+    if backend in ("rbw", "litebw") and _have(backend):
+        if soc_env.get("SOC_VAULT_EMAIL"):
+            _run([backend, "config", "set", "email", soc_env["SOC_VAULT_EMAIL"]])
+        if soc_env.get("SOC_VAULT_URL"):
+            _run([backend, "config", "set", "base_url", soc_env["SOC_VAULT_URL"]])
+        _run([backend, "config", "set", "pinentry", paths["pinentry"]])
+
+    # Clean any leftover plaintext master out of soc.env now that it is sealed —
+    # only after CONFIRMING it unseals, so a failed seal never strands the
+    # operator. record where we sealed + repoint a stale pinentry too.
+    if soc_env.get("SOC_VAULT_PASSWORD") and secretstore.is_sealed(sd):
+        try:
+            secretstore.unseal(sd)
+        except Exception:  # noqa: BLE001 — keep the plaintext if it won't unseal here
+            pass
+        else:
+            updates = {}
+            if (soc_env.get("SOC_SECRET_DIR") or "/etc/soc-display/secret") != sd:
+                updates["SOC_SECRET_DIR"] = sd
+            if soc_env.get("SOC_PINENTRY", "").endswith("pinentry-soc.sh"):
+                updates["SOC_PINENTRY"] = paths["pinentry"]
+            rewrite_env(paths["soc_env"], remove=("SOC_VAULT_PASSWORD",),
+                        set_kv=updates, mode=paths["env_mode"])
+
+    # Record the chosen source ('auto' preserved verbatim; 'sealed' as 'sealed').
+    if secretstore.is_sealed(sd) and soc_env.get("SOC_MASTER_SOURCE") != record_src:
+        rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": record_src},
+                    mode=paths.get("env_mode", 0o600))
+
+
 def cmd_firstrun(args) -> int:
     """First-time setup: generate a one-time PIN, seal the vault master password
     host-bound (no plaintext .env), point litebw at the unsealing pinentry. Asks
-    before overwriting an existing seal; re-runnable to change the password."""
+    before overwriting an existing seal; re-runnable to change the password.
+
+    Gathers inputs interactively, then delegates the mechanical seal/store to
+    ``seal_master`` (shared verbatim with the GUI wizard)."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
     soc_env = load_env_file(paths["soc_env"])
     banner("SOC video-wall · first-time setup (PIN + seal)")
@@ -1486,7 +1957,7 @@ def cmd_firstrun(args) -> int:
         return 0
     sys.path.insert(0, os.path.join(REPO, "kiosk-host"))
     try:
-        from host import mastersource, secretstore  # type: ignore
+        from host import mastersource, secretstore  # type: ignore  # noqa: F401
     except Exception as e:  # noqa: BLE001
         err(f"cannot load the secret store ({e})")
         return 1
@@ -1501,27 +1972,20 @@ def cmd_firstrun(args) -> int:
     src = ask_choice(
         "master-password source", ["auto", "sealed", "secret-service", "env"],
         cur_src if cur_src in ("auto", "sealed", "secret-service", "env") else "auto")
-    # 'auto' is materialised by sealing host-bound (the unattended default); the
-    # source name recorded in soc.env below stays 'auto' so the wall keeps its
-    # secret-service -> env fallbacks if the seal is ever removed.
-    record_src = src
-    if src == "auto":
-        src = "sealed"
+    eff_src = "sealed" if src == "auto" else src
 
-    if src == "env":
+    if eff_src == "env":
         warn("'env' reads $SOC_VAULT_PASSWORD — DEV/seeding only; never persisted "
              "to a file. Nothing to seal/store; recording the source choice only.")
-        if not args.dry_run:
-            rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": "env"},
-                        mode=paths.get("env_mode", 0o600))
+        try:
+            seal_master("", source=src, pin="", paths=paths, soc_env=soc_env,
+                        backend=backend, dry=args.dry_run)
+        except SealMasterError as e:
+            err(str(e))
+            return 1
         return 0
 
-    if src == "secret-service":
-        if not mastersource._have_secret_tool():
-            err("secret-tool (libsecret) is not on PATH — install it "
-                "(apt: libsecret-tools; dnf/pacman/apk/xbps: libsecret), or pick "
-                "the 'sealed' source. Nothing stored.")
-            return 1
+    if eff_src == "secret-service":
         master = ask_secret("vault master password (stored in the Secret Service "
                             "wallet, never in a file)")
         if not master:
@@ -1530,42 +1994,30 @@ def cmd_firstrun(args) -> int:
         if args.dry_run:
             print(yellow("   [dry-run] would store the master via secret-tool "
                          "(service=soc-wall account=vault-master)"))
-        else:
-            try:
-                mastersource.store_master(master, "secret-service")
-                if mastersource.get_master("secret-service") != master:
-                    raise mastersource.MasterSourceError(
-                        "stored value did not read back — wallet locked?")
-            except mastersource.MasterSourceError as e:
-                err(f"could not store the master in the wallet: {e}")
-                return 1
+        try:
+            seal_master(master, source=src, pin="", paths=paths, soc_env=soc_env,
+                        backend=backend, dry=args.dry_run)
+        except SealMasterError as e:
+            master = ""  # scrub
+            err(str(e))
+            return 1
+        master = ""  # scrub
+        if not args.dry_run:
             ok("stored + verified the master in the Secret Service wallet "
                "(service=soc-wall account=vault-master)")
-        master = ""  # scrub
+            if backend in ("rbw", "litebw") and _have(backend):
+                ok(f"{backend} configured (pinentry -> pinentry-vault.py -> secret-service)")
         note("Reminder: a headless wall's wallet is LOCKED at boot. For unattended")
         note("use, auto-unlock the wallet (PAM / gnome-keyring --unlock) or prefer")
         note("the 'sealed' source. See docs/SECURITY.md.")
-        if not args.dry_run:
-            updates = {"SOC_MASTER_SOURCE": "secret-service"}
-            # scrub any leftover plaintext master now that the wallet holds it
-            removes = ("SOC_VAULT_PASSWORD",) if soc_env.get("SOC_VAULT_PASSWORD") else ()
-            rewrite_env(paths["soc_env"], remove=removes, set_kv=updates,
-                        mode=paths.get("env_mode", 0o600))
-            if backend in ("rbw", "litebw") and _have(backend):
-                _run([backend, "config", "set", "pinentry", paths["pinentry"]])
-                ok(f"{backend} configured (pinentry -> pinentry-vault.py -> secret-service)")
         return 0
 
-    # src == 'sealed' below — the host-bound seal path. Needs cryptography.
+    # eff_src == 'sealed' below — the host-bound seal path. Needs cryptography.
     if not secretstore.available():
         err("the 'cryptography' package is required to seal the master password "
             "(pip install cryptography)")
         return 1
 
-    # Honor a custom SOC_SECRET_DIR from soc.env — doctor, the credential store,
-    # and the boot-time pinentry all read it, so first-run must seal to the SAME
-    # place or the wall seals here but looks for the secret elsewhere and can't
-    # self-unlock at boot.
     sd = soc_env.get("SOC_SECRET_DIR") or paths["secret_dir"]
     do_seal = True
     if secretstore.is_sealed(sd):
@@ -1580,21 +2032,26 @@ def cmd_firstrun(args) -> int:
         if not master:
             err("no master password entered — nothing sealed")
             return 1
-        pin = ask("one-time PIN (blank = generate a random one)", "") or secretstore.gen_pin()
+        pin = ask("one-time PIN (blank = generate a random one)", "")
         if args.dry_run:
             print(yellow(f"   [dry-run] would seal the master password to {sd}"))
-        else:
-            try:
-                secretstore.seal(master, pin, sd)
-                # Verify it unseals on THIS host before we trust it (and before
-                # any plaintext gets scrubbed) — never lock the wall out.
-                if secretstore.unseal(sd) != master:
-                    raise secretstore.SecretStoreError("seal did not unseal to the same value")
-            except secretstore.SecretStoreError as e:
-                err(f"could not seal: {e}")
-                return 1
-            ok(f"sealed + verified the master password (host-bound) -> {sd}")
+        try:
+            pin = seal_master(master, source=src, pin=pin, paths=paths,
+                              soc_env=soc_env, backend=backend, dry=args.dry_run)
+        except SealMasterError as e:
+            master = ""  # scrub
+            err(str(e))
+            return 1
         master = ""  # scrub
+        if not args.dry_run:
+            ok(f"sealed + verified the master password (host-bound) -> {sd}")
+            if backend in ("rbw", "litebw") and _have(backend):
+                ok(f"{backend} configured (email / base_url / pinentry -> pinentry-vault.py)")
+            elif backend in ("rbw", "litebw"):
+                warn(f"{backend} is not on PATH — install it, then re-run first-run to configure it")
+            if soc_env.get("SOC_VAULT_PASSWORD"):
+                ok(f"removed plaintext SOC_VAULT_PASSWORD from {paths['soc_env']} "
+                   f"(master is now host-sealed)")
         banner("YOUR ONE-TIME PIN")
         print()
         print("        " + bold(green("  ".join(pin))))
@@ -1606,51 +2063,14 @@ def cmd_firstrun(args) -> int:
             _readline("   press Enter once you have recorded the PIN ... ")
     else:
         note("kept the existing sealed secret.")
-
-    # point the vault client at the unsealing pinentry + bake email/url into its config
-    if backend in ("rbw", "litebw") and _have(backend):
-        if soc_env.get("SOC_VAULT_EMAIL"):
-            _run([backend, "config", "set", "email", soc_env["SOC_VAULT_EMAIL"]])
-        if soc_env.get("SOC_VAULT_URL"):
-            _run([backend, "config", "set", "base_url", soc_env["SOC_VAULT_URL"]])
-        _run([backend, "config", "set", "pinentry", paths["pinentry"]])
-        ok(f"{backend} configured (email / base_url / pinentry -> pinentry-vault.py)")
-    elif backend in ("rbw", "litebw"):
-        warn(f"{backend} is not on PATH — install it, then re-run first-run to configure it")
-
-    # Clean the plaintext master out of soc.env now that it is sealed. Only do
-    # this once we have CONFIRMED the seal unseals on this host, so a failed seal
-    # can never strand the operator without their password.
-    if not args.dry_run and soc_env.get("SOC_VAULT_PASSWORD"):
-        if not secretstore.is_sealed(sd):
-            warn("not sealed — keeping SOC_VAULT_PASSWORD in soc.env (nothing to fall back on)")
-        else:
-            try:
-                secretstore.unseal(sd)
-            except Exception as e:  # noqa: BLE001
-                warn(f"sealed secret does not unseal here ({e}); keeping "
-                     f"SOC_VAULT_PASSWORD so you are not locked out")
-            else:
-                updates = {}
-                # record where we sealed, if soc.env points elsewhere/nowhere
-                if (soc_env.get("SOC_SECRET_DIR") or "/etc/soc-display/secret") != sd:
-                    updates["SOC_SECRET_DIR"] = sd
-                # repoint a stale pinentry (the retired pinentry-soc.sh)
-                if soc_env.get("SOC_PINENTRY", "").endswith("pinentry-soc.sh"):
-                    updates["SOC_PINENTRY"] = paths["pinentry"]
-                rewrite_env(paths["soc_env"], remove=("SOC_VAULT_PASSWORD",),
-                            set_kv=updates, mode=paths["env_mode"])
+        # Re-run the client wiring / plaintext scrub / source record against the
+        # EXISTING seal (same as a fresh seal, minus the seal itself), so a
+        # re-run that declines re-sealing still repoints a stale client.
+        if not args.dry_run:
+            _seal_housekeeping(secretstore, sd, src, paths, soc_env, backend)
+            if soc_env.get("SOC_VAULT_PASSWORD"):
                 ok(f"removed plaintext SOC_VAULT_PASSWORD from {paths['soc_env']} "
                    f"(master is now host-sealed)")
-
-    # Record the chosen source so doctor / the wall resolve it unambiguously
-    # (the master itself is NEVER written to soc.env — only the source name).
-    # 'auto' is preserved verbatim (keeps the secret-service/env fallbacks); an
-    # explicit 'sealed' is recorded as 'sealed'.
-    if not args.dry_run and secretstore.is_sealed(sd) \
-            and soc_env.get("SOC_MASTER_SOURCE") != record_src:
-        rewrite_env(paths["soc_env"], set_kv={"SOC_MASTER_SOURCE": record_src},
-                    mode=paths.get("env_mode", 0o600))
     return 0
 
 
@@ -1699,6 +2119,16 @@ def clean_state(paths, args) -> None:
         else os.path.join(REPO, "dev", "run", "state"))
     targets = [paths["panels_out"], paths["soc_env"],
                paths["secret_dir"], state]
+    # Removing the per-user `active` marker hands control back to /etc on a
+    # redeploy (else a lingering marker would shadow the re-deployed system config —
+    # the inverse of the bug this resolver fixes). Always clear it, even when the
+    # current write target is /etc, so a prior user fallback can't linger.
+    try:
+        marker = paths.get("marker") or _configpaths().active_marker()
+        if marker:
+            targets.append(marker)
+    except Exception:  # noqa: BLE001 — resolver optional during clean
+        pass
     if paths["mode"] == "dev":
         targets.append(os.path.join(REPO, "dev", "run"))
     note("will remove (files are backed up first):")
@@ -1729,7 +2159,7 @@ def cmd_deploy(args) -> int:
     seal PIN -> push config + creds -> health check. Each step asks first, so it
     is safe to run (and re-run) interactively."""
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
     banner("SOC video-wall · deploy (end to end)")
     if getattr(args, "clean", False):
@@ -1759,7 +2189,14 @@ def cmd_deploy(args) -> int:
         fresh = run_install
     else:
         run_install = ask_bool("Step 1/6 — install OS packages + services (install.sh)?", True)
-    if run_install and has_pm:
+    if run_install and has_pm and args.dry_run:
+        # install.sh has no --dry-run flag and mutates the host (creates users,
+        # builds the venv, installs packages). Honour the dry-run contract by
+        # PRINTING what would run and changing nothing — never shell the installer.
+        cmd = ["./install.sh"] + (["--fresh"] if fresh else [])
+        note("Step 1/6 — [dry-run] would run: "
+             + " ".join((cmd if env.is_root else ["sudo"] + cmd)))
+    elif run_install and has_pm:
         cmd = ["./install.sh"] + (["--fresh"] if fresh else [])
         rc = _run(cmd if env.is_root else ["sudo"] + cmd)
         if rc not in (0, None):
@@ -1785,7 +2222,11 @@ def cmd_deploy(args) -> int:
     # 3) bring Vaultwarden up (real-vault backends: litebw / rbw)
     if is_vault:
         url = soc_env.get("SOC_VAULT_URL", "http://127.0.0.1:8222")
-        if _have("systemctl") and os.path.isdir("/run/systemd/system"):
+        email = soc_env.get("SOC_VAULT_EMAIL", "")
+        if args.dry_run and _have("systemctl") and os.path.isdir("/run/systemd/system"):
+            note("Step 3/6 — [dry-run] would start Vaultwarden "
+                 "(systemctl start vaultwarden) and wait for /alive.")
+        elif _have("systemctl") and os.path.isdir("/run/systemd/system"):
             if ask_bool("Step 3/6 — start Vaultwarden (systemctl start vaultwarden)?",
                         target == "pi"):
                 _run(["systemctl", "start", "vaultwarden"] if env.is_root
@@ -1796,10 +2237,43 @@ def cmd_deploy(args) -> int:
                         break
                     time.sleep(1)
                 else:
-                    warn(f"{url} not answering /alive yet — check it before continuing")
+                    # Fail CLOSED on a real run: a vault that never answered /alive
+                    # means the account/seal steps below will fail too, leaving a
+                    # box that boots into a wall that can't read the vault. Make the
+                    # operator confirm before pressing on (dry-run never prompts).
+                    err(f"{url} not answering /alive — the vault is not up; "
+                        "account create + seal will fail and the wall will be dark")
+                    if not ask_bool("  continue anyway (NOT recommended)?", False):
+                        err("aborting deploy — start Vaultwarden, then re-run")
+                        return 1
         else:
             note("Step 3/6 — no systemd; start Vaultwarden via your init manager.")
-        note("Create the kiosk account in the web vault (signups on) if not done yet.")
+        # Ensure the account EXISTS (create if missing) via the shared core — the
+        # same path the GUI's "Create account" button uses. No more "create it in
+        # the web vault by hand" dead-end. The master comes from --master-fd (the
+        # non-interactive escape hatch) or the sealed/interactive resolver; an
+        # empty result means "no usable master" -> skip rather than register with "".
+        if provision is not None and email and ask_bool(
+                f"  ensure the Vaultwarden account {email} exists (create if missing)?", True):
+            pw = _read_master_fd(args) or _resolve_master(soc_env)
+            if not pw:
+                warn("no usable master available — seal it (Step 4) or re-run with "
+                     "--master-fd; skipping account create/verify")
+            else:
+                popts = provision.Opts(email=email, url=url, dry_run=args.dry_run)
+                res = provision.step_vault_account(popts, pw)
+                pw = ""  # scrub
+                if res.ok:
+                    ok(res.detail)
+                else:
+                    # Fail CLOSED: a failed account-ensure is an ERROR, not a yellow
+                    # warning — without it the wall can't log into the vault. Require
+                    # confirmation to continue (dry-run never prompts).
+                    err(f"account create/verify failed: {res.detail}")
+                    if not args.dry_run and not ask_bool(
+                            "  continue anyway (the wall may not be able to log in)?", False):
+                        err("aborting deploy — fix the vault account, then re-run")
+                        return 1
     else:
         note("Step 3/6 — dev vault backend; no Vaultwarden server needed.")
 
@@ -1834,12 +2308,17 @@ def cmd_deploy(args) -> int:
 
 def cmd_creds(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
-    soc_env = load_env_file(paths["soc_env"])
-    cfg = load_yaml(paths["panels_installed"]) or {}
+    # Store logins against the config the WALL ACTUALLY READS (shared resolver),
+    # not just the wizard's write target — they agree on a deployed box, but the
+    # resolver is the single source of truth so creds can never target a dead file.
+    cp = _configpaths()
+    soc_env = load_env_file(cp.resolve_env() or paths["soc_env"])
+    panels_path = cp.resolve_panels() or paths["panels_installed"]
+    cfg = load_yaml(panels_path) or {}
     if not cfg.get("panels"):
-        err(f"no config found at {paths['panels_installed']} — run the wizard first")
+        err(f"no config found at {panels_path} — run the wizard first")
         return 1
     store_credentials(soc_env, cfg, args.dry_run)
     return 0
@@ -1848,36 +2327,141 @@ def cmd_creds(args) -> int:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def resolve_paths(target: str) -> dict:
-    if target == "pi":
+def resolve_paths(target: str, *, can_escalate: bool = False) -> dict:
+    """Where the wizard WRITES — derived from the SHARED resolver (host.configpaths)
+    so what we write is exactly what the wall (resolving with the same logic) reads.
+
+    target:
+      'dev'   -> force the repo checkout (config/panels.local.yaml, .env). Explicit,
+                 deterministic — tests and `--target dev` rely on this verbatim.
+      'pi' / 'auto' -> the highest-precedence location THIS euid can write:
+                 /etc/soc-display when root (or escalated), else the per-user
+                 ~/.config/soc-display + an `active` marker so the wall picks it up.
+
+    The dict shape (keys) is unchanged so doctor/creds/deploy/wizard/setupgui keep
+    working. New keys: 'via' (env|etc|user|repo), 'marker' (path or None),
+    'needs_privilege' (pkexec required)."""
+    if target == "dev":
         return dict(
-            mode="pi",
-            panels_out="/etc/soc-display/panels.yaml",
-            panels_installed="/etc/soc-display/panels.yaml",
-            soc_env="/etc/soc-display/soc.env",
-            wall_unit="/etc/systemd/system/soc-wall.service",
-            soc_root="/opt/soc-display",
-            pinentry="/opt/soc-display/scripts/pinentry-vault.py",
-            secret_dir="/etc/soc-display/secret",
+            mode="dev", via="repo", marker=None, needs_privilege=False,
+            panels_out=os.path.join(REPO, "config", "panels.local.yaml"),
+            panels_installed=os.path.join(REPO, "config", "panels.local.yaml"),
+            soc_env=os.path.join(REPO, ".env"),
+            wall_unit=os.path.join(REPO, "dev", "run", "soc-wall.service"),
+            soc_root=REPO,
+            pinentry=os.path.join(REPO, "scripts", "pinentry-vault.py"),
+            secret_dir=os.path.join(REPO, "dev", "run", "secret"),
             config_vault_item="SOC Wall Config",
-            inject_tmpl="/opt/soc-display/inject/login.js.tmpl",
-            default_backend="litebw",
-            panels_mode=0o644, env_mode=0o640,
+            inject_tmpl=os.path.join(REPO, "inject", "login.js.tmpl"),
+            default_backend="dev",
+            panels_mode=0o644, env_mode=0o600,
         )
+
+    # 'pi'/'auto': ask the shared resolver where this user can actually write.
+    cp = _configpaths()
+    pw = cp.resolve_write("panels", want_etc=True, can_escalate=can_escalate)
+    ew = cp.resolve_write("env", want_etc=True, can_escalate=can_escalate)
+    via = pw["via"]
+    if via in ("etc", "env"):
+        # Canonical deployed (or an explicit override pointing at the system tree).
+        soc_root = "/opt/soc-display"
+        secret_dir = "/etc/soc-display/secret"
+        wall_unit = "/etc/systemd/system/soc-wall.service"
+        inject_tmpl = "/opt/soc-display/inject/login.js.tmpl"
+    else:
+        # Per-user fallback: the sealed master must live where THIS user can read it,
+        # so secret_dir rides alongside the user-dir panels.yaml. No systemd unit
+        # (a per-user desktop wall is launched from the menu, not via root systemd).
+        soc_root = "/opt/soc-display" if os.path.isdir("/opt/soc-display") else REPO
+        secret_dir = os.path.join(cp.user_dir(), "secret")
+        wall_unit = None
+        inject_tmpl = os.path.join(soc_root, "inject", "login.js.tmpl")
     return dict(
-        mode="dev",
-        panels_out=os.path.join(REPO, "config", "panels.local.yaml"),
-        panels_installed=os.path.join(REPO, "config", "panels.local.yaml"),
-        soc_env=os.path.join(REPO, ".env"),
-        wall_unit=os.path.join(REPO, "dev", "run", "soc-wall.service"),
-        soc_root=REPO,
-        pinentry=os.path.join(REPO, "scripts", "pinentry-vault.py"),
-        secret_dir=os.path.join(REPO, "dev", "run", "secret"),
+        mode="pi", via=via, marker=pw.get("marker"),
+        needs_privilege=pw.get("needs_privilege", False),
+        panels_out=pw["path"],
+        panels_installed=pw["path"],
+        soc_env=ew["path"],
+        wall_unit=wall_unit,
+        soc_root=soc_root,
+        pinentry=os.path.join(soc_root, "scripts", "pinentry-vault.py"),
+        secret_dir=secret_dir,
         config_vault_item="SOC Wall Config",
-        inject_tmpl=os.path.join(REPO, "inject", "login.js.tmpl"),
-        default_backend="dev",
-        panels_mode=0o644, env_mode=0o600,
+        inject_tmpl=inject_tmpl,
+        default_backend="litebw",
+        panels_mode=pw["mode"], env_mode=ew["mode"],
     )
+
+
+def _drop_marker(paths: dict, dry: bool):
+    """When the wizard fell back to the per-user config dir, write the `active`
+    marker so the reader's marker-gated user tier picks THIS file up over a stale
+    /etc. The marker records the path it claims + a timestamp + the writer euid so
+    doctor --explain can show 'user config active since … (uid N)'."""
+    marker = paths.get("marker")
+    if not marker:
+        return
+    if dry:
+        print(yellow(f"   [dry-run] would activate per-user config: {marker}"))
+        return
+    os.makedirs(os.path.dirname(marker), 0o700, exist_ok=True)
+    body = (f"{paths['panels_out']}\n"
+            f"# activated {time.strftime('%Y-%m-%dT%H:%M:%S%z')} by uid {os.geteuid()}\n")
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    note(f"activated per-user config for this login (marker: {marker})")
+
+
+def _confirm_reaches_wall(paths: dict, soc_env: "dict | None", cfg: "dict | None",
+                          dry: bool) -> bool:
+    """FAIL-SAFE: after writing, assert that the file the wall will READ is exactly
+    what we just WROTE — resolving with the SAME shared logic. Prints the cause
+    VISIBLY (never silent) when they disagree, and returns True iff they agree.
+
+    Catches: a stale higher-precedence file shadowing our write, an $SOC_PANELS_FILE
+    pinning a third path, and the litebw/rbw vault-note-is-source-of-truth case
+    (a YAML-only write won't reach the wall until the note is updated)."""
+    if dry:
+        return True
+    cp = _configpaths()
+    wrote = paths["panels_out"]
+    read_path, label = cp.resolve_read("panels")
+    if read_path and os.path.abspath(read_path) == os.path.abspath(wrote):
+        if paths.get("via") == "user":
+            ok(f"Saved to {wrote} and activated for YOUR user. Launch the wall from "
+               f"THIS login and it uses the new panels. For system-wide, re-run as "
+               f"root (or allow the password prompt).")
+        else:
+            ok(f"Config written to {wrote} — the wall will read it. Launch Desktop/Kiosk mode.")
+        reached = True
+    else:
+        err(f"Saved to {wrote} but the wall will read {read_path or '(nothing)'} "
+            f"because: {label}. Unset SOC_PANELS_FILE / remove the shadowing file / "
+            f"re-run as root so the config reaches the wall.")
+        reached = False
+
+    # litebw/rbw: the vault note is the source of truth unless SOC_CONFIG_FROM_VAULT=0.
+    env = soc_env or {}
+    backend = env.get("SOC_VAULT_BACKEND", "")
+    if backend in ("litebw", "rbw") and env.get("SOC_CONFIG_FROM_VAULT", "1") != "0":
+        warn(f"Backend={backend} reads the '{env.get('SOC_CONFIG_VAULT_ITEM', 'SOC Wall Config')}' "
+             f"vault note FIRST; your file change won't show until that note is "
+             f"updated — push it (setup.py deploy pushes config), or set "
+             f"SOC_CONFIG_FROM_VAULT=0 to force the file.")
+    return reached
+
+
+def _default_target(env: "Env") -> str:
+    """The write target when --target is not given. In a bare dev checkout (no
+    deployed /etc/soc-display and no /opt/soc-display) keep today's 'dev' behaviour
+    so `make dev` / tests write the repo. On a DEPLOYED box, use 'pi' even for a
+    non-root desktop user: resolve_paths('pi') then lands the config where the wall
+    reads it (the per-user fallback + marker), instead of silently writing a repo
+    file the wall never sees — the bug this whole change fixes."""
+    deployed = os.path.isdir("/etc/soc-display") or os.path.isdir("/opt/soc-display")
+    if env.is_root:
+        return "pi"
+    return "pi" if deployed else "dev"
 
 
 def main():
@@ -1885,12 +2469,18 @@ def main():
     ap = argparse.ArgumentParser(
         description="Setup, diagnose, repair + install the SOC video wall.")
     ap.add_argument("command", nargs="?", default=None,
-                    choices=["menu", "deploy", "first-run", "wizard", "doctor",
-                             "repair", "install", "creds"],
+                    choices=["menu", "deploy", "first-run", "wizard", "wizard-gui",
+                             "doctor", "repair", "install", "creds",
+                             "provision", "create-users", "vault-register",
+                             "vault-seed", "seal", "write-config", "uninstall"],
                     help="menu (default on a TTY) | deploy (full automated "
                          "deploy) | first-run (seal the one-time PIN) | wizard "
-                         "(config) | doctor (diagnose) | repair (fix/install "
-                         "missing) | install (OS install + wizard) | creds (logins)")
+                         "(config) | wizard-gui (graphical config) | doctor "
+                         "(diagnose) | repair (fix/install missing) | install "
+                         "(OS install + wizard) | creds (logins) || PROVISIONING "
+                         "(headless parity with the GUI): provision (whole "
+                         "fresh-box flow) | create-users | vault-register | "
+                         "vault-seed | seal | write-config | uninstall")
     ap.add_argument("--clean", action="store_true",
                     help="deploy: wipe generated config/state first (fresh deploy)")
     ap.add_argument("--fresh", action="store_true",
@@ -1900,6 +2490,21 @@ def main():
     ap.add_argument("--target", choices=["pi", "dev"], help="where to write (default: pi if root, else dev)")
     ap.add_argument("--section", choices=["all", "display", "panels", "tunnel", "vpn", "proxy", "vault", "server"],
                     default="all", help="run just one section (wizard)")
+    # --- provisioning-core flags (parity with the GUI Setup) ------------------
+    ap.add_argument("--mode", choices=["kiosk", "desktop"], default="kiosk",
+                    help="provision: which mode's session/units to wire (default: kiosk)")
+    ap.add_argument("--email", default="", help="provision/vault-*: the Vaultwarden account email")
+    ap.add_argument("--url", default="http://127.0.0.1:8222",
+                    help="provision/vault-*: the Vaultwarden base URL")
+    ap.add_argument("--pin", default="", help="seal: PIN for the host-bound seal (auto-generated if omitted)")
+    ap.add_argument("--master-fd", type=int, default=None,
+                    help="seal/vault-*: read the master password from this FD (NEVER an argv flag)")
+    ap.add_argument("--seed", dest="seed", action="store_true", default=True,
+                    help="provision: seed the configured panels' vault-login items (default)")
+    ap.add_argument("--no-seed", dest="seed", action="store_false",
+                    help="provision: do NOT seed panel-login items")
+    ap.add_argument("--purge", action="store_true", help="uninstall: also remove users + Vaultwarden data")
+    ap.add_argument("--yes", action="store_true", help="non-interactive: accept every prompt")
     args = ap.parse_args()
     ASSUME_DEFAULTS = args.defaults
 
@@ -1916,14 +2521,215 @@ def main():
     dispatch = {
         "menu": cmd_menu, "deploy": cmd_deploy, "first-run": cmd_firstrun,
         "doctor": cmd_doctor, "repair": cmd_repair, "install": cmd_install,
-        "creds": cmd_creds, "wizard": cmd_wizard,
+        "creds": cmd_creds, "wizard": cmd_wizard, "wizard-gui": cmd_wizard_gui,
+        "provision": cmd_provision, "create-users": cmd_create_users,
+        "vault-register": cmd_vault_register, "vault-seed": cmd_vault_seed,
+        "seal": cmd_seal, "write-config": cmd_write_config,
+        "uninstall": cmd_uninstall,
     }
     return dispatch[cmd](args)
 
 
+# --------------------------------------------------------------------------- #
+# Provisioning-core CLI wrappers — every GUI Setup action reachable headlessly.
+# Each is a THIN wrapper over a provision.* function (the GUI calls the identical
+# function — parity by construction; no duplicated logic).
+# --------------------------------------------------------------------------- #
+def _opts_from_args(args) -> "provision.Opts":
+    """Build the provisioning Opts from argparse (the GUI builds the same)."""
+    return provision.Opts(
+        mode=getattr(args, "mode", "kiosk"),
+        email=getattr(args, "email", "") or "",
+        url=getattr(args, "url", "http://127.0.0.1:8222"),
+        pin=getattr(args, "pin", "") or "",
+        seed=getattr(args, "seed", True),
+        target=getattr(args, "target", None) or "pi",
+        fresh=getattr(args, "fresh", False),
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+
+def _read_master_fd(args) -> str:
+    """Read the master from --master-fd (NEVER argv). Returns '' if none given —
+    the seal/vault steps then fall back to the sealed source / stdin prompt."""
+    fd = getattr(args, "master_fd", None)
+    if fd is None:
+        return ""
+    try:
+        with os.fdopen(os.dup(fd), "r") as fh:
+            return fh.readline().rstrip("\n")
+    except Exception as e:  # noqa: BLE001
+        err(f"could not read the master from fd {fd}: {e}")
+        return ""
+
+
+def _require_provision() -> bool:
+    if provision is None:
+        err("the provisioning core (provision.py) is not available")
+        return False
+    return True
+
+
+def cmd_provision(args) -> int:
+    """The whole fresh-box flow — the CLI analogue of the GUI's Apply. Calls the
+    SAME provision.provision_all the GUI drives. Honours --dry-run / SOC_PROVISION_DRY_RUN."""
+    if not _require_provision():
+        return 1
+    env = Env()
+    opts = _opts_from_args(args)
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    paths = resolve_paths(opts.target)
+    if opts.dry:
+        banner("SOC video-wall · provision (DRY RUN — nothing will change)")
+        provision.print_plan(opts)
+        # Drive the full flow in dry-run so the printed plan is exercised end to end.
+        cfg = load_yaml(paths["panels_installed"]) or {}
+        soc_env = load_env_file(paths["soc_env"])
+        provision.provision_all(opts, cfg=cfg, soc_env=soc_env, paths=paths,
+                                master="", report=_prov_report)
+        banner("Dry run complete — no host state changed")
+        return 0
+    if not env.is_root:
+        warn("provision needs root for packages/users/deploy — re-run with sudo")
+        return 1
+    cfg = load_yaml(paths["panels_installed"]) or {}
+    soc_env = load_env_file(paths["soc_env"])
+    master = _read_master_fd(args)
+    backend = (soc_env or {}).get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
+    banner("SOC video-wall · provision (end to end)")
+    res = provision.provision_all(opts, cfg=cfg, soc_env=soc_env, paths=paths,
+                                  master=master, backend=backend, report=_prov_report)
+    master = ""  # scrub
+    if res.ok:
+        ok(res.detail)
+        return 0
+    err(res.detail)
+    return 1
+
+
+def _prov_report(step: str, status: str, detail: str = "") -> None:
+    tail = f" — {detail}" if detail else ""
+    if status == "FAILED":
+        err(f"{step}: {status}{tail}")
+    elif status == "running":
+        note(f"{step} …")
+    else:
+        ok(f"{step}: {status}{tail}")
+
+
+def cmd_create_users(args) -> int:
+    """Create the kiosk + desktop (+ service) users (provision.step_users)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    if not opts.dry and os.geteuid() != 0:
+        err("create-users needs root (or --dry-run)")
+        return 1
+    res = provision.step_users(opts)
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_vault_register(args) -> int:
+    """Register / ensure the Vaultwarden account (provision.step_vault_account,
+    which calls host.vaultsetup.ensure_account — the SAME path the GUI's Create
+    account button uses)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    if not opts.email:
+        err("vault-register needs --email")
+        return 1
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    master = _read_master_fd(args)
+    if not master and not opts.dry:
+        master = ask_secret("vault master password (for the account)")
+    res = provision.step_vault_account(opts, master)
+    master = ""  # scrub
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_vault_seed(args) -> int:
+    """Seed the configured panels' vault-login items (provision.step_vault_seed)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    paths = resolve_paths(opts.target)
+    cfg = load_yaml(paths["panels_installed"]) or {}
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    master = _read_master_fd(args)
+    if not master and not opts.dry:
+        master = ask_secret("vault master password (to seed logins)")
+    res = provision.step_vault_seed(opts, master, cfg)
+    master = ""  # scrub
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_seal(args) -> int:
+    """Seal the master host-bound (provision.step_seal -> setup.seal_master).
+    Master via --master-fd / stdin — NEVER argv."""
+    if not _require_provision():
+        return 1
+    env = Env()
+    opts = _opts_from_args(args)
+    paths = resolve_paths(opts.target)
+    soc_env = load_env_file(paths["soc_env"])
+    backend = (soc_env or {}).get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    master = _read_master_fd(args)
+    if not master and not opts.dry:
+        if not sys.stdin.isatty():
+            master = sys.stdin.readline().rstrip("\n")
+        else:
+            master = ask_secret("vault master password (to seal)")
+    res = provision.step_seal(opts, master, paths, soc_env, backend)
+    master = ""  # scrub
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_write_config(args) -> int:
+    """Render + write panels.yaml / soc.env / wall-unit (provision.step_write_config)."""
+    if not _require_provision():
+        return 1
+    opts = _opts_from_args(args)
+    paths = resolve_paths(opts.target)
+    cfg = load_yaml(paths["panels_installed"]) or {}
+    soc_env = load_env_file(paths["soc_env"])
+    if args.dry_run:
+        os.environ["SOC_PROVISION_DRY_RUN"] = "1"
+    if not cfg.get("panels"):
+        warn("no panels configured yet — run the wizard first (python3 setup.py wizard)")
+    res = provision.step_write_config(opts, cfg, soc_env, paths)
+    (ok if res.ok else err)(res.detail)
+    return 0 if res.ok else 1
+
+
+def cmd_uninstall(args) -> int:
+    """Headless uninstall — shells uninstall.sh so removal == the GUI Uninstall.
+    --purge passes through (also removes users + Vaultwarden data)."""
+    env = Env()
+    script = os.path.join(REPO, "uninstall.sh")
+    if not os.path.exists(script):
+        err(f"uninstall.sh not found at {script}")
+        return 1
+    cmd = [script] + (["--purge"] if getattr(args, "purge", False) else [])
+    if getattr(args, "yes", False):
+        cmd.append("--yes")
+    return _run(cmd if env.is_root else ["sudo"] + cmd)
+
+
 def cmd_wizard(args) -> int:
     env = Env()
-    target = args.target or ("pi" if env.is_root else "dev")
+    target = args.target or _default_target(env)
     paths = resolve_paths(target)
 
     banner("SOC video-wall · interactive setup")
@@ -1933,8 +2739,10 @@ def cmd_wizard(args) -> int:
     print(f"   detected : root={env.is_root} apt={env.has_apt} pi={env.is_pi} venv={env.has_venv}")
     if args.dry_run:
         print(yellow("   mode     : DRY RUN — no files will be written"))
-    if target == "pi" and not env.is_root:
-        warn("writing to /etc/soc-display needs root; re-run with sudo, or use --target dev")
+    if paths.get("via") == "user":
+        warn("/etc/soc-display is not writable here — saving to your per-user config "
+             f"({os.path.dirname(paths['panels_out'])}) and activating it for THIS login. "
+             "Re-run as root for a system-wide install.")
 
     prev = load_yaml(paths["panels_out"])
     if prev:
@@ -1945,27 +2753,47 @@ def cmd_wizard(args) -> int:
     cfg["display"] = section_display(prev) if args.section in ("all", "display") else (prev or {}).get("display", _def_display())
     cfg["panels"] = section_panels(cfg["display"], prev) if args.section in ("all", "panels") else (prev or {}).get("panels", [])
     cfg["tunnel"] = section_tunnel(cfg["panels"], prev) if args.section in ("all", "tunnel") else (prev or {}).get("tunnel", {"enabled": False})
-    cfg["vpn"] = section_vpn(prev) if args.section in ("all", "vpn") else (prev or {}).get("vpn", {"enabled": False})
+    cfg["vpns"] = (section_vpns(prev) if args.section in ("all", "vpn")
+                   else cfg_vpns(prev or {}))
     cfg["proxy"] = section_proxy(prev) if args.section in ("all", "proxy") else (prev or {}).get("proxy", {"enabled": False})
 
+    cfg_vpn_list = cfg_vpns(cfg)
+    any_vpn = any(v.get("enabled") for v in cfg_vpn_list)
     soc_env = None
     if args.section in ("all", "vault"):
-        soc_env = section_vault(paths, load_env_file(paths["soc_env"]), cfg["vpn"].get("enabled"))
+        soc_env = section_vault(paths, load_env_file(paths["soc_env"]), any_vpn)
     if args.section in ("all", "server"):
         section_server(paths, args.dry_run)   # guidance only — Vaultwarden has no .env
 
     # Summary
     banner("Review")
+    enabled_vpns = [v for v in cfg_vpn_list if v.get("enabled")]
     print(f"   {len(cfg['panels'])} panel(s); "
           f"tunnel {'ON' if cfg['tunnel'].get('enabled') else 'off'}; "
-          f"VPN {'ON' if cfg['vpn'].get('enabled') else 'off'}; "
+          f"VPN {len(enabled_vpns)} enabled; "
           f"proxy {'ON' if cfg.get('proxy', {}).get('enabled') else 'off'}")
+    for v in enabled_vpns:
+        owner = "  [default-route]" if v.get("default_route") else ""
+        print(dim(f"     - vpn {v.get('name', '?')} [{v.get('type', 'fortinet')}]{owner}"))
     for p in cfg["panels"]:
         tgt = p.get("url") or f"tunnel:{p.get('tunnel', {}).get('local_port')}"
         print(dim(f"     - {p['id']} [{p['engine']}/{p['mode']}] {tgt}  <- {p['vault_item']}"))
     if not ask_bool("Write these files now?", True):
         err("nothing written")
         return 1
+
+    # FAIL-SAFE pre-flight: if even the chosen fallback dir is unwritable (locked-down
+    # / quota'd / immutable ~/.config), say WHY now — never die with a raw
+    # PermissionError traceback half-way through the write.
+    if not args.dry_run:
+        wdir = os.path.dirname(paths["panels_out"]) or "."
+        cp = _configpaths()
+        if not cp._dir_writable(wdir):
+            err(f"cannot write the config: {wdir} is not writable by this user "
+                f"(uid {os.geteuid()}).")
+            note("Fix the directory permissions, free up space, or re-run as root "
+                 "(writes /etc/soc-display). Nothing was written.")
+            return 1
 
     # Write
     banner("Writing files")
@@ -1979,6 +2807,9 @@ def cmd_wizard(args) -> int:
                        render_wall_unit(soc_env, soc_root=paths["soc_root"]),
                        0o644, args.dry_run)
 
+    # Per-user fallback: activate this config for the reader (marker-gated tier).
+    _drop_marker(paths, args.dry_run)
+
     if not args.dry_run:
         validate_panels(paths["panels_out"])
 
@@ -1990,6 +2821,9 @@ def cmd_wizard(args) -> int:
 
     if not getattr(args, "_in_deploy", False):
         post_actions(env, cfg, target, args.dry_run)
+
+    # FAIL-SAFE: confirm the wall will actually read what we just wrote.
+    _confirm_reaches_wall(paths, _LAST_SOC_ENV, cfg, args.dry_run)
 
     banner("Done")
     print("   Guide: docs/SETUP.md   ·   Re-run anytime: python3 setup.py")

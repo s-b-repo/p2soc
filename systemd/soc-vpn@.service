@@ -1,0 +1,53 @@
+[Unit]
+Description=SOC wall VPN supervisor %i (driver selected by panels.yaml vpn.type) — auto-reconnect
+Documentation=https://github.com/adrienverge/openfortivpn
+After=network-online.target vaultwarden.service
+Wants=network-online.target
+# Best-effort: bring the VPN process up before the kiosk session starts so
+# routes to VPN-side panels exist when the windows load. The real readiness
+# gate is the kiosk host's vpn.ready_probe (best-effort, in main.py).
+Before=getty@tty1.service
+# Never stop retrying: the supervisor owns backoff (incl. long auth/cert
+# holds); this only covers supervisor crashes.
+StartLimitIntervalSec=0
+
+[Service]
+# Multi-VPN: the instance name (%i — what comes after the '@') selects which
+# VPN entry in conf.vpns this supervisor manages. e.g. for vpns: [{name: hq,
+# ...}, {name: dr, ...}], `systemctl start forti-vpn@hq forti-vpn@dr` brings
+# both up. forti-vpn.service (no '@') is the legacy single-VPN path; it omits
+# SOC_VPN_NAME so the supervisor uses conf.vpns[0].
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
+TimeoutStartSec=30
+Environment=SOC_ROOT=/opt/soc-display
+Environment=SOC_ENV_FILE=/etc/soc-display/soc.env
+Environment=SOC_PANELS_FILE=/etc/soc-display/panels.yaml
+Environment=SOC_VPN_NAME=%i
+ExecStart=/opt/soc-display/scripts/forti-vpn.sh
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+# --- privilege & hardening (identical to forti-vpn.service) ---
+NoNewPrivileges=no
+ProtectSystem=true
+ProtectHome=no
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PPPOX AF_PACKET
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+RemoveIPC=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

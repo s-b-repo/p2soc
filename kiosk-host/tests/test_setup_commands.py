@@ -1,6 +1,7 @@
 """Unit tests for setup.py commands: first-run (seal), clean, env render."""
 import importlib.util
 import os
+import re
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -152,3 +153,29 @@ def test_wall_unit_env_roundtrip(tmp_path):
     back = m.load_unit_env(str(p))
     for k, v in _WALL_ENV.items():
         assert back[k] == v
+
+
+def test_install_next_steps_numbering_is_sequential():
+    """install.sh's 'Next steps' checklist must number 0,1,2,... with no
+    duplicate step (a stray second '3.' once made it print 0,1,2,3,3,4,...)."""
+    with open(os.path.join(_REPO, "install.sh"), encoding="utf-8") as fh:
+        text = fh.read()
+    nums = [int(n) for n in re.findall(r"^\s+(\d+)\. ", text, re.MULTILINE)]
+    assert 0 in nums, "expected a '0.' first step in the checklist"
+    # the contiguous run starting at the '0.' step is the checklist
+    run = nums[nums.index(0):]
+    for i in range(1, len(run)):
+        if run[i] != run[i - 1] + 1:
+            run = run[:i]
+            break
+    assert run == list(range(len(run))), f"non-sequential checklist: {run}"
+    assert len(run) >= 8, f"expected the full 0..7 checklist, got {run}"
+
+
+def test_install_first_run_step_not_stale_rbw():
+    """The first-run next-step must describe the actual default backend (litebw),
+    not the legacy 'points rbw at pinentry' wording."""
+    with open(os.path.join(_REPO, "install.sh"), encoding="utf-8") as fh:
+        text = fh.read()
+    assert "points rbw at pinentry" not in text
+    assert "points the vault backend (litebw by default) at" in text

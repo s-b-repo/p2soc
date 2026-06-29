@@ -23,7 +23,7 @@ installed, deploy **skips the slow OS-package step** (it asks first; pass
 `--fresh` to force a full reinstall). The manual equivalent:
 
 ```bash
-sudo ./install.sh                 # packages, users, /opt + /etc, systemd units, autologin
+sudo ./install.sh                 # packages, users, /opt + /etc, systemd units, launcher
 sudo python3 setup.py             # menu → Configure (panels.yaml + soc.env)
 sudo python3 setup.py first-run   # one-time PIN + seal the master password
 sudo python3 setup.py doctor
@@ -31,6 +31,35 @@ sudo python3 setup.py doctor
 
 The installer picks the display stack at runtime (`SOC_SESSION=auto` →
 Wayland → XWayland → XLibre → Xorg); force one with `SESSION=...` if needed.
+
+### Desktop vs kiosk mode (`INSTALL_MODE`)
+
+`install.sh` honours `INSTALL_MODE=desktop|kiosk` (**default `desktop`**):
+
+```bash
+sudo INSTALL_MODE=desktop ./install.sh   # default: coexist with the desktop
+sudo INSTALL_MODE=kiosk   ./install.sh   # dedicated tty1-autologin appliance
+```
+
+- **`desktop`** — deploy everything (packages, users, `/opt` + `/etc`, systemd
+  units, the launcher icon) but **don't touch the boot**: the default systemd
+  target and tty1 autologin are left alone, so the existing DE/login manager
+  keeps working. Launch the wall on demand from the **desktop icon** or
+  `systemctl start soc-wall`.
+- **`kiosk`** — the appliance takeover: enable tty1 autologin + the multi-user
+  target so the box boots straight into the wall, hands-free (the original boot
+  target is saved so uninstall can restore it).
+
+You can switch later by re-running `install.sh` with the other `INSTALL_MODE`.
+
+### The clickable launcher
+
+Both modes install a **desktop entry** (`soc-wall.desktop`) that opens a small
+GTK chooser (`scripts/soc-wall-menu` → `kiosk-host/host/launchermenu.py`) with
+three actions: **Setup**, **Desktop mode** (windowed), and **Kiosk mode**
+(fullscreen). This is the everyday entry point in desktop installs — no terminal
+needed. (The launcher's "Setup" entry is the graphical front door; the full GUI
+setup wizard is still in progress.)
 
 ## 2. Configure (the wizard does this)
 
@@ -103,3 +132,64 @@ config source, file perms, and the systemd units.
 - [ ] VPN (if used): `systemctl status forti-vpn` STATUS reads "Tunnel up"; pill is green
 - [ ] tunnel key (if used) is `permitopen`-restricted on the jump host
 - [ ] reboot ×3 → the wall returns fully logged-in, hands-free
+
+## Installing from a package (deb / rpm / apk)
+
+Instead of running `install.sh` from a checkout, you can install a prebuilt
+package. CI builds them on a `vX.Y.Z` tag (`.github/workflows/release.yml`, via
+nfpm) and attaches them — plus a source tarball and `SHA256SUMS` — to the GitHub
+Release:
+
+- **deb** — `arm64` (Pi 5), `armhf`, `amd64`
+- **rpm** — `aarch64`, `x86_64`
+- **apk** — `aarch64`, `x86_64`
+
+```bash
+sudo apt install ./p2soc_1.0.0-1_arm64.deb     # Debian/Raspberry Pi OS/Ubuntu
+sudo dnf install ./p2soc-1.0.0-1.aarch64.rpm   # Fedora/RHEL/openSUSE
+sudo apk add --allow-untrusted ./p2soc-1.0.0-r1_aarch64.apk
+```
+
+The package lays down `/opt/soc-display`, the units and the launcher; its
+post-install hook (`packaging/postinstall.sh`) wires up the rest. Packages
+default to **desktop** mode (they don't hijack the boot). After install, finish
+on the box exactly as for a checkout:
+
+```bash
+sudo python3 /opt/soc-display/setup.py first-run   # seal the master password
+sudo python3 /opt/soc-display/setup.py doctor
+```
+
+Prefer `install.sh` when you need `INSTALL_MODE=kiosk`, an unsupported distro
+(`SOC_SKIP_PACKAGES=1`), or to deploy straight from a local checkout.
+
+## Uninstall / revert
+
+```bash
+sudo ./uninstall.sh            # or: make uninstall
+sudo ./uninstall.sh --purge    # or: make uninstall ARGS="--purge"
+```
+
+`uninstall.sh` is **manifest-driven** — `install.sh` records what it changed in
+`/etc/soc-display/.install-manifest` (paths, users, the saved default boot
+target, whether it flipped the boot target / wrote the getty override). The
+uninstaller reads that to cleanly reverse the install and **restore the original
+boot target** (relevant only for a `kiosk` install). It's idempotent: safe to
+re-run.
+
+By default it **preserves operator data** — the `soc`/service/Vaultwarden users
+and their homes, `/etc/soc-display` (panels.yaml, soc.env, the sealed secrets)
+and `/var/lib/vaultwarden` (the vault) are kept. Pass **`--purge`** to also wipe
+those (one explicit confirmation; add `--force` for unattended). A package
+install removes the same way via the package manager (`apt remove p2soc`, etc.),
+whose pre-remove hook calls the same revert logic.
+
+## Rebranding
+
+The product name, tagline, icon and accent colours come from one file —
+`branding/branding.yaml` (read by `host/branding.py`) — and flow into the
+launcher, the desktop entry (generated at install time) and the setup screens.
+Override per-host with `/etc/soc-display/branding.yaml` or by pointing
+`SOC_BRANDING_FILE` at your own copy; the icon is `share/icons/soc-wall.svg`.
+Edit the file, re-run `install.sh` (or restart the launcher) and the new
+branding shows up everywhere — no code changes.

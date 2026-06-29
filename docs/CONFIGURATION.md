@@ -19,6 +19,21 @@ display:
 
 Cell geometry is computed as `(width - gap*(cols-1)) / cols` × `(height - gap*(rows-1)) / rows`.
 
+## Vault backend (`SOC_VAULT_BACKEND`)
+
+Logins, the config note, and VPN/proxy creds all come from Vaultwarden. The
+backend that talks to it is selected by `SOC_VAULT_BACKEND` in `soc.env`:
+
+| `SOC_VAULT_BACKEND` | What it is | Use when |
+|---|---|---|
+| `litebw` *(default)* | **`litebw`** — a pure-Python, rbw-compatible Vaultwarden client (`host/litebw.py`). Needs **no Rust toolchain**, so it runs on the 1 GB Pi without compiling anything. (`native` is an alias.) | production, the Pi, anywhere |
+| `rbw` | the legacy [`rbw`](https://github.com/doy/rbw) CLI, unlocked through `scripts/pinentry-vault.py` | a host that already has `rbw` installed and prefers it |
+| `dev` | a plain JSON file (`$SOC_DEV_VAULT`) — no Vaultwarden needed | local testing / `make test` only |
+
+`litebw` and `rbw` share the same unattended-unlock model: they unseal the
+host-bound master (see below) so **no plaintext master password lives on disk**.
+Credentials are held only in a short-TTL in-RAM cache.
+
 ## Vault master-password source (`SOC_MASTER_SOURCE`)
 
 The Vaultwarden master password (which `litebw`/`rbw` need to derive the account
@@ -125,11 +140,71 @@ port before opening the window.
 | `title` | the `id` | display name (shown on the status card + on-screen config) |
 | `url` | — | for `mode: direct`; **may be omitted** — the tile then shows a "not configured" card until a URL is set (in YAML or at the glass) |
 | `vault_item` | — | the Vaultwarden login to auto-fill this panel; **omit for a display-only tile** (no auto-login). When set, `selectors` are required |
-| `allow_insecure` | `false` | accept a self-signed TLS cert for this panel (trusted LAN only) |
+| `allow_insecure` | `false` | accept a self-signed TLS cert for this panel (trusted LAN only). `insecure_tls:` is an accepted alias |
 | `allow_media` | `false` | keep WebGL / WebAudio / HTML5 media enabled (off by default to save RAM/GPU on 1 GB boards) |
+| `persist` | `true` | keep cookies + web storage on disk so a cookie-session dashboard stays logged in across a panel reload **and** a wall restart. `false` → ephemeral (no on-disk session) |
+| `user_agent` | — | override the browser User-Agent string for this panel (some dashboards gate behaviour on it) |
+| `allow` | `[]` | extra domains this panel may navigate its **top-level** frame to, on top of its own origin + the bundled SSO list. Wildcard `*.example.com` ok |
+| `block_trackers` | `true` | apply the analytics/tracker blocklist for this panel. `false` → don't (for a dashboard that legitimately needs one) |
+| `unblock` | `[]` | specific tracker hosts this panel is allowed to load even with `block_trackers: true` |
 
 So the minimum panel is just `{id, grid}` (a blank, configurable tile); add `url`
 to display a page, and `vault_item` + `selectors` to auto-log-in.
+
+### Renderer security & site restriction
+
+Every panel renders a third-party-fronted SOC dashboard that could be compromised
+or buggy. The renderer reduces blast radius **without breaking a normal dashboard**
+— every restriction is scoped to things a dashboard doesn't need, and every
+loosening is explicit opt-in. The defaults are safe and invisible.
+
+- **WebKit hardening (always on).** No file:// escalation, no Java/plugins, no
+  mixed (insecure) content on HTTPS pages, no downloads / arbitrary file pickers,
+  a hardened `NO_THIRD_PARTY` cookie accept policy, and the WebKit sandbox where
+  available. TLS certs are **verified** (fail-closed); a panel opts out per-tile
+  with `allow_insecure` / `insecure_tls` (trusted LAN only).
+- **Navigation allowlist.** Top-level (main-frame) navigation is restricted to an
+  allowlist: each panel's own origin (and its subdomains) + a bundled cloud-SSO
+  list (`security/allowlist-sso.txt`) + any per-panel `allow:` + the global
+  `security.allow:` / `security.sso_allow:`. Sub-resources, XHR, websockets and
+  SSO **redirect** chains are *not* gated, so real logins and live dashboards keep
+  working — only an attempt to drive the panel's top-level frame to an unrelated
+  site is refused (and logged). Self-hosted dashboards add their origin with one
+  `allow:` line; the master switch `SOC_NAV_ALLOWLIST=0` disables the gate for an
+  unmapped dashboard.
+- **Tracker / analytics blocking.** The curated top-20 analytics/tracker domains
+  (`security/trackers-top20.json`, a WebKit `WKContentRuleList` / Chromium
+  `Network.setBlockedURLs` data file — easy to extend by appending hosts) are
+  dropped as **third-party** requests, so a dashboard's own first-party telemetry
+  is never caught. Less third-party JS = smaller attack surface and less RAM/CPU.
+  Opt a panel out with `block_trackers: false`, or allow one host with `unblock:`.
+
+#### Optional top-level `security:` block
+
+All keys are optional and default to the safe/on value; omit the block entirely
+for today's behaviour.
+
+```yaml
+security:
+  nav_allowlist: true        # gate top-level navigation to the allowlist
+  block_trackers: true       # global default for the per-panel knob
+  allow: []                  # extra allowed top-level-nav domains (every panel)
+  sso_allow: []              # extra SSO/redirect domains on top of the bundled list
+```
+
+Environment overrides (set in `soc.env`): `SOC_NAV_ALLOWLIST` and
+`SOC_BLOCK_TRACKERS` (`0`/`1`) override the file defaults at boot; `SOC_WEBDATA_DIR`
+overrides where persistent web data is stored.
+
+#### Where sessions are stored
+
+Persistent cookies and web storage hold **session tokens**, so they live in a
+private `webdata/` dir — mode `0700`, owned by the kiosk user, a **sibling** of
+the sealed-master `secret/` dir (never inside it), outside the repo, and never
+logged. Each panel gets its own subdirectory (`webdata/<panel-id>/`) so one
+panel cannot read another's session. The location follows the same precedence as
+the rest of the config (`$SOC_WEBDATA_DIR` → user dir when the active marker is
+set → `/etc/soc-display/webdata` when deployed → `dev/run/webdata` in a checkout).
 
 ### Auto-login & the sign-in popup
 
@@ -252,7 +327,11 @@ vpn:
   gateway: "vpn.example.com"        # FortiGate SSL-VPN host
   port: 443
   vault_item: "SOC FortiGate VPN"   # Vaultwarden login: FortiGate user + password
-  trusted_cert: ""                  # sha256 digest to pin the gateway cert (recommended)
+  trusted_cert: ""                  # digest to pin the gateway cert (recommended); a
+                                    # SHA-256 (64 hex) OR SHA-1 (40 hex) fingerprint,
+                                    # case-insensitive — SHA-256 preferred
+  interface: ""                     # tunnel interface-name override (e.g. ppp1/tunN) so
+                                    # the on-wall VPN pill finds a non-default device
   realm: ""                         # FortiGate realm, if your gateway uses one
   set_routes: true                  # accept routes pushed by the gateway
   set_dns: false                    # usually keep the local resolver
@@ -283,11 +362,14 @@ misses.
 
 How the password stays safe: the supervisor reads the FortiGate password from the
 vault and hands it to openfortivpn through a **pinentry helper**
-(`scripts/forti-pinentry.sh`), exactly like `rbw` is unlocked — so it is **never
+(`scripts/forti-pinentry.sh`), exactly like `litebw` (or `rbw`) is unlocked — so it is **never
 on the command line and never written to disk**. Only the gateway, username, and
 routing flags are visible in the process list.
 
-**Pin the cert.** Get the digest from the first connection attempt's error, or:
+**Pin the cert.** `trusted_cert` accepts a **SHA-256 (64 hex)** *or* **SHA-1 (40
+hex)** fingerprint, case-insensitive (openfortivpn takes both; SHA-256 is
+preferred, SHA-1 is for older gateways). Get the digest from the first connection
+attempt's error, or:
 
 ```bash
 openssl s_client -connect vpn.example.com:443 </dev/null 2>/dev/null \
@@ -393,3 +475,51 @@ Other tips:
 - For Grafana/Kibana-style panels, add kiosk/refresh params to the URL, e.g.
   `…/d/abc?kiosk&refresh=30s`, to cut live-update CPU/RAM.
 - On 32-bit ARM (armv7), run a 64-bit OS instead if you can — WebKitGTK is heavy.
+
+## Install mode (`INSTALL_MODE`)
+
+`install.sh` deploys the same files either way; `INSTALL_MODE` (env var, **default
+`desktop`**) only decides whether the box becomes a dedicated appliance:
+
+| `INSTALL_MODE` | Effect |
+|---|---|
+| `desktop` *(default)* | deploy everything but **leave the systemd default target and tty1 autologin untouched** — your desktop environment keeps working. Launch the wall on demand from the desktop icon (Setup / Desktop mode / Kiosk mode). |
+| `kiosk` | the appliance takeover: enable **tty1 autologin** so the box boots straight into the fullscreen wall. |
+
+```bash
+sudo ./install.sh                      # desktop (default)
+sudo INSTALL_MODE=kiosk ./install.sh   # dedicated tty1-autologin appliance
+```
+
+The install records `/etc/soc-display/.install-manifest`; `./uninstall.sh` (or
+`make uninstall`) is manifest-driven, restores the boot target, and **preserves
+operator data by default** (`--purge` to wipe it).
+
+## Branding (`branding/branding.yaml`)
+
+Rebrand the whole product from one file — **`branding/branding.yaml`** (loaded by
+`host/branding.py`). Name, tagline, icon and accent colours flow into the launcher
+menu, the desktop app entry (generated at install) and the setup wizard. A partial
+file is fine; anything you omit falls back to the built-in defaults.
+
+```yaml
+name: "SOC Video Wall"          # full product name (titles, headers)
+short_name: "SOC Wall"          # compact name (window title, menus)
+tagline: "Operations console"   # one-line subtitle under the name
+vendor: "s-b-repo"
+homepage: "https://github.com/s-b-repo/p2soc"
+icon: "share/icons/soc-wall.svg"   # SVG; repo-relative or absolute
+colors:
+  primary: "#2BE0C8"            # brand colour
+  setup: "#8B9CFF"             # tints the three launcher cards…
+  desktop: "#2BE0C8"
+  kiosk: "#F5B14C"
+  background: "#0B1220"         # …and themes the window
+  text: "#E8EEF7"
+  text_dim: "#8194B0"
+```
+
+Override the source at runtime with **`SOC_BRANDING_FILE=/path/to/branding.yaml`**,
+or drop a `branding.yaml` in **`/etc/soc-display/`** on a deployed box (the
+`SOC_BRANDING_FILE` env var wins, then `/etc/soc-display/branding.yaml`, then the
+repo file).

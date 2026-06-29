@@ -20,7 +20,12 @@
     passSel:     "{{PASS_SEL}}",
     submitSel:   "{{SUBMIT_SEL}}",
     loginMarker: "{{LOGIN_MARKER}}",   // selector present ONLY on the login page
-    keepalive:   {{KEEPALIVE_JSON}}    // {strategy,intervalSec,url?,target?}
+    keepalive:   {{KEEPALIVE_JSON}},   // {strategy,intervalSec,url?,target?}
+    // Origin (scheme://host[:non-default-port]) this panel is configured for.
+    // socLogin refuses to fill credentials on any other origin, so an open
+    // redirect / compromised dashboard can't autofill SOC creds into an
+    // attacker page. Empty string = unset = legacy behaviour (no gate).
+    allowedOrigin: "{{ALLOWED_ORIGIN}}"
   };
 
   window.__SOC = { installed: true, cfg: CFG, needLogin: false,
@@ -71,16 +76,40 @@
 
   function onLoginPage() {
     try {
-      // configured marker if present; otherwise heuristic (a visible password
-      // field), so a panel set at the glass without selectors still works.
+      // 1. Configured marker selector wins (operator-set, panel-specific).
       if (CFG.loginMarker) return !!document.querySelector(CFG.loginMarker);
-      return !!document.querySelector('input[type="password"]');
+      // 2. Heuristic: a real password input means it's a login form.
+      if (document.querySelector('input[type="password"]')) return true;
+      // 3. FALLBACK (text-pattern): the dashboard was redesigned and the
+      //    selectors miss, but the rendered page clearly says "Sign in" /
+      //    "Password" / "Username". Use a DOM-text heuristic so the host
+      //    knows to try filling credentials anyway. Bounded slice + word
+      //    boundaries (\b) so we don't false-positive on a page that just
+      //    happens to mention "password" in the body copy.
+      var txt = "";
+      try { txt = (document.body && document.body.innerText || "").slice(0, 8192); }
+      catch (e) { return false; }
+      if (/\b(sign\s+in|log\s+in|password|user\s*name|email\s+address)\b/i.test(txt)) {
+        // Require that *some* password-shaped input exists too (avoid pages
+        // that talk about "password" but have no form — e.g. a help page).
+        var pw = document.querySelector(
+          'input[type="password"], input[name*="pass" i], input[id*="pass" i]');
+        if (pw) return true;
+      }
+      return false;
     } catch (e) { return false; }
   }
 
   function passField() {
-    if (CFG.passSel) return document.querySelector(CFG.passSel);
-    return document.querySelector('input[type="password"]');
+    if (CFG.passSel) {
+      var p = document.querySelector(CFG.passSel);
+      if (p) return p;
+    }
+    // Loose fallback: type=password OR a name/id that contains "pass". Picks
+    // up forms that style a "PIN" field as type=password etc. — same heuristic
+    // the text-pattern login detector above uses.
+    return document.querySelector(
+      'input[type="password"], input[name*="pass" i], input[id*="pass" i]');
   }
 
   function userField(p) {
@@ -102,6 +131,16 @@
   // Called by the host with real creds. Returns true if it submitted.
   window.socLogin = function (creds) {
     try {
+      // Origin gate: never fill credentials on a page that is not the panel's
+      // configured origin (defends against open redirects / compromised
+      // dashboards navigating off-site). Unset allowedOrigin = legacy behaviour.
+      if (CFG.allowedOrigin && location.origin !== CFG.allowedOrigin) {
+        try {
+          console.warn("SOC: refusing credential injection — origin " +
+                       location.origin + " != allowed " + CFG.allowedOrigin);
+        } catch (e) {}
+        return false;
+      }
       var p = passField();
       if (!p) return false;
       var u = userField(p);
