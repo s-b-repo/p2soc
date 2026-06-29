@@ -1,0 +1,35 @@
+# Dependabot — the free GitHub dependency-update bot. It opens grouped PRs when a
+# dependency has an update or a security fix; the CI workflow (.github/workflows/
+# ci.yml, which runs `make lint && make test` on pull_request) then proves the
+# update doesn't break anything before you merge. No third-party service, no cost.
+version: 2
+updates:
+  # Python deps tracked in requirements*.txt. The installers may use distro
+  # packages, but Dependabot still flags upstream releases + CVEs here.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "deps"
+    groups:
+      python:
+        patterns: ["*"]
+
+  # The GitHub Actions pinned by ci.yml / release.yml — keep them current + patched
+  # (outdated/abandoned actions are a real supply-chain risk).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
