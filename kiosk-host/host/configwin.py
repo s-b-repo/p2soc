@@ -752,7 +752,7 @@ class ConfigWindow(Gtk.Window):
         w["captcha_auto"].set_active(v.get("captcha_auto", True))
         w["captcha_show"] = Gtk.CheckButton(label="show captcha image in log (iNode — for manual entry)")
         w["captcha_show"].set_active(bool(v.get("captcha_show")))
-        w["captcha_retries"] = Gtk.SpinButton.new_with_range(1, 100, 1)
+        w["captcha_retries"] = Gtk.SpinButton.new_with_range(1, 40, 1)
         w["captcha_retries"].set_value(int(v.get("captcha_retries", 40)))
 
         box.pack_start(w["insecure"], False, False, 0)
