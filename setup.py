@@ -328,6 +328,15 @@ def write_file(path: str, content: str, mode: int, dry: bool):
         path = os.path.join(alt, base)
         parent = alt
         note(f"  /etc not writable — writing to {path} instead")
+        # Drop the active marker so the wall reads THIS file over the stale /etc copy
+        marker = cp.active_marker()
+        if marker:
+            try:
+                os.makedirs(os.path.dirname(marker), 0o700, exist_ok=True)
+                with open(marker, "w", encoding="utf-8") as fh:
+                    fh.write(f"{path}\n# activated {time.strftime('%Y-%m-%dT%H:%M:%S%z')} by uid {os.geteuid()}\n")
+            except OSError:
+                pass
     backup(path)
     # Atomic write (mirror backup.write_backup): stage into <path>.tmp in the SAME
     # dir (so os.replace is a same-fs rename, no EXDEV), fsync, force the final
