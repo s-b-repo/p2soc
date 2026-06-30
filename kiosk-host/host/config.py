@@ -156,6 +156,7 @@ class Panel:
                                     # `insecure_tls:` in YAML is an accepted alias.
     allow_media: bool = False       # keep WebGL/WebAudio/<video> (off by default
                                     # to save RAM/GPU on 1 GB boards)
+    tenant: str = ""                # optional tenant tag (multi-tenant grouping)
     # --- renderer security / compat knobs (consumed by webkit_panel/chromium_panel) ---
     persist: bool = True            # persist cookies + web storage on disk so a
                                     # session survives reload + wall restart

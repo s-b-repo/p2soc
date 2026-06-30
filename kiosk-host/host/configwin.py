@@ -477,8 +477,16 @@ class ConfigWindow(Gtk.Window):
         for opt in ("webkit", "chromium"):
             engine_c.append_text(opt)
         engine_c.set_active(1 if p.engine == "chromium" else 0)
+
+        # Tenant field
+        tenant_e = Gtk.Entry()
+        tenant_e.set_text(getattr(p, "tenant", "") or "")
+        tenant_e.set_width_chars(16)
+        tenant_e.set_placeholder_text("tenant (optional)")
+
         for col, (lbl, w) in enumerate((("title", title_e), ("URL", url_e),
-                                        ("vault login", vault_e), ("engine", engine_c))):
+                                        ("vault login", vault_e), ("engine", engine_c),
+                                        ("tenant", tenant_e))):
             h = Gtk.Label(label=lbl)
             h.get_style_context().add_class("soc-config-sub")
             h.set_xalign(0.0)
@@ -488,7 +496,7 @@ class ConfigWindow(Gtk.Window):
         # Allow insecure TLS — right below the URL/engine row
         insecure_chk = Gtk.CheckButton(label="Allow insecure TLS (self-signed certs)")
         insecure_chk.set_active(bool(getattr(p, "allow_insecure", False)))
-        g.attach(insecure_chk, 0, 2, 4, 1)
+        g.attach(insecure_chk, 0, 2, 5, 1)
 
         inner.pack_start(g, False, False, 0)
 
@@ -525,7 +533,8 @@ class ConfigWindow(Gtk.Window):
         self._rows[p.id] = {"url": url_e, "title": title_e, "vault": vault_e,
                             "engine": engine_c, "user": user_e, "pass": pass_e,
                             "submit": sub_e, "marker": mark_e,
-                            "insecure": insecure_chk}
+                            "insecure": insecure_chk,
+                            "tenant": tenant_e}
         return frame
 
     def _tab_credentials(self):
@@ -571,10 +580,47 @@ class ConfigWindow(Gtk.Window):
             grid.attach(btn, 3, r, 1, 1)
             self._cred_r += 1
 
+        # Panel logins section
+        pnl_lbl = Gtk.Label(label="Panel Logins")
+        pnl_lbl.get_style_context().add_class("soc-config-title")
+        pnl_lbl.set_xalign(0.0)
+        pnl_lbl.set_margin_top(6)
+        box.pack_start(pnl_lbl, False, False, 0)
+        panel_count = 0
         for p in self.panels:
-            add_row(p.vault_item, p.effective_url)
-        add_row((self._vpn or {}).get("vault_item", ""), "")   # VPN login -> vault
-        add_row(self._proxy_vault_item, "")                    # proxy login -> vault
+            if p.vault_item:
+                add_row(p.vault_item, p.effective_url)
+                panel_count += 1
+        if panel_count == 0:
+            box.pack_start(Gtk.Label(label="  No panel vault logins configured. "
+                                           "Set a 'vault login' on a panel first."),
+                           False, False, 0)
+
+        # VPN login section
+        vpn_item = (self._vpn or {}).get("vault_item", "")
+        vpn_lbl = Gtk.Label(label="VPN Login")
+        vpn_lbl.get_style_context().add_class("soc-config-title")
+        vpn_lbl.set_xalign(0.0)
+        vpn_lbl.set_margin_top(12)
+        box.pack_start(vpn_lbl, False, False, 0)
+        if vpn_item:
+            add_row(vpn_item, "")
+        else:
+            box.pack_start(Gtk.Label(label="  No VPN vault login. Set in the VPN tab."),
+                           False, False, 0)
+
+        # Proxy login section
+        proxy_lbl = Gtk.Label(label="Proxy Login")
+        proxy_lbl.get_style_context().add_class("soc-config-title")
+        proxy_lbl.set_xalign(0.0)
+        proxy_lbl.set_margin_top(12)
+        box.pack_start(proxy_lbl, False, False, 0)
+        if self._proxy_vault_item:
+            add_row(self._proxy_vault_item, "")
+        else:
+            box.pack_start(Gtk.Label(label="  No proxy vault login configured."),
+                           False, False, 0)
+
         if self._cred_r == 1:
             box.pack_start(Gtk.Label(label="No vault logins to set yet (give a "
                                            "panel/VPN/proxy a vault item first)."),
@@ -1127,7 +1173,8 @@ class ConfigWindow(Gtk.Window):
             entry = overrides.get(pid, {}) if isinstance(overrides.get(pid), dict) else {}
             entry.update({"url": url, "title": title, "vault_item": vault_item,
                           "engine": engine, "selectors": sel, "login_marker": marker,
-                          "allow_insecure": allow_insecure})
+                          "allow_insecure": allow_insecure,
+                          "tenant": _sanitize_len(w["tenant"].get_text(), 100)})
             overrides[pid] = entry
 
         if self.display is not None:
