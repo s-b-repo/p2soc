@@ -591,7 +591,7 @@ entry {{ background-color: {sunken}; color: {text};
   caret-color: {accent}; transition: border-color 120ms ease, box-shadow 120ms ease; }}
 entry:focus, entry:focus-visible {{ border: 1px solid {accent};
   box-shadow: 0 0 0 2px {ring}; }}
-entry image, entry placeholder {{ color: {text_dim}; }}
+entry image, entry placeholder {{ color: {text}; opacity: 0.55; }}
 .soc-field-bad {{ border: 1px solid {bad}; }}
 .soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.30)}; }}
 .soc-field-good {{ border: 1px solid {good}; }}
