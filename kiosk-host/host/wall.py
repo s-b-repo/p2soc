@@ -507,6 +507,7 @@ class WallWindow:
             pass
 
     # ---- screen / size ------------------------------------------------------
+    def _screen_size(self):
         w, h = self.conf.display.width, self.conf.display.height
         try:
             disp = Gdk.Display.get_default()
