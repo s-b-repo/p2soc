@@ -427,10 +427,14 @@ fi
 # --------------------------------------------------------------------------- #
 log "Installing project to $SOC_ROOT"
 mkdir -p "$SOC_ROOT"
+# When the installer lives inside the target (package postinst), the tree is
+# already in place — skip the self-copy to avoid tar file-changed races.
+if [ "$SRC_DIR" != "$SOC_ROOT" ]; then
 # copy everything except dev runtime / venv / git
 tar -C "$SRC_DIR" \
     --exclude='.git' --exclude='.venv' --exclude='dev/run' --exclude='__pycache__' \
     --warning=no-file-changed -cf - . | tar -C "$SOC_ROOT" -xf -
+fi
 chown -R root:root "$SOC_ROOT"
 chmod +x "$SOC_ROOT"/scripts/*.sh "$SOC_ROOT"/scripts/*.py 2>/dev/null || true
 # the bundled iNode SSL-VPN client (vendor/) — its connect script + helpers
