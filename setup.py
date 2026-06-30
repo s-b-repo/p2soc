@@ -298,8 +298,15 @@ def backup(path: str):
         return
     stamp = time.strftime("%Y%m%d-%H%M%S")
     bak = f"{path}.bak.{stamp}"
-    shutil.copy2(path, bak)
-    note(f"backed up existing {path} -> {os.path.basename(bak)}")
+    try:
+        shutil.copy2(path, bak)
+        note(f"backed up existing {path} -> {os.path.basename(bak)}")
+    except PermissionError:
+        # Non-root user can't back up root-owned files in /etc — the write
+        # below will go to a user-writable path instead; skipping the backup
+        # is safe because the original file is unchanged.
+        note(f"cannot back up {path} (permission denied) — skipping backup, "
+             f"original file untouched")
 
 
 def write_file(path: str, content: str, mode: int, dry: bool):
@@ -311,6 +318,16 @@ def write_file(path: str, content: str, mode: int, dry: bool):
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
+    # If the target dir isn't writable (non-root user, /etc owned by root),
+    # silently redirect to the per-user XDG dir so the install completes.
+    if not os.access(parent, os.W_OK):
+        import host.configpaths as cp
+        base = os.path.basename(path)
+        alt = cp.user_dir()
+        os.makedirs(alt, exist_ok=True)
+        path = os.path.join(alt, base)
+        parent = alt
+        note(f"  /etc not writable — writing to {path} instead")
     backup(path)
     # Atomic write (mirror backup.write_backup): stage into <path>.tmp in the SAME
     # dir (so os.replace is a same-fs rename, no EXDEV), fsync, force the final
