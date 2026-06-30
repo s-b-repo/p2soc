@@ -81,6 +81,13 @@ class WallWindow:
                                   "(Ctrl+Alt+L). Panels stay visible.")
             lock.connect("clicked", lambda *_: self.on_lock and self.on_lock())
             toolbar.pack_end(lock, False, False, 0)
+        # Screenshot button — saves wall state to ~/soc-wall-*.png
+        ss_btn = Gtk.Button(label="📷 Shot")
+        ss_btn.get_style_context().add_class("soc-toolbar-action")
+        ss_btn.set_tooltip_text("Save a screenshot of the wall")
+        ss_btn.connect("clicked", lambda *_: self._take_screenshot())
+        toolbar.pack_end(ss_btn, False, False, 0)
+
         if on_show_vpn_log is not None:
             # Dedicated 'show the VPN log' button — distinct from the VPN
             # pill (which RECONNECTS), this just opens the live log viewer
@@ -98,7 +105,20 @@ class WallWindow:
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.pack_start(toolbar, False, False, 0)
-        vbox.pack_start(grid, True, True, 0)
+
+        # Wrap grid in an overlay so the PIN lock can cover panels
+        overlay = Gtk.Overlay()
+        overlay.add(grid)
+        self._lock_overlay = self._build_lock_overlay()
+        overlay.add_overlay(self._lock_overlay)
+        self._lock_overlay.set_visible(False)
+        self._locked = False
+        self._lock_entry = None  # set by _build_lock_overlay
+        self._lock_err = None
+        self._lock_fails = 0
+        self._overlay = overlay
+
+        vbox.pack_start(overlay, True, True, 0)
         win.add(vbox)
 
         win.connect("key-press-event", self._on_key)
@@ -323,7 +343,170 @@ class WallWindow:
         widget.set_vexpand(True)
         self.grid.attach(widget, col, row, 1, 1)
 
-    def _screen_size(self):
+    def detach(self, pid: str):
+        """Remove a panel's widget from the grid by panel id."""
+        for child in self.grid.get_children():
+            # Find the PanelFrame wrapping this panel's widget
+            if hasattr(child, '_content') and hasattr(child._content, 'panel'):
+                if getattr(child._content.panel, 'id', '') == pid:
+                    self.grid.remove(child)
+                    return
+            # Direct widget check
+            if hasattr(child, 'panel') and getattr(child.panel, 'id', '') == pid:
+                self.grid.remove(child)
+                return
+
+    # ---- PIN lock overlay ----------------------------------------------------
+    def _build_lock_overlay(self):
+        """Floating, draggable PIN unlock dialog. Panels stay fully visible;
+        clicks/keys pass through to panels except on the dialog itself."""
+        # Transparent event box — lets clicks through to panels below
+        outer = Gtk.EventBox()
+
+        # Draggable floating card
+        card = Gtk.Frame()
+        ctx = card.get_style_context()
+        ctx.add_class("soc-config")
+        ctx.add_class("soc-locked")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(18)
+
+        title = Gtk.Label(label="🔒  Unlock Wall")
+        title.get_style_context().add_class("soc-config-title")
+        title.set_halign(Gtk.Align.CENTER)
+
+        self._lock_entry = Gtk.Entry()
+        self._lock_entry.set_visibility(False)
+        self._lock_entry.set_placeholder_text("Enter PIN")
+        self._lock_entry.set_alignment(0.5)
+        self._lock_entry.set_width_chars(16)
+        self._lock_entry.connect("activate", lambda *_: self._try_unlock())
+
+        self._lock_err = Gtk.Label(label="")
+        self._lock_err.get_style_context().add_class("soc-config-error")
+        self._lock_err.set_halign(Gtk.Align.CENTER)
+
+        unlock_btn = Gtk.Button(label="Unlock")
+        unlock_btn.get_style_context().add_class("soc-config-primary")
+        unlock_btn.connect("clicked", lambda *_: self._try_unlock())
+
+        for w in (title, self._lock_entry, self._lock_err, unlock_btn):
+            box.pack_start(w, False, False, 0)
+
+        card.add(box)
+
+        # Make the card draggable via a title-bar grab area
+        drag_bar = Gtk.EventBox()
+        drag_bar.add(card)
+        drag_bar.connect("button-press-event", self._on_drag_start)
+        drag_bar.connect("button-release-event", self._on_drag_end)
+        drag_bar.connect("motion-notify-event", self._on_drag_motion)
+        self._drag_start_x = 0
+        self._drag_start_y = 0
+        self._dragging = False
+
+        # Center the card
+        center = Gtk.Box()
+        center.set_halign(Gtk.Align.CENTER)
+        center.set_valign(Gtk.Align.CENTER)
+        center.add(drag_bar)
+        outer.add(center)
+        self._drag_parent = center
+        return outer
+
+    def _on_drag_start(self, w, event):
+        self._drag_start_x = event.x_root
+        self._drag_start_y = event.y_root
+        self._dragging = True
+
+    def _on_drag_end(self, w, event):
+        self._dragging = False
+
+    def _on_drag_motion(self, w, event):
+        if not self._dragging:
+            return
+        dx = event.x_root - self._drag_start_x
+        dy = event.y_root - self._drag_start_y
+        if abs(dx) < 3 and abs(dy) < 3:
+            return
+        hal = self._drag_parent.get_halign()
+        val = self._drag_parent.get_valign()
+        self._drag_parent.set_halign(Gtk.Align.START)
+        self._drag_parent.set_valign(Gtk.Align.START)
+        self._drag_parent.set_margin_start(
+            max(0, self._drag_parent.get_margin_start() + dx))
+        self._drag_parent.set_margin_top(
+            max(0, self._drag_parent.get_margin_top() + dy))
+        self._drag_start_x = event.x_root
+        self._drag_start_y = event.y_root
+
+    def lock_panels(self):
+        """Show the PIN overlay — panels keep rendering underneath."""
+        if self._locked:
+            return
+        self._locked = True
+        self._lock_fails = 0
+        self._lock_err.set_text("")
+        self._lock_entry.set_text("")
+        self._lock_overlay.set_visible(True)
+        self._lock_overlay.show_all()
+        self._lock_entry.grab_focus()
+
+    def unlock_panels(self):
+        """Hide the PIN overlay."""
+        self._locked = False
+        self._lock_overlay.set_visible(False)
+
+    def _try_unlock(self):
+        """Verify PIN from the lock overlay entry."""
+        from .locker import verify_pin
+        from .configwin import state_dir
+        pin = self._lock_entry.get_text()
+        if verify_pin(state_dir(), pin):
+            self.unlock_panels()
+            return
+        self._lock_entry.set_text("")
+        self._lock_fails += 1
+        if self._lock_fails >= 3:
+            wait = min(5 * (self._lock_fails - 2), 60)
+            self._lock_err.set_text(f"Incorrect PIN — locked {wait}s")
+            self._lock_entry.set_sensitive(False)
+            GLib.timeout_add_seconds(wait, self._rearm_lock_entry)
+        else:
+            self._lock_err.set_text("Incorrect PIN")
+
+    def _rearm_lock_entry(self):
+        self._lock_entry.set_sensitive(True)
+        self._lock_entry.grab_focus()
+        self._lock_err.set_text("")
+        return False
+
+    def is_locked(self) -> bool:
+        return self._locked
+
+    def _take_screenshot(self):
+        """Save a PNG screenshot of the wall window to ~/soc-wall-*.png."""
+        import time
+        try:
+            win = self.window.get_window()
+            if win is None:
+                return
+            w = win.get_width()
+            h = win.get_height()
+            if w <= 0 or h <= 0:
+                return
+            pb = Gdk.pixbuf_get_from_window(win, 0, 0, w, h)
+            if pb is None:
+                return
+            path = os.path.expanduser(
+                "~/soc-wall-{}.png".format(time.strftime("%Y%m%d-%H%M%S")))
+            pb.savev(path, "png", [], [])
+            self.log("screenshot saved: {}".format(path))
+        except Exception:
+            pass
+
+    # ---- screen / size ------------------------------------------------------
         w, h = self.conf.display.width, self.conf.display.height
         try:
             disp = Gdk.Display.get_default()

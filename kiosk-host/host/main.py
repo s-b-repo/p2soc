@@ -333,8 +333,6 @@ class KioskHost:
         if self.wall is not None:
             self.wall.show()
             self._start_vpn_monitor()
-            # boot-time file-integrity check: warn on the top bar if the
-            # deployed tree has drifted from the install-time manifest.
             self._check_deploy_drift()
         self._start_mem_watch()
 
@@ -355,6 +353,25 @@ class KioskHost:
         log(f"memory watchdog on: recycle a panel when MemAvailable < "
             f"{self._mem_min_mb} MB (every {self._mem_check_sec}s)")
         GLib.timeout_add_seconds(self._mem_check_sec, self._check_memory)
+
+        # Branding refresh: detect theme changes from the setup wizard and repaint
+        # the running wall without a restart (checks the cross-process marker).
+        GLib.timeout_add_seconds(5, self._check_branding)
+
+    def _check_branding(self):
+        """Detect cross-process theme changes (setup wizard save) and repaint the
+        running wall without a restart. Returns True to keep the timer alive."""
+        try:
+            from . import branding
+            mt = branding._marker_mtime()
+            if mt > branding._marker_mtime_val:
+                branding._marker_mtime_val = mt
+                branding.load(refresh=True)
+                from . import style
+                style.apply_css()
+        except Exception:
+            pass
+        return True
 
     def _check_memory(self):
         avail = perf.mem_available_mb()
@@ -477,16 +494,14 @@ class KioskHost:
 
     # ---- kiosk lock + VPN-log viewer --------------------------------------
     def _lock_wall(self):
-        """Show the kiosk-lock overlay (toolbar 🔒 / Ctrl+Alt+L). Panels keep
-        rendering underneath; keyboard + mouse are inert until the operator
-        enters the PIN/TOTP (or the sealed setup PIN as an admin override)."""
-        if self._locker is None:
-            log("lock requested but the kiosk locker is unavailable")
+        """Toggle the PIN overlay on the wall panels. Panels keep rendering
+        underneath; keyboard + mouse are inert until PIN/TOTP is entered."""
+        if self.wall is None:
             return
-        try:
-            self._locker.lock(on_unlock=None)
-        except Exception as e:  # noqa: BLE001
-            log(f"lock failed: {e}")
+        if self.wall.is_locked():
+            self.wall.unlock_panels()
+        else:
+            self.wall.lock_panels()
 
     def open_vpn_log_viewer(self):
         """Open (or present) the live VPN log viewer — streams
@@ -700,7 +715,7 @@ class KioskHost:
         except Exception as e:                         # noqa: BLE001
             log(f"manifest check skipped: import failed ({e})")
             return
-        deploy_root = os.environ.get("SOC_DEPLOY_ROOT", "/opt/soc-display")
+        deploy_root = os.environ.get("SOC_DEPLOY_ROOT") or os.environ.get("SOC_ROOT") or "/opt/soc-display"
         import threading
 
         def work():
@@ -731,18 +746,34 @@ class KioskHost:
         self._config_win = None
 
     def apply_config(self, changes: dict):
-        """Live-apply URL/title/vault edits from the config window to the panels."""
+        """Live-apply URL/title/vault edits + add/remove panels from the config window."""
+        # --- add panels ---
+        added = changes.pop("_add_panel", None)
+        if added and self.wall is not None:
+            for pdict in added:
+                try:
+                    self._add_panel_live(pdict)
+                except Exception as e:  # noqa: BLE001
+                    log(f"[{pdict.get('id', '?')}] add panel failed: {e}")
+
+        # --- remove panels ---
+        removed = changes.pop("_remove_panel", None)
+        if removed:
+            for pid in removed:
+                self._remove_panel_live(pid)
+
+        # --- display ---
         disp = changes.pop("_display", None)
         if disp and self.wall is not None and "gap" in disp:
-            try:                                        # gap applies live
+            try:
                 self.wall.grid.set_row_spacing(disp["gap"])
                 self.wall.grid.set_column_spacing(disp["gap"])
             except Exception:  # noqa: BLE001
                 pass
         vpn_ch = changes.pop("_vpn", None)
         if vpn_ch is not None:
-            self.conf.vpn = vpn_ch                      # persisted to the vault note
-            self._restart_vpn_async()                   # pick up the new config
+            self.conf.vpn = vpn_ch
+            self._restart_vpn_async()
         by_id = {v.panel.id: v for v in self.panels_view}
         for pid, ch in changes.items():
             view = by_id.get(pid)
@@ -756,11 +787,75 @@ class KioskHost:
                 view.panel.vault_item = ch["vault_item"]
             url_changed = "url" in ch and ch["url"] != (view.panel.url or "")
             if url_changed:
-                view.set_url(ch["url"])      # reload (also re-triggers login)
+                view.set_url(ch["url"])
             elif vault_changed and hasattr(view, "set_url"):
-                # vault item changed but URL didn't — reload to re-trigger login
                 view.set_url(view.panel.url or "")
         self._push_config_to_vault()
+
+    def _add_panel_live(self, pdict: dict):
+        """Create and attach a new panel view at runtime."""
+        grid = tuple(pdict.get("grid", (len(self.panels_view) % 2, len(self.panels_view) // 2)))
+        from .config import Panel, KeepAlive
+        ka = KeepAlive(strategy="none")
+        panel = Panel(
+            id=pdict["id"],
+            engine=pdict.get("engine", "webkit"),
+            grid=grid,
+            mode=pdict.get("mode", "direct"),
+            vault_item=pdict.get("vault_item", ""),
+            selectors=pdict.get("selectors", {}),
+            login_marker=pdict.get("login_marker", ""),
+            keepalive=ka,
+            url=pdict.get("url", ""),
+            title=pdict.get("title", ""),
+            allow_insecure=pdict.get("allow_insecure", False))
+        self.conf.panels.append(panel)
+
+        cdp_base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
+        idx = len(self.panels_view)
+        if panel.engine == "chromium":
+            from .chromium_panel import ChromiumPanel
+            view = ChromiumPanel(panel, self.need_login, log,
+                                 cdp_port=cdp_base + idx,
+                                 proxy=self.conf.proxy,
+                                 proxy_creds=self.proxy_creds,
+                                 security=self.conf.security,
+                                 on_login_success=self.login_success)
+        else:
+            from .webkit_panel import WebKitPanel
+            view = WebKitPanel(panel, self.need_login, log,
+                               embedded=self.wall is not None,
+                               proxy=self.conf.proxy,
+                               proxy_creds=self.proxy_creds,
+                               security=self.conf.security,
+                               on_config=(self.open_config
+                                          if os.environ.get("SOC_ONSCREEN_CONFIG", "1") != "0"
+                                          else None),
+                               on_login_success=self.login_success)
+            if self.wall is not None:
+                self.wall.attach(panel, view.widget)
+        self.panels_view.append(view)
+        GLib.idle_add(self._show_one, view)
+        log(f"[{panel.id}] panel added live")
+
+    def _remove_panel_live(self, pid: str):
+        """Remove a panel view at runtime."""
+        for i, v in enumerate(self.panels_view):
+            if v.panel.id == pid:
+                try:
+                    v.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.panels_view.pop(i)
+                self.conf.panels = [p for p in self.conf.panels if p.id != pid]
+                if self.wall is not None:
+                    try:
+                        self.wall.detach(pid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                log(f"[{pid}] panel removed live")
+                return
+        log(f"[{pid}] panel not found for removal")
 
     def _restart_vpn_async(self):
         """A VPN-tab change — restart the VPN service so it re-reads the config
@@ -1252,7 +1347,8 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
 
         def _open_setup(_b):
             import subprocess  # local: subprocess isn't a module-level import
-            root = os.environ.get("SOC_ROOT", "/opt/soc-display")
+            root = os.environ.get("SOC_ROOT") or os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", ".."))
             sh = os.path.join(root, "scripts", "soc-wall-setup-gui.sh")
             argv = (["bash", sh] if os.path.exists(sh)
                     else [sys.executable, "-m", "host.setupgui"])

@@ -61,6 +61,8 @@ desktop-dev: .venv  ## install user-level app icons pointing at THIS checkout (n
 	@install -m0644 share/icons/soc-wall.svg $(HOME)/.local/share/icons/hicolor/scalable/apps/soc-wall.svg
 	@PYTHONPATH=kiosk-host SOC_ROOT="$(CURDIR)" $(PY) -m host.branding desktop \
 	  "$(CURDIR)/scripts/soc-wall-menu" soc-wall > $(HOME)/.local/share/applications/soc-wall.desktop
+	@printf '[Desktop Entry]\nName=SOC Wall Setup\nComment=Configure the SOC video wall\nExec=%s/scripts/soc-wall-setup-gui.sh\nIcon=soc-wall\nTerminal=false\nType=Application\nNoDisplay=true\nCategories=Settings;\nKeywords=soc;setup;config;wizard;\n' "$(CURDIR)" > $(HOME)/.local/share/applications/soc-wall-setup.desktop
+	@printf '[Desktop Entry]\nName=SOC Wall Appearance\nComment=Theme colours and presets for the SOC video wall\nExec=%s/scripts/soc-wall-appearance.sh\nIcon=soc-wall\nTerminal=false\nType=Application\nNoDisplay=true\nCategories=Settings;\nKeywords=soc;theme;appearance;colors;colours;\n' "$(CURDIR)" > $(HOME)/.local/share/applications/soc-wall-appearance.desktop
 	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
 	@command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
 	@echo "dev app icons installed -> $(HOME)/.local/share/applications (only 'SOC Video Wall' ships; Setup + Appearance are reached from inside the control center)"
@@ -123,9 +125,66 @@ lint: .venv verify-arm  ## syntax-check shell + python + run the aarch64 gate
 install:  ## install on the Pi (run as root)
 	sudo ./install.sh
 
+.PHONY: install-local
+install-local: .venv  ## user-local install (no root, current folder) — creates venv, installs desktop shortcuts + PATH symlinks
+	@echo "=== SOC Wall local install ==="
+	@echo "  ROOT: $(CURDIR)"
+	@# 1. Ensure scripts are executable
+	@chmod +x scripts/*.sh scripts/*.py scripts/soc-wall-entrypoint 2>/dev/null || true
+	@# 2. Create config dir for local use
+	@mkdir -p $(CURDIR)/config
+	@# 3. Seed dev vault (for development without Vaultwarden)
+	@$(MAKE) dev-vault >/dev/null 2>&1 || true
+	@# 4. Install desktop entries (generated with correct absolute paths)
+	@mkdir -p $(HOME)/.local/share/applications $(HOME)/.local/share/icons/hicolor/scalable/apps
+	@install -m0644 share/icons/soc-wall.svg $(HOME)/.local/share/icons/hicolor/scalable/apps/soc-wall.svg
+	@echo "  generating soc-wall.desktop..."
+	@PYTHONPATH=kiosk-host SOC_ROOT="$(CURDIR)" $(PY) -m host.branding desktop \
+	  "$(CURDIR)/scripts/soc-wall-menu" soc-wall > $(HOME)/.local/share/applications/soc-wall.desktop
+	@# 5. Install setup + appearance entries (secondary, NoDisplay=true)
+	@printf '[Desktop Entry]\nName=SOC Wall Setup\nComment=Configure the SOC video wall\nExec=%s/scripts/soc-wall-setup-gui.sh\nIcon=soc-wall\nTerminal=false\nType=Application\nNoDisplay=true\nCategories=Settings;\nKeywords=soc;setup;config;wizard;\n' "$(CURDIR)" > $(HOME)/.local/share/applications/soc-wall-setup.desktop
+	@printf '[Desktop Entry]\nName=SOC Wall Appearance\nComment=Theme colours and presets for the SOC video wall\nExec=%s/scripts/soc-wall-appearance.sh\nIcon=soc-wall\nTerminal=false\nType=Application\nNoDisplay=true\nCategories=Settings;\nKeywords=soc;theme;appearance;colors;colours;\n' "$(CURDIR)" > $(HOME)/.local/share/applications/soc-wall-appearance.desktop
+	@# 6. Install PATH symlinks so 'soc-wall-menu' works from the terminal
+	@mkdir -p $(HOME)/.local/bin
+	@ln -sf "$(CURDIR)/scripts/soc-wall-menu" $(HOME)/.local/bin/soc-wall-menu
+	@ln -sf "$(CURDIR)/scripts/soc-wall-desktop.sh" $(HOME)/.local/bin/soc-wall-desktop.sh 2>/dev/null || true
+	@ln -sf "$(CURDIR)/scripts/soc-wall-setup-gui.sh" $(HOME)/.local/bin/soc-wall-setup-gui.sh 2>/dev/null || true
+	@ln -sf "$(CURDIR)/scripts/soc-wall-appearance.sh" $(HOME)/.local/bin/soc-wall-appearance.sh 2>/dev/null || true
+	@ln -sf "$(CURDIR)/scripts/litebw" $(HOME)/.local/bin/litebw 2>/dev/null || true
+	@# 7. Refresh desktop database + icon cache
+	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
+	@command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf $(HOME)/.local/share/icons/hicolor 2>/dev/null || true
+	@echo ""
+	@echo "  Local install complete. The 'SOC Video Wall' icon should now appear"
+	@echo "  in your application menu. You can also run from the terminal:"
+	@echo "    soc-wall-menu"
+	@echo "    make dev"
+	@echo ""
+	@echo "  To uninstall: make uninstall-local"
+	@# Auto-launch the control center in a graphical session.
+	@if [ -n "$${DISPLAY:-}$${WAYLAND_DISPLAY:-}" ] && [ -x "$(CURDIR)/scripts/soc-wall-menu" ]; then \
+	  echo "  Launching the SOC Video Wall control center…"; \
+	  SOC_ROOT="$(CURDIR)" "$(CURDIR)/scripts/soc-wall-menu" & \
+	fi || true
+
 .PHONY: uninstall
 uninstall:  ## uninstall from the Pi (root; preserves data — ARGS="--purge" to wipe)
 	sudo ./uninstall.sh $(ARGS)
+
+.PHONY: uninstall-local
+uninstall-local:  ## remove user-local install (desktop entries + PATH symlinks)
+	@echo "Removing local SOC Wall install..."
+	@rm -f $(HOME)/.local/share/applications/soc-wall.desktop
+	@rm -f $(HOME)/.local/share/applications/soc-wall-setup.desktop
+	@rm -f $(HOME)/.local/share/applications/soc-wall-appearance.desktop
+	@rm -f $(HOME)/.local/share/icons/hicolor/scalable/apps/soc-wall.svg
+	@rm -f $(HOME)/.local/bin/soc-wall-menu
+	@rm -f $(HOME)/.local/bin/soc-wall-desktop.sh
+	@rm -f $(HOME)/.local/bin/soc-wall-setup-gui.sh
+	@rm -f $(HOME)/.local/bin/soc-wall-appearance.sh
+	@rm -f $(HOME)/.local/bin/litebw
+	@command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications 2>/dev/null || true
+	@echo "  Local install removed. The repo + venv are untouched."
 
 .PHONY: clean
 clean:  ## stop dev procs and remove dev runtime state

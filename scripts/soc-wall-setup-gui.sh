@@ -13,7 +13,7 @@ ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 # checkout wins over a stale /opt deploy), then SOC_ROOT, then /opt/soc-display.
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
 ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)}"
-[ -d "$ROOT/kiosk-host" ] || ROOT="/opt/soc-display"
+[ -d "$ROOT/kiosk-host" ] || { echo "soc-wall-setup-gui: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
 # Headless / discovery invocations don't need a display.
 HEADLESS=0

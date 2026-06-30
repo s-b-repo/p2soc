@@ -59,6 +59,15 @@ def load_overrides() -> dict:
 
 
 ALLOWED_URL_SCHEMES = ("http://", "https://")
+MAX_URL_LEN = 2048
+MAX_TITLE_LEN = 200
+MAX_VAULT_ITEM_LEN = 200
+MAX_SELECTOR_LEN = 500
+MAX_MARKER_LEN = 200
+MAX_VPN_GATEWAY_LEN = 253
+MAX_VPN_DOMAIN_LEN = 253
+MAX_VPN_REALM_LEN = 200
+MAX_VPN_CONFIG_LEN = 8192
 
 
 def valid_url(url: str) -> bool:
@@ -66,6 +75,27 @@ def valid_url(url: str) -> bool:
     other schemes stops file://, javascript:, data: etc. being set at the glass."""
     u = (url or "").strip().lower()
     return u == "" or u.startswith(ALLOWED_URL_SCHEMES)
+
+
+def _sanitize_len(s: str, max_len: int) -> str:
+    """Truncate a string to max_len."""
+    s = (s or "").strip()
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
+def _safe_gateway(s: str) -> str:
+    """Reject VPN gateway/domain/realm values with shell metacharacters or
+    null bytes. Returns sanitized string or empty on rejection."""
+    s = _sanitize_len(s, MAX_VPN_GATEWAY_LEN)
+    if not s:
+        return ""
+    # Block null bytes and shell metacharacters
+    for bad in ("\x00", ";", "&", "|", "`", "$", "(", ")", "{", "}", "<", ">", "\n", "\r"):
+        if bad in s:
+            return ""
+    return s
 
 
 def save_overrides(d: dict):
@@ -208,7 +238,7 @@ class ConfigWindow(Gtk.Window):
                  proxy_vault_item=""):
         super().__init__(title="SOC wall — settings")
         style.apply_css()
-        self.panels = panels
+        self.panels = list(panels)       # mutable copy — add/remove modify this
         self.on_apply = on_apply
         self.on_close_cb = on_close
         self.display = display          # config.DisplayCfg | None (Display tab)
@@ -217,6 +247,9 @@ class ConfigWindow(Gtk.Window):
         self._vpn_w = None
         self._rows = {}
         self._unlocked = not pin_is_set()
+        self._added_panels: list = []    # panels created in this session
+        self._removed_ids: set = set()   # panel IDs removed in this session
+        self._panels_box = None          # set by _tab_panels
 
         self.set_keep_above(True)
         self.set_modal(True)
@@ -312,6 +345,19 @@ class ConfigWindow(Gtk.Window):
         outer.pack_start(self._form_msg, False, False, 0)
         outer.pack_start(self._build_security(), False, False, 0)
 
+        # Export / Import row
+        io_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        io_row.set_margin_top(6)
+        export_btn = Gtk.Button(label="⬇ Export YAML")
+        export_btn.set_tooltip_text("Save current config as panels.yaml")
+        export_btn.connect("clicked", lambda *_: self._export_yaml())
+        import_btn = Gtk.Button(label="⬆ Import YAML")
+        import_btn.set_tooltip_text("Load config from a panels.yaml file")
+        import_btn.connect("clicked", lambda *_: self._import_yaml())
+        io_row.pack_start(export_btn, False, False, 0)
+        io_row.pack_start(import_btn, False, False, 0)
+        outer.pack_start(io_row, False, False, 0)
+
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         actions.set_halign(Gtk.Align.END)
         close_b = Gtk.Button(label="Close")
@@ -328,12 +374,78 @@ class ConfigWindow(Gtk.Window):
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_min_content_height(340)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_border_width(8)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_border_width(8)
-        for p in self.panels:
-            box.pack_start(self._panel_group(p), False, False, 0)
-        scroll.add(box)
+        self._panels_box = box
+        self._rebuild_panel_rows()
+        outer.pack_start(box, True, True, 0)
+
+        add_btn = Gtk.Button(label="＋ Add Panel")
+        add_btn.get_style_context().add_class("soc-config-primary")
+        add_btn.connect("clicked", lambda *_: self._add_panel())
+        outer.pack_start(add_btn, False, False, 0)
+        scroll.add(outer)
         return scroll
+
+    def _rebuild_panel_rows(self):
+        """Rebuild the panel rows from self.panels (called after add/remove)."""
+        if self._panels_box is None:
+            return
+        for child in self._panels_box.get_children():
+            self._panels_box.remove(child)
+        self._rows.clear()
+        for p in self.panels:
+            self._panels_box.pack_start(self._panel_group(p), False, False, 0)
+        self._panels_box.show_all()
+
+    def _add_panel(self):
+        """Add a new blank panel to the list and rebuild the tab."""
+        # Compute grid position: fill columns first, then next row
+        cols = getattr(self.display, 'cols', 2) if self.display else 2
+        n = len(self.panels)
+        grid_pos = (n % cols, n // cols)
+        new_id = f"panel-{n + 1}"
+
+        from host.config import Panel, KeepAlive
+        ka = KeepAlive(strategy="none")
+        panel = Panel(
+            id=new_id, engine="webkit", grid=grid_pos, mode="direct",
+            vault_item="", selectors={}, login_marker="", keepalive=ka,
+            url="", title="")
+        self.panels.append(panel)
+        self._added_panels.append(panel)
+        self._rebuild_panel_rows()
+
+    def _remove_panel(self, panel):
+        """Remove a panel from the list and rebuild the tab."""
+        self.panels = [p for p in self.panels if p.id != panel.id]
+        self._removed_ids.add(panel.id)
+        self._added_panels = [p for p in self._added_panels if p.id != panel.id]
+        self._rebuild_panel_rows()
+
+    def _move_panel(self, panel, direction: int):
+        """Move panel up (-1) or down (+1) in the list (swaps grid positions)."""
+        idx = next((i for i, p in enumerate(self.panels) if p.id == panel.id), None)
+        if idx is None:
+            return
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(self.panels):
+            return
+        # Swap in the list
+        self.panels[idx], self.panels[new_idx] = self.panels[new_idx], self.panels[idx]
+        # Swap grid positions
+        g1 = list(getattr(self.panels[idx], "grid", (0, 0)))
+        g2 = list(getattr(self.panels[new_idx], "grid", (0, 0)))
+        try:
+            self.panels[idx].grid = tuple(g2)
+        except AttributeError:
+            pass
+        try:
+            self.panels[new_idx].grid = tuple(g1)
+        except AttributeError:
+            pass
+        self._rebuild_panel_rows()
 
     def _panel_group(self, p):
         frame = Gtk.Frame(label=f"  {p.display_name}  ")
@@ -367,6 +479,12 @@ class ConfigWindow(Gtk.Window):
             h.set_xalign(0.0)
             g.attach(h, col, 0, 1, 1)
             g.attach(w, col, 1, 1, 1)
+
+        # Allow insecure TLS — right below the URL/engine row
+        insecure_chk = Gtk.CheckButton(label="Allow insecure TLS (self-signed certs)")
+        insecure_chk.set_active(bool(getattr(p, "allow_insecure", False)))
+        g.attach(insecure_chk, 0, 2, 4, 1)
+
         inner.pack_start(g, False, False, 0)
 
         exp = Gtk.Expander(label="Advanced — auto-login selectors (apply on restart)")
@@ -382,10 +500,27 @@ class ConfigWindow(Gtk.Window):
             ag.pack_start(w, True, True, 0)
         exp.add(ag)
         inner.pack_start(exp, False, False, 0)
+
+        # Reorder + Remove buttons
+        if len(self.panels) > 1:
+            btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            btn_row.set_halign(Gtk.Align.END)
+            up_btn = Gtk.Button(label="↑ Up")
+            up_btn.connect("clicked", lambda *_, panel=p: self._move_panel(panel, -1))
+            dn_btn = Gtk.Button(label="↓ Down")
+            dn_btn.connect("clicked", lambda *_, panel=p: self._move_panel(panel, 1))
+            rm_btn = Gtk.Button(label="✕ Remove")
+            rm_btn.get_style_context().add_class("destructive-action")
+            rm_btn.connect("clicked", lambda *_, panel=p: self._remove_panel(panel))
+            for b in (up_btn, dn_btn, rm_btn):
+                btn_row.pack_start(b, False, False, 0)
+            inner.pack_start(btn_row, False, False, 0)
+
         frame.add(inner)
         self._rows[p.id] = {"url": url_e, "title": title_e, "vault": vault_e,
                             "engine": engine_c, "user": user_e, "pass": pass_e,
-                            "submit": sub_e, "marker": mark_e}
+                            "submit": sub_e, "marker": mark_e,
+                            "insecure": insecure_chk}
         return frame
 
     def _tab_credentials(self):
@@ -614,20 +749,45 @@ class ConfigWindow(Gtk.Window):
         return box
 
     def _tab_status(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(12)
-        configured = sum(1 for p in self.panels if getattr(p, "configured", False))
-        lines = [
-            f"vault backend : {os.environ.get('SOC_VAULT_BACKEND', cfg.DEFAULT_VAULT_BACKEND)}",
-            f"panels        : {configured}/{len(self.panels)} configured",
-            f"auto-login    : {sum(1 for p in self.panels if p.vault_item)} panel(s)",
-            "VPN status    : shown in the top bar (click the pill to re-check)",
-        ]
-        for ln in lines:
-            lbl = Gtk.Label(label=ln)
-            lbl.get_style_context().add_class("soc-config-sub")
-            lbl.set_xalign(0.0)
-            box.pack_start(lbl, False, False, 0)
+        title = Gtk.Label(label="Wall Status")
+        title.get_style_context().add_class("soc-config-title")
+        title.set_xalign(0.0)
+        box.pack_start(title, False, False, 0)
+
+        # Memory from /proc (no deps)
+        try:
+            with open("/proc/meminfo") as fh:
+                lines = fh.read()
+            import re
+            mt = re.search(r"MemTotal:\s+(\d+)", lines)
+            ma = re.search(r"MemAvailable:\s+(\d+)", lines)
+            if mt and ma:
+                total = int(mt.group(1)) // 1024
+                avail = int(ma.group(1)) // 1024
+                used = total - avail
+                info = "Memory: {} MB / {} MB ({}% used)".format(used, total, used * 100 // total)
+            else:
+                info = "Memory info unavailable"
+        except Exception:
+            info = "System info unavailable"
+
+        mem_lbl = Gtk.Label(label=info)
+        mem_lbl.get_style_context().add_class("soc-config-sub")
+        mem_lbl.set_xalign(0.0)
+        mem_lbl.set_line_wrap(True)
+        box.pack_start(mem_lbl, False, False, 0)
+
+        # Panel count + grid
+        cols = getattr(self.display, "cols", "?") if self.display else "?"
+        rows = getattr(self.display, "rows", "?") if self.display else "?"
+        summary = "Panels: {}  |  Grid: {} x {}".format(len(self.panels), cols, rows)
+        sum_lbl = Gtk.Label(label=summary)
+        sum_lbl.get_style_context().add_class("soc-config-sub")
+        sum_lbl.set_xalign(0.0)
+        box.pack_start(sum_lbl, False, False, 0)
+
         return box
 
     def _build_security(self):
@@ -823,6 +983,96 @@ class ConfigWindow(Gtk.Window):
         ctx.add_class("soc-config-error" if error else "soc-config-ok")
         self._form_msg.set_text(text)
 
+    def _export_yaml(self):
+        """Dump current panel config to a YAML file via save dialog."""
+        try:
+            from .config import to_yaml
+            # Build a minimal config from current state
+            cfg = {"display": {"auto": True, "cols": getattr(self.display, "cols", 2) if self.display else 2,
+                               "rows": getattr(self.display, "rows", 2) if self.display else 2,
+                               "gap": getattr(self.display, "gap", 0) if self.display else 0,
+                               "width": 1920, "height": 1080, "layout": "auto"},
+                   "panels": [], "tunnel": {"enabled": False},
+                   "vpn": {"enabled": False}, "proxy": {"enabled": False}}
+            for p in self.panels:
+                cfg["panels"].append({
+                    "id": p.id, "url": getattr(p, "url", "") or "",
+                    "title": getattr(p, "title", "") or "",
+                    "vault_item": getattr(p, "vault_item", "") or "",
+                    "engine": getattr(p, "engine", "webkit") or "webkit",
+                    "grid": list(getattr(p, "grid", (0, 0))),
+                    "mode": getattr(p, "mode", "direct") or "direct",
+                    "selectors": getattr(p, "selectors", {}) or {},
+                    "login_marker": getattr(p, "login_marker", "") or "",
+                    "allow_insecure": bool(getattr(p, "allow_insecure", False)),
+                })
+            import yaml, os, time
+            path = os.path.expanduser("~/soc-wall-export-{}.yaml".format(time.strftime("%Y%m%d-%H%M%S")))
+            with open(path, "w") as fh:
+                yaml.dump(cfg, fh, default_flow_style=False, allow_unicode=True)
+            self._msg("Exported to {}".format(path))
+        except Exception as e:
+            self._msg("Export failed: {}".format(e), error=True)
+
+    def _import_yaml(self):
+        """Load panel config from a YAML file via open dialog."""
+        try:
+            import os
+            chooser = Gtk.FileChooserDialog(
+                title="Import panels.yaml", action=Gtk.FileChooserAction.OPEN)
+            chooser.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            chooser.add_button("Open", Gtk.ResponseType.OK)
+            ffilter = Gtk.FileFilter()
+            ffilter.set_name("YAML files")
+            ffilter.add_pattern("*.yaml")
+            ffilter.add_pattern("*.yml")
+            chooser.add_filter(ffilter)
+            resp = chooser.run()
+            if resp != Gtk.ResponseType.OK:
+                chooser.destroy()
+                return
+            path = chooser.get_filename()
+            chooser.destroy()
+            if not path:
+                return
+            import yaml
+            with open(path) as fh:
+                data = yaml.safe_load(fh)
+            if not isinstance(data, dict):
+                self._msg("Invalid YAML: expected a mapping", error=True)
+                return
+            panels_raw = data.get("panels", [])
+            if not panels_raw:
+                self._msg("No panels found in file", error=True)
+                return
+            # Replace panels list
+            from host.config import Panel, KeepAlive
+            new_panels = []
+            for i, p in enumerate(panels_raw):
+                if not isinstance(p, dict):
+                    continue
+                ka = KeepAlive(strategy="none")
+                panel = Panel(
+                    id=p.get("id", "panel-{}".format(i + 1)),
+                    engine=p.get("engine", "webkit"),
+                    grid=tuple(p.get("grid", [i % 2, i // 2])),
+                    mode=p.get("mode", "direct"),
+                    vault_item=p.get("vault_item", ""),
+                    selectors=p.get("selectors", {}),
+                    login_marker=p.get("login_marker", ""),
+                    keepalive=ka,
+                    url=p.get("url", ""),
+                    title=p.get("title", ""),
+                    allow_insecure=p.get("allow_insecure", False))
+                new_panels.append(panel)
+            self.panels = new_panels
+            self._added_panels = []
+            self._removed_ids = set()
+            self._rebuild_panel_rows()
+            self._msg("Imported {} panels from {}".format(len(new_panels), os.path.basename(path)))
+        except Exception as e:
+            self._msg("Import failed: {}".format(e), error=True)
+
     def _apply(self):
         if not self._unlocked:
             return
@@ -834,18 +1084,20 @@ class ConfigWindow(Gtk.Window):
 
         changes, overrides = {}, load_overrides()
         for pid, w in self._rows.items():
-            url = w["url"].get_text().strip()
-            title = w["title"].get_text().strip()
-            vault_item = w["vault"].get_text().strip()
+            url = _sanitize_len(w["url"].get_text(), MAX_URL_LEN)
+            title = _sanitize_len(w["title"].get_text(), MAX_TITLE_LEN)
+            vault_item = _sanitize_len(w["vault"].get_text(), MAX_VAULT_ITEM_LEN)
             engine = w["engine"].get_active_text() or "webkit"
-            sel = {k: w[k].get_text().strip() for k in ("user", "pass", "submit")}
+            sel = {k: _sanitize_len(w[k].get_text(), MAX_SELECTOR_LEN) for k in ("user", "pass", "submit")}
             sel = {k: v for k, v in sel.items() if v}
-            marker = w["marker"].get_text().strip()
+            marker = _sanitize_len(w["marker"].get_text(), MAX_MARKER_LEN)
+            allow_insecure = w["insecure"].get_active()
             # only url/title/vault apply live; the rest persist for next restart
             changes[pid] = {"url": url, "title": title, "vault_item": vault_item}
             entry = overrides.get(pid, {}) if isinstance(overrides.get(pid), dict) else {}
             entry.update({"url": url, "title": title, "vault_item": vault_item,
-                          "engine": engine, "selectors": sel, "login_marker": marker})
+                          "engine": engine, "selectors": sel, "login_marker": marker,
+                          "allow_insecure": allow_insecure})
             overrides[pid] = entry
 
         if self.display is not None:
@@ -859,12 +1111,12 @@ class ConfigWindow(Gtk.Window):
             vpncfg = vpn_form_to_dict({
                 "enabled": w["enabled"].get_active(),
                 "type": w["type"].get_active_text() or "fortinet",
-                "gateway": w["gateway"].get_text(),
+                "gateway": _safe_gateway(w["gateway"].get_text()),
                 "port": int(w["port"].get_value()),
-                "vault_item": w["vault_item"].get_text(),
-                "config": w["config"].get_text(),
-                "domain": w["domain"].get_text(),
-                "realm": w["realm"].get_text(),
+                "vault_item": _sanitize_len(w["vault_item"].get_text(), MAX_VAULT_ITEM_LEN),
+                "config": _sanitize_len(w["config"].get_text(), MAX_VPN_CONFIG_LEN),
+                "domain": _safe_gateway(w["domain"].get_text()),
+                "realm": _safe_gateway(w["realm"].get_text()),
                 "trusted_cert": w["trusted_cert"].get_text(),
                 "ready_probe": w["ready_probe"].get_text(),
                 "insecure": w["insecure"].get_active(),
@@ -885,6 +1137,18 @@ class ConfigWindow(Gtk.Window):
                       error=True)
             return
         try:
+            # Pass add/remove signals so the wall can create/destroy views live
+            if self._added_panels:
+                changes["_add_panel"] = [{
+                    "id": p.id, "url": p.url or "", "title": p.title or "",
+                    "vault_item": p.vault_item or "", "engine": p.engine or "webkit",
+                    "selectors": p.selectors or {}, "login_marker": p.login_marker or "",
+                    "mode": getattr(p, "mode", "direct"),
+                    "grid": list(getattr(p, "grid", (0, 0))),
+                    "allow_insecure": getattr(p, "allow_insecure", False),
+                } for p in self._added_panels]
+            if self._removed_ids:
+                changes["_remove_panel"] = sorted(self._removed_ids)
             self.on_apply(changes)
         except Exception as e:  # noqa: BLE001 — never let a bad apply kill the window
             self._msg(f"apply error: {e}", error=True)

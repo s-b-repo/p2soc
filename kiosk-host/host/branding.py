@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 _DEFAULTS = {
     "name": "SOC Video Wall",
@@ -148,6 +149,30 @@ def _deep_merge(base: dict, over: dict) -> dict:
 
 
 _cache: dict | None = None
+_marker_mtime_val: float = 0.0
+
+
+def _marker_path() -> str:
+    """Cross-process signal file: touched by save_colors(), checked by load()."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache")
+    d = os.path.join(base, "soc-display")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "branding-changed")
+
+
+def _touch_marker() -> None:
+    """Write current timestamp into the marker file so other processes see it."""
+    with open(_marker_path(), "w") as fh:
+        fh.write(str(time.time()))
+
+
+def _marker_mtime() -> float:
+    """Return the mtime of the marker file, or 0 if absent."""
+    try:
+        return os.path.getmtime(_marker_path())
+    except OSError:
+        return 0.0
 
 
 def load(refresh: bool = False) -> dict:
@@ -318,11 +343,18 @@ def _save_target(path: str | None) -> str:
     # 3. /etc/soc-display/branding.yaml ONLY if the dir exists and is writable (root).
     if os.path.isdir("/etc/soc-display") and os.access("/etc/soc-display", os.W_OK):
         return "/etc/soc-display/branding.yaml"
-    # 4. repo checkout — keep the theme with the source in a dev tree.
+    # 4. per-user XDG file WHEN IT ALREADY EXISTS — matches _candidates() read order
+    #    (user file wins over repo). If a previous save created it, update in place
+    #    so read+write stay consistent; don't create a new user file that would then
+    #    permanently shadow an operator's hand-edited repo branding.yaml.
+    user = _user_branding()
+    if os.path.exists(user):
+        return os.path.abspath(user)
+    # 5. repo checkout — keep the theme with the source in a dev tree.
     repo = os.path.join(_root(), "branding", "branding.yaml")
     if _writable(repo):
         return os.path.abspath(repo)
-    # 5. per-user XDG file — ALWAYS writable, so a desktop user on a deployed box
+    # 6. per-user XDG file (create) — last resort, always writable by the desktop user.
     #    (root-owned /etc, non-writable /opt) never needs root; _candidates() reads
     #    it above /etc so the saved theme applies on next launch. This is the path
     #    that fixes "cannot write branding ... and no writable repo fallback".
@@ -455,6 +487,12 @@ def save_colors(colors: dict, path: str | None = None) -> str:
             pass
         raise
     load(refresh=True)
+    # Touch a cross-process marker so other processes (launchermenu) detect the
+    # change without polling the YAML file on every frame.
+    try:
+        _touch_marker()
+    except OSError:
+        pass
     return target
 
 

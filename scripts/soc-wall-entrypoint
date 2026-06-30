@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# =============================================================================
+# SOC Wall entrypoint — self-locating bootstrap for .desktop launcher files.
+#
+# .desktop Exec= lines point at THIS script. It finds the SOC wall install root
+# and execs the real launcher (scripts/soc-wall-menu). This is how shortcuts
+# always work regardless of where the repo is cloned — the .desktop files
+# use an absolute Exec= that's set at install time, and this entrypoint
+# self-locates from there, so moving the repo only requires regenerating
+# the .desktop files (make install-local).
+#
+# Self-location priority:
+#   1. $SOC_ROOT (explicit override)
+#   2. Parent of this script's directory (repo checkout next to it)
+#   3. Common install locations (checked only as last resort)
+# =============================================================================
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+# 1. $SOC_ROOT override wins.
+if [ -n "${SOC_ROOT:-}" ] && [ -d "$SOC_ROOT/kiosk-host" ]; then
+  ROOT="$SOC_ROOT"
+else
+  # 2. Parent of scripts/ — works from any checkout.
+  ROOT="$(cd "$SELF_DIR/.." && pwd)"
+fi
+
+# Verify we found a valid install root.
+if [ ! -d "$ROOT/kiosk-host" ]; then
+  # 3. Last-resort: scan common paths.
+  for d in \
+    /opt/soc-display \
+    "$HOME/soc-display" \
+    "$HOME/Pictures/eset/soc-display" \
+    "$HOME/Projects/soc-display" \
+    /usr/share/soc-display; do
+    if [ -d "$d/kiosk-host" ]; then
+      ROOT="$d"
+      break
+    fi
+  done
+fi
+
+if [ ! -d "$ROOT/kiosk-host" ]; then
+  echo "SOC Wall: cannot find installation root (no kiosk-host/ found)." >&2
+  echo "  Set SOC_ROOT=/path/to/repo or run: make install-local" >&2
+  exit 1
+fi
+
+export SOC_ROOT="$ROOT"
+exec "$ROOT/scripts/soc-wall-menu" "$@"

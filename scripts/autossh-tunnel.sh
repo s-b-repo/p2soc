@@ -4,7 +4,15 @@
 # tunnels are configured it idles (so Restart=always doesn't churn).
 set -euo pipefail
 
-ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locate: parent of this scripts/ dir (works from any checkout).
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+CHECKOUT="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
+if [ -d "$CHECKOUT/kiosk-host" ]; then
+  ROOT="$CHECKOUT"
+else
+  ROOT="${SOC_ROOT:-/opt/soc-display}"
+fi
+[ -d "$ROOT/kiosk-host" ] || { echo "autossh-tunnel.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 [ -r "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 export SOC_PANELS_FILE="${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}"

@@ -1,0 +1,161 @@
+# SOC video-wall kiosk (p2soc) — continuous integration.
+# Pure-Python + shell payload with system-package deps (PyGObject/WebKitGTK,
+# autossh, openfortivpn, ...) — NOTHING is compiled. CI just lints, runs the
+# unit tests, enforces the aarch64 "no-compile-on-Pi" gate, and scans for
+# accidentally-committed secrets. Runs on stock ubuntu-latest (amd64); the
+# interpreted payload needs no cross-compilation.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: jobs only read the checked-out tree.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # lint — bash -n + py_compile (via `make lint`, which also runs the arm gate).
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      # `make lint` only does `bash -n` + `python -m py_compile` (no imports are
+      # executed), so the heavy PyGObject/WebKit system packages are NOT needed
+      # to compile the sources. We install python3-gi + the WebKit GIR only if a
+      # future change makes lint import them — kept commented to stay light.
+      #   sudo apt-get update
+      #   sudo apt-get install -y python3-gi gir1.2-webkit2-4.1
+      - name: Lint (shell + python syntax) and arm gate
+        env:
+          # make lint -> .venv builds a system-site-packages venv; on the CI
+          # runner there is no system PyGObject, but lint never imports it.
+          SOC_SKIP_PACKAGES: '1'
+        run: make lint
+
+  # ---------------------------------------------------------------------------
+  # test — unit tests (dev vault backend, no display needed).
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The GUI host imports PyGObject (gi) at module scope, so the suite needs
+      # system GTK + a display — mirror the Pi/dev environment with distro
+      # packages + Xvfb rather than actions/setup-python (whose interpreter can't
+      # see apt's gi typelibs). cryptography/PyYAML/websocket come from apt too.
+      - name: Install GTK + Python test deps (system python)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-gi gir1.2-gtk-3.0 \
+            python3-yaml python3-cryptography python3-pytest xvfb
+          sudo apt-get install -y --no-install-recommends gir1.2-webkit2-4.1 || true
+          sudo apt-get install -y --no-install-recommends python3-websocket \
+            || python3 -m pip install --break-system-packages websocket-client
+
+      - name: Run unit tests (headless display via Xvfb)
+        env:
+          SOC_VAULT_BACKEND: dev
+        run: |
+          cd kiosk-host
+          xvfb-run -a python3 -m pytest tests/ -q
+
+  # ---------------------------------------------------------------------------
+  # arm-gate — assert no compile-on-Pi / wrong-arch regression. Skips cleanly
+  # if dev/verify-arm.sh is ever removed.
+  # ---------------------------------------------------------------------------
+  arm-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: aarch64 no-compile-on-Pi gate
+        run: |
+          if [ -f dev/verify-arm.sh ]; then
+            bash dev/verify-arm.sh
+          else
+            echo "dev/verify-arm.sh absent — skipping arm gate."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # secrets — fail the build if a real secret (.env/vaultwarden.env or a private
+  # key) is ever committed. Prefers gitleaks; falls back to a grep-based scan.
+  # ---------------------------------------------------------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so gitleaks scans every commit, not just the tip.
+          fetch-depth: 0
+
+      - name: Secret scan (gitleaks)
+        id: gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Belt-and-braces: an explicit, dependency-free check that the exact files
+      # we never commit are absent from the working tree, and that no obvious
+      # PEM private key is tracked. Runs even if the gitleaks action is
+      # unavailable, and fails the job on any hit.
+      - name: Forbidden-file / private-key fallback scan
+        if: always()
+        run: |
+          set -euo pipefail
+          fail=0
+
+          # (1) Tracked files that must never exist (real secrets per .gitignore).
+          #     .env.example is an allowed template; everything else *.env is not.
+          while IFS= read -r f; do
+            case "$f" in
+              *.env.example) ;;                      # allowed template
+              .env|*.env|vaultwarden.env)
+                echo "::error file=$f::forbidden secret file committed: $f"
+                fail=1 ;;
+            esac
+          done < <(git ls-files)
+
+          # (2) Tracked private-key material (PEM / OpenSSH / *.key).
+          while IFS= read -r f; do
+            case "$f" in
+              *.key|*.pem|*id_rsa|*id_ed25519|*id_ecdsa|*id_dsa)
+                echo "::error file=$f::forbidden key file committed: $f"
+                fail=1 ;;
+            esac
+          done < <(git ls-files)
+
+          # (3) Tracked text containing a PEM private-key header.
+          if git grep -lE -- '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----' \
+               -- ':!*.example' ':!.github/**' >/tmp/keyhits 2>/dev/null; then
+            if [ -s /tmp/keyhits ]; then
+              echo "::error::PEM private-key header found in tracked file(s):"
+              cat /tmp/keyhits
+              fail=1
+            fi
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "Secret scan FAILED — see errors above."
+            exit 1
+          fi
+          echo "Secret scan passed: no forbidden secret/key files tracked."

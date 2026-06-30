@@ -3,10 +3,14 @@
 # (desktop/kiosk), configure (setup/appearance), and system (install/uninstall) all
 # in one window. This is the SOLE advertised entry — setup/appearance open from
 # inside the control center (no separate .desktop entries).
+#
+# Exec= uses the command name without a full path — the install process puts
+# soc-wall-menu on PATH (system install -> /usr/local/bin; local install ->
+# ~/.local/bin). soc-wall-menu self-locates the install root from there.
 [Desktop Entry]
 Name=SOC Video Wall
 Comment=Open the SOC video-wall control center (run, configure, install/uninstall)
-Exec=/opt/soc-display/scripts/soc-wall-menu
+Exec=soc-wall-menu
 Icon=soc-wall
 Terminal=false
 Type=Application

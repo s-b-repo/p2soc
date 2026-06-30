@@ -35,7 +35,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.delenv("SOC_PANELS_FILE", raising=False)
     monkeypatch.delenv("SOC_ENV_FILE", raising=False)
     monkeypatch.delenv("SOC_SECRET_DIR", raising=False)
-    monkeypatch.setattr(cp, "ETC_DIR", str(etc))
+    monkeypatch.setenv("SOC_ETC_DIR", str(etc))
     return tmp_path
 
 
@@ -51,7 +51,7 @@ def _write(p, text="x"):
 def test_env_override_is_absolute_authority(sandbox, monkeypatch, tmp_path):
     pinned = tmp_path / "pinned.yaml"
     _write(str(pinned))
-    _write(os.path.join(cp.ETC_DIR, cp.PANELS_BASENAME))   # /etc also exists
+    _write(os.path.join(cp.etc_dir(), cp.PANELS_BASENAME))   # /etc also exists
     monkeypatch.setenv("SOC_PANELS_FILE", str(pinned))
     path, label = cp.resolve_read("panels")
     assert path == str(pinned)
@@ -59,7 +59,7 @@ def test_env_override_is_absolute_authority(sandbox, monkeypatch, tmp_path):
 
 
 def test_etc_wins_when_no_marker(sandbox):
-    etc_p = os.path.join(cp.ETC_DIR, cp.PANELS_BASENAME)
+    etc_p = os.path.join(cp.etc_dir(), cp.PANELS_BASENAME)
     user_p = os.path.join(cp.user_dir(), cp.PANELS_BASENAME)
     _write(etc_p, "etc")
     _write(user_p, "user")          # present but NO marker -> must be ignored
@@ -69,7 +69,7 @@ def test_etc_wins_when_no_marker(sandbox):
 
 
 def test_marked_user_beats_etc(sandbox):
-    etc_p = os.path.join(cp.ETC_DIR, cp.PANELS_BASENAME)
+    etc_p = os.path.join(cp.etc_dir(), cp.PANELS_BASENAME)
     user_p = os.path.join(cp.user_dir(), cp.PANELS_BASENAME)
     _write(etc_p, "etc")
     _write(user_p, "user")
@@ -97,11 +97,11 @@ def test_none_when_nothing_exists(sandbox):
 # WRITE target fallthrough + the write==read invariant
 # --------------------------------------------------------------------------- #
 def test_write_lands_in_etc_when_writable(sandbox):
-    os.makedirs(cp.ETC_DIR)                  # writable by this (non-root) test user
+    os.makedirs(cp.etc_dir())                  # writable by this (non-root) test user
     w = cp.resolve_write("panels", want_etc=True, can_escalate=False)
     assert w["via"] == "etc"
     assert w["marker"] is None
-    assert w["path"] == os.path.join(cp.ETC_DIR, cp.PANELS_BASENAME)
+    assert w["path"] == os.path.join(cp.etc_dir(), cp.PANELS_BASENAME)
     assert w["mode"] == 0o644
 
 
@@ -109,7 +109,7 @@ def test_write_falls_back_to_user_with_marker(sandbox, monkeypatch):
     # /etc not writable: simulate by making _dir_writable say no for ETC_DIR.
     real = cp._dir_writable
     monkeypatch.setattr(cp, "_dir_writable",
-                        lambda d: False if d == cp.ETC_DIR else real(d))
+                        lambda d: False if d == cp.etc_dir() else real(d))
     w = cp.resolve_write("panels", want_etc=True, can_escalate=False)
     assert w["via"] == "user"
     assert w["marker"] == cp.active_marker()
@@ -122,7 +122,7 @@ def test_write_equals_read_invariant(sandbox, monkeypatch):
     """The crux: after the writer writes to its chosen target (+ marker), the reader
     resolving with the SAME logic returns exactly that file."""
     monkeypatch.setattr(cp, "_dir_writable",
-                        lambda d: False if d == cp.ETC_DIR else True)
+                        lambda d: False if d == cp.etc_dir() else True)
     for kind in ("panels", "env"):
         w = cp.resolve_write(kind, want_etc=True, can_escalate=False)
         os.makedirs(w["dir"], exist_ok=True)
@@ -135,7 +135,7 @@ def test_write_equals_read_invariant(sandbox, monkeypatch):
 
 def test_escalation_keeps_etc_target(sandbox, monkeypatch):
     monkeypatch.setattr(cp, "_dir_writable",
-                        lambda d: False if d == cp.ETC_DIR else True)
+                        lambda d: False if d == cp.etc_dir() else True)
     w = cp.resolve_write("panels", want_etc=True, can_escalate=True)
     assert w["via"] == "etc"
     assert w["needs_privilege"] is True
@@ -215,7 +215,7 @@ def test_wizard_write_reaches_resolver(tmp_path, monkeypatch):
     monkeypatch.delenv("SOC_ENV_FILE", raising=False)
     # Force the per-user write tier deterministically (don't depend on the host /etc).
     monkeypatch.setattr(cp, "_dir_writable",
-                        lambda d: False if d == cp.ETC_DIR else True)
+                        lambda d: False if d == cp.etc_dir() else True)
 
     paths = setup.resolve_paths("pi")
     assert paths["via"] == "user"
@@ -240,7 +240,7 @@ def test_user_tier_flags_unwritable(monkeypatch):
     assert w.get("unwritable") is True
     # And when it IS writable, the flag is False (no false alarms).
     monkeypatch.setattr(cp, "_dir_writable",
-                        lambda d: False if d == cp.ETC_DIR else True)
+                        lambda d: False if d == cp.etc_dir() else True)
     w2 = cp.resolve_write("panels", want_etc=True, can_escalate=False)
     assert w2["via"] == "user" and w2.get("unwritable") is False
 

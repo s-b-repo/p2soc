@@ -657,10 +657,11 @@ def step_write_config(opts: Opts, cfg: dict, soc_env: dict, paths: dict) -> Prov
     setup = _load_setup()
     if setup is None:
         return ProvResult(ok=False, changed=False, detail="setup core unavailable for write-config")
-    # render_panels_yaml needs a built config (display + panels). On a fresh box
-    # the wizard hasn't run yet — skip rather than crash; the operator runs the
-    # wizard (or the GUI builds cfg in-process before calling this step).
-    if not cfg.get("display") or not cfg.get("panels"):
+    # render_panels_yaml needs at least a display config. Panels can be empty —
+    # the wall opens with blank frames; the operator adds panels later via the
+    # on-screen config. On a fresh box the wizard hasn't run yet — skip rather
+    # than crash; the operator runs the wizard first.
+    if not cfg.get("display"):
         return ProvResult(ok=True, changed=False,
                           detail="no wizard config yet — run the wizard, then write-config")
     setup.write_file(paths["panels_out"], setup.render_panels_yaml(cfg),

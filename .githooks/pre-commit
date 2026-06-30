@@ -1,0 +1,74 @@
+#!/bin/sh
+# soc-wall pre-commit secrets-scrub.
+#
+# Activate once per checkout:
+#     git config core.hooksPath .githooks
+#
+# Blocks two failure modes:
+#   1. A staged file's *content* contains a secret-shaped string.
+#   2. A staged file's *path* is on the never-commit list (.env,
+#      secret/, PROMPT.txt, .claude/, MEMORY.md).
+#
+# Escape hatch for legitimate fixtures: prefix the matching line with
+# the literal string EXAMPLE-OK (e.g. an .env.example documenting the
+# *shape* of a real secret without ever holding one).
+#
+# Self-reference: the SECRETS_RX literals are written with character-
+# class brackets so this hook file does NOT match itself when staged.
+
+set -e
+
+# --- 1. content scan ---------------------------------------------------
+# Patterns:
+#   [i]lovekalilinux        — operator's local sudo password (canary)
+#   BEGIN (RSA|EC|OPENSSH) PRIVATE KEY  — PEM private keys
+#   s[k]-[A-Za-z0-9]{20,}   — OpenAI / Anthropic-style API key
+#   g[h]p_/gh[s]_           — GitHub PAT / app token
+SECRETS_RX='([i]lovekalilinux|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|s[k]-[A-Za-z0-9]{20,}|g[h]p_[A-Za-z0-9]{20,}|gh[s]_[A-Za-z0-9]{20,})'
+
+# Build the candidate file list: staged + excluding the policy itself
+# (the hook + the config + the contributing doc all legitimately
+# *describe* the patterns).
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+candidates=""
+for f in $staged; do
+    case "$f" in
+        .githooks/*|.pre-commit-config.yaml|CONTRIBUTING.md) continue ;;
+    esac
+    [ -f "$f" ] && candidates="$candidates $f"
+done
+
+if [ -n "$candidates" ]; then
+    # -I skips binaries; -n shows line nrs; -E enables ERE.
+    # Drop matches on lines containing the EXAMPLE-OK escape.
+    hits=$(grep -nIE "$SECRETS_RX" $candidates 2>/dev/null | grep -v 'EXAMPLE-OK' || true)
+    if [ -n "$hits" ]; then
+        echo >&2 "Pre-commit blocked: secret-shaped content in staged file(s)."
+        echo >&2 "----------------------------------------"
+        echo >&2 "$hits"
+        echo >&2 "----------------------------------------"
+        echo >&2 "Either redact and re-stage, or add the literal string"
+        echo >&2 "EXAMPLE-OK on the same line if this is a documented fixture."
+        exit 1
+    fi
+fi
+
+# --- 2. path blacklist -------------------------------------------------
+BAD_PATHS='^\.env$|^\.env\..*$|^secret/|^PROMPT\.txt$|^\.claude/|^MEMORY\.md$|^.*\.key$|^.*_ed25519$'
+# Allowlist: documented fixtures that *look* like never-commit paths but
+# carry only example/shape data. Keep in sync with .gitignore's bang-rules.
+BAD_PATHS_EXEMPT='^\.env\.example$'
+bad=$(echo "$staged" | grep -E "$BAD_PATHS" | grep -vE "$BAD_PATHS_EXEMPT" || true)
+if [ -n "$bad" ]; then
+    echo >&2 "Pre-commit blocked: never-commit path(s) in staged set."
+    echo >&2 "----------------------------------------"
+    echo >&2 "$bad"
+    echo >&2 "----------------------------------------"
+    echo >&2 "Remove from staging:"
+    echo >&2 "    git restore --staged <file>"
+    exit 1
+fi
+
+exit 0

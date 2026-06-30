@@ -15,7 +15,15 @@
 # are honoured exactly (no silent fallback). Overrides: SOC_COMPOSITOR (which
 # Wayland compositor), SOC_XSERVER (explicit X server binary/command).
 
-ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locate: parent of this scripts/ dir (works from any checkout).
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+CHECKOUT="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
+if [ -d "$CHECKOUT/kiosk-host" ]; then
+  ROOT="$CHECKOUT"
+else
+  ROOT="${SOC_ROOT:-/opt/soc-display}"
+fi
+[ -d "$ROOT/kiosk-host" ] || { echo "start-session.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
 # Resolve SOC_ENV_FILE via the SHARED resolver (host.configpaths) so this kiosk
 # path agrees with the wizard + the in-session launcher. Running as the root kiosk

@@ -38,7 +38,7 @@ def _security_dir() -> str:
     if override:
         return os.path.abspath(override)
     for cand in (
-        os.path.join(configpaths.ETC_DIR, "security"),
+        os.path.join(configpaths.etc_dir(), "security"),
         os.path.join(configpaths.repo_root(), "security"),
     ):
         if os.path.isdir(cand):
