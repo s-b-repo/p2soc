@@ -105,21 +105,15 @@ class WallWindow:
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.pack_start(toolbar, False, False, 0)
+        vbox.pack_start(grid, True, True, 0)
+        win.add(vbox)
 
-        # Wrap grid in an overlay so the PIN lock can cover panels
-        overlay = Gtk.Overlay()
-        overlay.add(grid)
+        # PIN lock popup (separate window — no overlay event-delivery issues)
         self._lock_overlay = self._build_lock_overlay()
-        overlay.add_overlay(self._lock_overlay)
-        self._lock_overlay.set_visible(False)
         self._locked = False
-        self._lock_entry = None  # set by _build_lock_overlay
+        self._lock_entry = None
         self._lock_err = None
         self._lock_fails = 0
-        self._overlay = overlay
-
-        vbox.pack_start(overlay, True, True, 0)
-        win.add(vbox)
 
         win.connect("key-press-event", self._on_key)
         # window-wide accelerators so the hotkeys still work even when a webview
@@ -358,12 +352,19 @@ class WallWindow:
 
     # ---- PIN lock overlay ----------------------------------------------------
     def _build_lock_overlay(self):
-        """Floating, draggable PIN unlock dialog. Panels stay fully visible;
-        clicks/keys pass through to panels except on the dialog itself."""
-        # Transparent event box — lets clicks through to panels below
-        outer = Gtk.EventBox()
+        """Floating PIN unlock dialog as a standalone popup window. No overlay
+        event-delivery issues — a regular GTK window with modal grab."""
+        from . import style
+        style.apply_css()
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Unlock Wall")
+        win.set_decorated(True)
+        win.set_resizable(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_keep_above(True)
+        win.set_position(Gtk.WindowPosition.CENTER)
+        win.connect("delete-event", lambda *_: True)  # can't close via X button
 
-        # Draggable floating card
         card = Gtk.Frame()
         ctx = card.get_style_context()
         ctx.add_class("soc-config")
@@ -395,32 +396,28 @@ class WallWindow:
             box.pack_start(w, False, False, 0)
 
         card.add(box)
-
-        # Center the card in the overlay
-        center = Gtk.Box()
-        center.set_halign(Gtk.Align.CENTER)
-        center.set_valign(Gtk.Align.CENTER)
-        center.add(card)
-        outer.add(center)
-        return outer
+        win.add(card)
+        win.show_all()
+        win.hide()  # start hidden, shown on lock
+        return win
 
     # ---- lock control --------------------------------------------------------
     def lock_panels(self):
-        """Show the PIN overlay — panels keep rendering underneath."""
+        """Show the PIN unlock popup."""
         if self._locked:
             return
         self._locked = True
         self._lock_fails = 0
         self._lock_err.set_text("")
         self._lock_entry.set_text("")
-        self._lock_overlay.set_visible(True)
-        self._lock_overlay.show_all()
+        self._lock_overlay.show()
+        self._lock_overlay.present()
         self._lock_entry.grab_focus()
 
     def unlock_panels(self):
-        """Hide the PIN overlay."""
+        """Hide the PIN unlock popup."""
         self._locked = False
-        self._lock_overlay.set_visible(False)
+        self._lock_overlay.hide()
 
     def _try_unlock(self):
         """Verify PIN from the lock overlay entry."""
