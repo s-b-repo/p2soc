@@ -190,7 +190,11 @@ def apply_css():
     """Install the wall CSS for the whole screen (idempotent). Call again after
     a theme change to repaint the running wall."""
     global _applied, _provider, TOKENS, _CSS
-    screen = Gdk.Screen.get_default()
+    # Cache the screen — it never changes during the process lifetime
+    screen = getattr(apply_css, "_screen", None)
+    if screen is None:
+        screen = Gdk.Screen.get_default()
+        apply_css._screen = screen  # type: ignore[attr-defined]
     if screen is None:
         return
     _CSS = _build_css()
