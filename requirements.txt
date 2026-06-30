@@ -6,6 +6,6 @@
 # build reliably OOM-kills the 1GB Pi 5). This file is the TRACKED MANIFEST so the
 # free dependency bot (Dependabot) can flag upstream updates + security fixes and
 # CI can verify nothing breaks. Keep it in sync with install.sh's pip line.
-cryptography>=3.5
-PyYAML>=5.1
-websocket-client>=1.0
+cryptography>=49.0.0
+PyYAML>=6.0.3
+websocket-client>=1.9.0
