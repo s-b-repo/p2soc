@@ -418,18 +418,20 @@ class WallWindow:
     def _on_drag_start(self, w, event):
         self._drag_start_x = event.x_root
         self._drag_start_y = event.y_root
-        self._dragging = True
+        self._dragging = False  # starts as False — only becomes True after movement
 
     def _on_drag_end(self, w, event):
         self._dragging = False
 
     def _on_drag_motion(self, w, event):
-        if not self._dragging:
-            return
         dx = event.x_root - self._drag_start_x
         dy = event.y_root - self._drag_start_y
-        if abs(dx) < 3 and abs(dy) < 3:
-            return
+        # Require 5px movement before entering drag mode — single clicks still
+        # reach child buttons (Unlock) without being swallowed.
+        if not self._dragging:
+            if abs(dx) < 5 and abs(dy) < 5:
+                return
+            self._dragging = True
         hal = self._drag_parent.get_halign()
         val = self._drag_parent.get_valign()
         self._drag_parent.set_halign(Gtk.Align.START)
