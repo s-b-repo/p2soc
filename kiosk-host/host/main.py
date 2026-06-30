@@ -356,7 +356,7 @@ class KioskHost:
 
         # Branding refresh: detect theme changes from the setup wizard and repaint
         # the running wall without a restart (checks the cross-process marker).
-        GLib.timeout_add_seconds(5, self._check_branding)
+        GLib.timeout_add_seconds(15, self._check_branding)  # theme sync — 15s is plenty
 
     def _check_branding(self):
         """Detect cross-process theme changes (setup wizard save) and repaint the
