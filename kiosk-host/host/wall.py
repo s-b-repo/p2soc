@@ -396,53 +396,15 @@ class WallWindow:
 
         card.add(box)
 
-        # Make the card draggable via a title-bar grab area
-        drag_bar = Gtk.EventBox()
-        drag_bar.add(card)
-        drag_bar.connect("button-press-event", self._on_drag_start)
-        drag_bar.connect("button-release-event", self._on_drag_end)
-        drag_bar.connect("motion-notify-event", self._on_drag_motion)
-        self._drag_start_x = 0
-        self._drag_start_y = 0
-        self._dragging = False
-
-        # Center the card
+        # Center the card in the overlay
         center = Gtk.Box()
         center.set_halign(Gtk.Align.CENTER)
         center.set_valign(Gtk.Align.CENTER)
-        center.add(drag_bar)
+        center.add(card)
         outer.add(center)
-        self._drag_parent = center
         return outer
 
-    def _on_drag_start(self, w, event):
-        self._drag_start_x = event.x_root
-        self._drag_start_y = event.y_root
-        self._dragging = False  # starts as False — only becomes True after movement
-
-    def _on_drag_end(self, w, event):
-        self._dragging = False
-
-    def _on_drag_motion(self, w, event):
-        dx = event.x_root - self._drag_start_x
-        dy = event.y_root - self._drag_start_y
-        # Require 5px movement before entering drag mode — single clicks still
-        # reach child buttons (Unlock) without being swallowed.
-        if not self._dragging:
-            if abs(dx) < 5 and abs(dy) < 5:
-                return
-            self._dragging = True
-        hal = self._drag_parent.get_halign()
-        val = self._drag_parent.get_valign()
-        self._drag_parent.set_halign(Gtk.Align.START)
-        self._drag_parent.set_valign(Gtk.Align.START)
-        self._drag_parent.set_margin_start(
-            max(0, self._drag_parent.get_margin_start() + dx))
-        self._drag_parent.set_margin_top(
-            max(0, self._drag_parent.get_margin_top() + dy))
-        self._drag_start_x = event.x_root
-        self._drag_start_y = event.y_root
-
+    # ---- lock control --------------------------------------------------------
     def lock_panels(self):
         """Show the PIN overlay — panels keep rendering underneath."""
         if self._locked:
