@@ -40,7 +40,7 @@ icon: "share/icons/soc-wall.svg"
 #   warn           amber-on-white caution — the only non-green accent, used sparingly.
 #   bad            error ring + invalid status (a brick red that survives on white).
 colors:
-  primary: "#1FA463"
+  primary: "#FF0000"
   setup: "#1FA463"
   desktop: "#1FA463"
   kiosk: "#0E7C7B"

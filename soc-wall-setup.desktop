@@ -3,10 +3,13 @@
 # single advertised entry point and launches Setup itself. NoDisplay keeps this out
 # of application menus while the .sh it execs stays in use (the control center +
 # SOC_RETURN_TO_MENU re-exec it). Reachable directly only by path if ever needed.
+#
+# Exec= uses the command name without a full path — the install process puts
+# soc-wall-setup-gui.sh on PATH via the install-local symlink or system install.
 [Desktop Entry]
 Name=SOC Wall Setup
 Comment=Configure the SOC video wall — presets and validated custom settings
-Exec=/opt/soc-display/scripts/soc-wall-setup-gui.sh
+Exec=soc-wall-setup-gui.sh
 Icon=soc-wall
 Terminal=false
 Type=Application

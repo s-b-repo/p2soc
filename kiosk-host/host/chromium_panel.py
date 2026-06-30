@@ -466,6 +466,10 @@ class ChromiumPanel:
             args.append("--no-proxy-server")   # panel opted out (proxy: false)
         if os.environ.get("SOC_CHROMIUM_NO_SANDBOX") == "1":
             args.append("--no-sandbox")
+        # Allow self-signed / untrusted TLS certs (LAN appliances, IP cameras,
+        # dev dashboards) when the panel opts in with allow_insecure: true.
+        if getattr(p, "allow_insecure", False):
+            args.append("--ignore-certificate-errors")
         self.log(f"[{p.id}] chromium spawning (CDP :{self.cdp_port}, "
                  f"ozone {_ozone_platform()})")
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,

@@ -5,7 +5,16 @@
 # backoff, so a config error doesn't busy-loop the CPU.
 set -u
 
-ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locate: parent of this scripts/ dir (works from any checkout).
+# SOC_ROOT overrides; /opt/soc-display is the deployed default.
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+CHECKOUT="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
+if [ -d "$CHECKOUT/kiosk-host" ]; then
+  ROOT="$CHECKOUT"
+else
+  ROOT="${SOC_ROOT:-/opt/soc-display}"
+fi
+[ -d "$ROOT/kiosk-host" ] || { echo "launcher.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
 # Resolve which soc.env / panels.yaml the wall reads through the SAME resolver the
 # wizard writes with (host.configpaths), so the shell and Python can never drift.

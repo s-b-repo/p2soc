@@ -9,7 +9,15 @@
 # Falls back gracefully and prints actionable errors when nothing fits.
 set -u
 
-ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locate: parent of this scripts/ dir (works from any checkout).
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+CHECKOUT="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
+if [ -d "$CHECKOUT/kiosk-host" ]; then
+  ROOT="$CHECKOUT"
+else
+  ROOT="${SOC_ROOT:-/opt/soc-display}"
+fi
+[ -d "$ROOT/kiosk-host" ] || { echo "wayland-session.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 if [ -f "$ENV_FILE" ]; then
   set -a

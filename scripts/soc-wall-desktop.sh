@@ -14,7 +14,7 @@ set -euo pipefail
 # checkout OR the deployed /opt/soc-display. SOC_ROOT overrides.
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
 ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)}"
-[ -d "$ROOT/kiosk-host" ] || ROOT="/opt/soc-display"
+[ -d "$ROOT/kiosk-host" ] || { echo "soc-wall-desktop: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 MODE="fullscreen"
 
 # Resolve which soc.env the wall reads via the SAME resolver the wizard writes

@@ -153,7 +153,7 @@ def test_webdata_is_sibling_of_secret_not_inside(monkeypatch, tmp_path):
     monkeypatch.delenv("SOC_WEBDATA_DIR", raising=False)
     monkeypatch.delenv("SOC_SECRET_DIR", raising=False)
     monkeypatch.setenv("SOC_ROOT", str(tmp_path))
-    monkeypatch.setattr(cp, "ETC_DIR", str(tmp_path / "no-etc"))
+    monkeypatch.setenv("SOC_ETC_DIR", str(tmp_path / "no-etc"))
     monkeypatch.setattr(cp, "xdg_config_home", lambda: str(tmp_path / "xdg"))
     secret = cp.resolve_secret_dir()
     webdata = cp.resolve_webdata_dir()
@@ -166,7 +166,7 @@ def test_webdata_marker_gated_user_tier(monkeypatch, tmp_path):
     monkeypatch.delenv("SOC_WEBDATA_DIR", raising=False)
     user = tmp_path / "xdg" / "soc-display"
     monkeypatch.setattr(cp, "xdg_config_home", lambda: str(tmp_path / "xdg"))
-    monkeypatch.setattr(cp, "ETC_DIR", str(tmp_path / "no-etc"))
+    monkeypatch.setenv("SOC_ETC_DIR", str(tmp_path / "no-etc"))
     # marker present -> user tier wins
     os.makedirs(user, exist_ok=True)
     (user / cp.MARKER_BASENAME).write_text("")

@@ -260,7 +260,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
     monkeypatch.setenv("SOC_ROOT", str(repo))
     monkeypatch.delenv("SOC_WEBDATA_DIR", raising=False)
-    monkeypatch.setattr(cp, "ETC_DIR", str(etc))
+    monkeypatch.setenv("SOC_ETC_DIR", str(etc))
     return tmp_path
 
 
@@ -281,14 +281,14 @@ def test_webdata_marker_gates_user_tier(sandbox):
 
 
 def test_webdata_prefers_etc_when_deployed(sandbox):
-    os.makedirs(cp.ETC_DIR, exist_ok=True)        # looks deployed, no marker
+    os.makedirs(cp.etc_dir(), exist_ok=True)        # looks deployed, no marker
     assert cp.resolve_webdata_dir() == os.path.join(
-        cp.ETC_DIR, cp.WEBDATA_BASENAME)
+        cp.etc_dir(), cp.WEBDATA_BASENAME)
 
 
 def test_webdata_is_sibling_not_inside_secret(sandbox):
     # the no-plaintext-master guarantee: webdata must NOT live under secret/
-    os.makedirs(cp.ETC_DIR, exist_ok=True)
+    os.makedirs(cp.etc_dir(), exist_ok=True)
     secret = cp.resolve_secret_dir()
     webdata = cp.resolve_webdata_dir()
     assert not webdata.startswith(secret.rstrip("/") + "/")

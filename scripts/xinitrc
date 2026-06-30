@@ -2,7 +2,17 @@
 # Installed as the kiosk user's ~/.xinitrc — launched by `startx` on tty1.
 # Exports the project root, fixes screen geometry, then hands off to Openbox.
 
-export SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locate: parent of this scripts/ dir (works from any checkout).
+# SOC_ROOT overrides; falls back to the deployed default.
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+CHECKOUT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)"
+if [ -d "$CHECKOUT/kiosk-host" ]; then
+  export SOC_ROOT="$CHECKOUT"
+else
+  export SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
+fi
+[ -d "$SOC_ROOT/kiosk-host" ] || { echo "xinitrc: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
+
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 if [ -f "$ENV_FILE" ]; then
   set -a

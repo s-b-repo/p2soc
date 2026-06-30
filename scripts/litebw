@@ -23,6 +23,7 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 # (SOC_ROOT, default /opt/soc-display) so `litebw unlock` works from any shell
 # that doesn't already export SOC_ROOT. Mirrors scripts/soc-wall-menu et al.
 [ -d "$ROOT/kiosk-host" ] || ROOT="${SOC_ROOT:-/opt/soc-display}"
+[ -d "$ROOT/kiosk-host" ] || { echo "litebw: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
 # Pick the venv python if present, else system python3.
 PYBIN="$ROOT/.venv/bin/python"

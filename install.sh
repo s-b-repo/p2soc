@@ -1080,6 +1080,13 @@ else
   log "  launch the wall from the 'SOC Video Wall' desktop icon, or:"
   log "  $([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start soc-wall" || echo "$SOC_ROOT/scripts/launcher.sh")"
   log "  (re-run with INSTALL_MODE=kiosk for a dedicated tty1-autologin appliance)"
+
+  # Auto-launch the control center when running in a graphical session so the
+  # operator sees the app immediately after install (no hunting through menus).
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && [ -x "$SOC_ROOT/scripts/soc-wall-menu" ]; then
+    log "  launching the SOC Video Wall control center now…"
+    SOC_ROOT="$SOC_ROOT" "$SOC_ROOT/scripts/soc-wall-menu" &
+  fi
 fi
 
 # kernel console blanking off (Raspberry Pi). Track whether WE added it so

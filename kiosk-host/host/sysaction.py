@@ -31,7 +31,8 @@ import subprocess
 import sys
 import threading
 
-ROOT = os.environ.get("SOC_ROOT", "/opt/soc-display")
+ROOT = os.environ.get("SOC_ROOT") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # The terminals we try, in order, for the no-pkexec fallback (same set the launcher
 # uses for the TTY wizard so behaviour is consistent across the app).
@@ -41,6 +42,20 @@ _TERMINALS = ("x-terminal-emulator", "gnome-terminal", "konsole",
 # install.sh / uninstall.sh emit ANSI colour (cyan ==> , yellow !! ); strip it so
 # the in-window log reads clean. Precompiled once — runs per output line.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _pkexec_ok():
+    """True when pkexec is on PATH AND has the setuid bit set.
+    A broken pkexec (binary exists, no setuid — Kali default) must
+    degrade to the terminal/sudo fallback, not fail at runtime."""
+    path = shutil.which("pkexec")
+    if not path:
+        return False
+    try:
+        st = os.stat(path)
+        return bool(st.st_mode & 0o4000)  # setuid bit
+    except OSError:
+        return False
 
 
 def _strip_ansi(s: str) -> str:
@@ -163,7 +178,7 @@ def build_argv(action: str, *, mode: "str | None" = None,
 
     script = _script_path(action)
 
-    if shutil.which("pkexec"):
+    if _pkexec_ok():
         # pkexec env <KNOBS> <script> <args> — graphical polkit, secret-free argv.
         argv = ["pkexec", "env"] + envparts + [script] + extra_args
         return argv, "pkexec"
