@@ -430,7 +430,7 @@ mkdir -p "$SOC_ROOT"
 # copy everything except dev runtime / venv / git
 tar -C "$SRC_DIR" \
     --exclude='.git' --exclude='.venv' --exclude='dev/run' --exclude='__pycache__' \
-    -cf - . | tar -C "$SOC_ROOT" -xf -
+    --warning=no-file-changed -cf - . | tar -C "$SOC_ROOT" -xf -
 chown -R root:root "$SOC_ROOT"
 chmod +x "$SOC_ROOT"/scripts/*.sh "$SOC_ROOT"/scripts/*.py 2>/dev/null || true
 # the bundled iNode SSL-VPN client (vendor/) — its connect script + helpers
