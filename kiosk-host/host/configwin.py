@@ -198,10 +198,15 @@ def vpn_form_to_dict(v: dict) -> dict:
     VPN service re-validates on restart and surfaces problems via its status."""
     out = {"enabled": bool(v.get("enabled")), "type": (v.get("type") or "fortinet")}
     for k in ("gateway", "vault_item", "config", "domain", "realm",
-              "trusted_cert", "ready_probe"):
+              "trusted_cert", "ready_probe", "extra_args"):
         val = str(v.get(k) or "").strip()
         if val:
             out[k] = val
+    for k in ("captcha_auto", "captcha_show"):
+        if k in v:
+            out[k] = bool(v.get(k))
+    if "captcha_retries" in v:
+        out["captcha_retries"] = int(v.get("captcha_retries", 40))
     if v.get("insecure"):
         out["insecure"] = True
     if v.get("config_from_vault"):
@@ -738,13 +743,38 @@ class ConfigWindow(Gtk.Window):
             g.attach(widget, 1, r, 1, 1)
         box.pack_start(g, False, False, 0)
 
-        w["insecure"] = Gtk.CheckButton(label="skip TLS verify (inode — trusted LAN only)")
+        w["insecure"] = Gtk.CheckButton(label="skip TLS verify (LAN appliances with self-signed certs)")
         w["insecure"].set_active(bool(v.get("insecure")))
         w["config_from_vault"] = Gtk.CheckButton(
             label="config from the vault item's Notes (openvpn / wireguard)")
         w["config_from_vault"].set_active(bool(v.get("config_from_vault")))
+        w["captcha_auto"] = Gtk.CheckButton(label="auto-solve captcha with OCR (iNode, needs tesseract)")
+        w["captcha_auto"].set_active(v.get("captcha_auto", True))
+        w["captcha_show"] = Gtk.CheckButton(label="show captcha image in log (iNode — for manual entry)")
+        w["captcha_show"].set_active(bool(v.get("captcha_show")))
+        w["captcha_retries"] = Gtk.SpinButton.new_with_range(1, 100, 1)
+        w["captcha_retries"].set_value(int(v.get("captcha_retries", 40)))
+
         box.pack_start(w["insecure"], False, False, 0)
         box.pack_start(w["config_from_vault"], False, False, 0)
+
+        # iNode SSL-VPN captcha + extra args
+        inode_lbl = Gtk.Label(label="iNode SSL-VPN options")
+        inode_lbl.get_style_context().add_class("soc-config-sub")
+        inode_lbl.set_xalign(0.0)
+        inode_lbl.set_margin_top(8)
+        box.pack_start(inode_lbl, False, False, 0)
+        ig = Gtk.Grid()
+        ig.set_column_spacing(8)
+        ig.set_row_spacing(4)
+        cr_lbl = Gtk.Label(label="captcha retries")
+        cr_lbl.get_style_context().add_class("soc-config-sub")
+        cr_lbl.set_xalign(0.0)
+        ig.attach(cr_lbl, 0, 0, 1, 1)
+        ig.attach(w["captcha_retries"], 1, 0, 1, 1)
+        box.pack_start(ig, False, False, 0)
+        box.pack_start(w["captcha_auto"], False, False, 0)
+        box.pack_start(w["captcha_show"], False, False, 0)
         self._vpn_w = w
         return box
 
@@ -1121,6 +1151,10 @@ class ConfigWindow(Gtk.Window):
                 "ready_probe": w["ready_probe"].get_text(),
                 "insecure": w["insecure"].get_active(),
                 "config_from_vault": w["config_from_vault"].get_active(),
+                "captcha_auto": w["captcha_auto"].get_active(),
+                "captcha_show": w["captcha_show"].get_active(),
+                "captcha_retries": int(w["captcha_retries"].get_value()),
+                "extra_args": w["extra_args"].get_text(),
             })
             overrides["_vpn"] = vpncfg
             changes["_vpn"] = vpncfg
