@@ -165,6 +165,15 @@ window, grid, stack {{ background-color: {bg}; }}
   border-radius: 12px;
 }}
 
+/* Settings notebook tabs — match the branding palette so they aren't a
+   black-on-black default-theme artifact inside the themed settings window. */
+notebook header {{ background-color: {bg}; border-bottom: 1px solid {border}; }}
+notebook tab  {{ background-color: {bg}; color: {dim}; padding: 6px 14px;
+  border: 1px solid transparent; border-bottom: none; }}
+notebook tab:checked {{ background-color: {surface}; color: {text};
+  border-color: {border}; }}
+notebook tab:hover {{ color: {accent}; }}
+
 .destructive-action {{
   color: {bad};
   border-color: {_rgba(bad, 0.5)};
