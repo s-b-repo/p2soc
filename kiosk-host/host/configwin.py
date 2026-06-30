@@ -182,13 +182,15 @@ def apply_overrides_to_panels(panels, overrides: dict):
 
 
 def apply_vpn_override(vpn: dict, overrides: dict):
-    """Merge a saved VPN override (set from the on-screen VPN tab) onto the loaded
-    vpn dict at startup. The override is what the operator entered at the glass;
-    it merges over the config note/file so advanced fields not on the form
-    (set_routes, etc.) are preserved."""
+    """Merge saved VPN overrides. The override is what the operator entered at the
+    glass; it merges over the config note/file so advanced fields are preserved."""
     o = overrides.get("_vpn")
     if isinstance(o, dict):
         vpn.update(o)
+    # Multi-VPN override
+    ov = overrides.get("_vpns")
+    if isinstance(ov, list) and ov:
+        vpn["vpns"] = ov
     return vpn
 
 
@@ -197,7 +199,7 @@ def vpn_form_to_dict(v: dict) -> dict:
     enabled+type, keeps only non-empty strings, coerces port/health to int. The
     VPN service re-validates on restart and surfaces problems via its status."""
     out = {"enabled": bool(v.get("enabled")), "type": (v.get("type") or "fortinet")}
-    for k in ("gateway", "vault_item", "config", "domain", "realm",
+    for k in ("name", "gateway", "vault_item", "config", "domain", "realm",
               "trusted_cert", "ready_probe", "extra_args"):
         val = str(v.get(k) or "").strip()
         if val:
@@ -247,9 +249,10 @@ class ConfigWindow(Gtk.Window):
         self.on_apply = on_apply
         self.on_close_cb = on_close
         self.display = display          # config.DisplayCfg | None (Display tab)
-        self._vpn = vpn                 # conf.vpn dict | None (VPN tab)
+        self._vpns = list(vpn or []) if isinstance(vpn, list) else ([vpn] if vpn else [])
         self._proxy_vault_item = proxy_vault_item
-        self._vpn_w = None
+        self._vpn_rows = []
+        self._vpn_box = None
         self._rows = {}
         self._unlocked = not pin_is_set()
         self._added_panels: list = []    # panels created in this session
@@ -338,7 +341,7 @@ class ConfigWindow(Gtk.Window):
         nb.append_page(self._tab_credentials(), Gtk.Label(label="Credentials"))
         if self.display is not None:
             nb.append_page(self._tab_display(), Gtk.Label(label="Display"))
-        if self._vpn is not None:
+        if self._vpns is not None:
             nb.append_page(self._tab_vpn(), Gtk.Label(label="VPN"))
         nb.append_page(self._tab_status(), Gtk.Label(label="Status"))
         outer.pack_start(nb, True, True, 0)
@@ -597,7 +600,7 @@ class ConfigWindow(Gtk.Window):
                            False, False, 0)
 
         # VPN login section
-        vpn_item = (self._vpn or {}).get("vault_item", "")
+        vpn_item = ",".join(v.get("vault_item", "") for v in (self._vpns or []) if v.get("vault_item"))
         vpn_lbl = Gtk.Label(label="VPN Login")
         vpn_lbl.get_style_context().add_class("soc-config-title")
         vpn_lbl.set_xalign(0.0)
@@ -733,33 +736,21 @@ class ConfigWindow(Gtk.Window):
         box.pack_start(g, False, False, 0)
         return box
 
-    def _tab_vpn(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_border_width(12)
-        note = Gtk.Label(label="The supervised VPN. Credentials live in the vault "
-                               "(set the username/password on the Credentials tab "
-                               "for this VPN's vault item). Apply pushes the config "
-                               "into the vault and restarts the VPN service.")
-        note.get_style_context().add_class("soc-config-sub")
-        note.set_xalign(0.0)
-        note.set_line_wrap(True)
-        box.pack_start(note, False, False, 0)
+    def _build_vpn_row(self, idx, v):
+        """Build one VPN config row as an expander."""
+        exp = Gtk.Expander(label=f"VPN {idx + 1}: {v.get('name', 'unnamed')}")
+        exp.set_expanded(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(8)
 
-        v = self._vpn or {}
         w = {}
-        w["enabled"] = Gtk.CheckButton(label="VPN enabled")
+        w["enabled"] = Gtk.CheckButton(label="Enabled")
         w["enabled"].set_active(bool(v.get("enabled")))
         box.pack_start(w["enabled"], False, False, 0)
 
         g = Gtk.Grid()
         g.set_column_spacing(8)
-        g.set_row_spacing(6)
-        w["type"] = Gtk.ComboBoxText()
-        types = ["fortinet", "openvpn", "wireguard", "inode"]
-        for t in types:
-            w["type"].append_text(t)
-        cur = str(v.get("type", "fortinet"))
-        w["type"].set_active(types.index(cur) if cur in types else 0)
+        g.set_row_spacing(4)
 
         def entry(val, hint):
             e = Gtk.Entry()
@@ -768,20 +759,29 @@ class ConfigWindow(Gtk.Window):
             e.set_placeholder_text(hint)
             return e
 
-        w["gateway"] = entry(v.get("gateway"), "gateway host (fortinet / inode)")
+        w["name"] = entry(v.get("name", f"vpn{idx+1}"), "unique name")
+        w["type"] = Gtk.ComboBoxText()
+        for t in ("fortinet", "openvpn", "wireguard", "inode"):
+            w["type"].append_text(t)
+        cur = str(v.get("type", "fortinet"))
+        types = ["fortinet", "openvpn", "wireguard", "inode"]
+        w["type"].set_active(types.index(cur) if cur in types else 0)
+        w["gateway"] = entry(v.get("gateway"), "gateway host")
         w["port"] = Gtk.SpinButton.new_with_range(0, 65535, 1)
         w["port"].set_value(int(v.get("port", 443) or 0))
-        w["vault_item"] = entry(v.get("vault_item"), "vault login (username + password)")
-        w["config"] = entry(v.get("config"), ".ovpn/.conf path, or the iNode client dir")
+        w["vault_item"] = entry(v.get("vault_item"), "vault login name")
+        w["config"] = entry(v.get("config"), ".ovpn/.conf path or iNode dir")
         w["domain"] = entry(v.get("domain"), "auth domain (inode)")
         w["realm"] = entry(v.get("realm"), "realm (fortinet)")
         w["trusted_cert"] = entry(v.get("trusted_cert"), "gateway cert sha256 pin")
-        w["ready_probe"] = entry(v.get("ready_probe"), "host:port reachable only over the VPN")
-        rows = [("type", w["type"]), ("gateway", w["gateway"]), ("port", w["port"]),
-                ("vault login", w["vault_item"]), ("config", w["config"]),
-                ("domain", w["domain"]), ("realm", w["realm"]),
-                ("trusted_cert", w["trusted_cert"]), ("ready_probe", w["ready_probe"])]
-        for r, (lbl, widget) in enumerate(rows, start=1):
+        w["ready_probe"] = entry(v.get("ready_probe"), "host:port over VPN")
+
+        fields = [("name", w["name"]), ("type", w["type"]),
+                  ("gateway", w["gateway"]), ("port", w["port"]),
+                  ("vault login", w["vault_item"]), ("config", w["config"]),
+                  ("domain", w["domain"]), ("realm", w["realm"]),
+                  ("trusted_cert", w["trusted_cert"]), ("ready_probe", w["ready_probe"])]
+        for r, (lbl, widget) in enumerate(fields):
             h = Gtk.Label(label=lbl)
             h.get_style_context().add_class("soc-config-sub")
             h.set_xalign(0.0)
@@ -789,30 +789,21 @@ class ConfigWindow(Gtk.Window):
             g.attach(widget, 1, r, 1, 1)
         box.pack_start(g, False, False, 0)
 
-        w["insecure"] = Gtk.CheckButton(label="skip TLS verify (LAN appliances with self-signed certs)")
+        w["insecure"] = Gtk.CheckButton(label="skip TLS verify")
         w["insecure"].set_active(bool(v.get("insecure")))
-        w["config_from_vault"] = Gtk.CheckButton(
-            label="config from the vault item's Notes (openvpn / wireguard)")
+        w["config_from_vault"] = Gtk.CheckButton(label="config from vault Notes")
         w["config_from_vault"].set_active(bool(v.get("config_from_vault")))
-        w["captcha_auto"] = Gtk.CheckButton(label="auto-solve captcha with OCR (iNode, needs tesseract)")
+        w["captcha_auto"] = Gtk.CheckButton(label="auto-solve captcha (iNode OCR)")
         w["captcha_auto"].set_active(v.get("captcha_auto", True))
-        w["captcha_show"] = Gtk.CheckButton(label="show captcha image in log (iNode — for manual entry)")
+        w["captcha_show"] = Gtk.CheckButton(label="show captcha image")
         w["captcha_show"].set_active(bool(v.get("captcha_show")))
         w["captcha_retries"] = Gtk.SpinButton.new_with_range(1, 40, 1)
         w["captcha_retries"].set_value(int(v.get("captcha_retries", 40)))
 
         box.pack_start(w["insecure"], False, False, 0)
         box.pack_start(w["config_from_vault"], False, False, 0)
-
-        # iNode SSL-VPN captcha + extra args
-        inode_lbl = Gtk.Label(label="iNode SSL-VPN options")
-        inode_lbl.get_style_context().add_class("soc-config-sub")
-        inode_lbl.set_xalign(0.0)
-        inode_lbl.set_margin_top(8)
-        box.pack_start(inode_lbl, False, False, 0)
         ig = Gtk.Grid()
         ig.set_column_spacing(8)
-        ig.set_row_spacing(4)
         cr_lbl = Gtk.Label(label="captcha retries")
         cr_lbl.get_style_context().add_class("soc-config-sub")
         cr_lbl.set_xalign(0.0)
@@ -821,8 +812,61 @@ class ConfigWindow(Gtk.Window):
         box.pack_start(ig, False, False, 0)
         box.pack_start(w["captcha_auto"], False, False, 0)
         box.pack_start(w["captcha_show"], False, False, 0)
-        self._vpn_w = w
+
+        exp.add(box)
+        return exp, w
+
+    def _tab_vpn(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(12)
+
+        note = Gtk.Label(label="Supervised VPN tunnels. Credentials pull from Vaultwarden "
+                               "(set username/password on the Credentials tab for each "
+                               "VPN's vault item). Apply pushes config to vault and restarts "
+                               "VPN services. Multiple VPNs run in parallel.")
+        note.get_style_context().add_class("soc-config-sub")
+        note.set_xalign(0.0)
+        note.set_line_wrap(True)
+        box.pack_start(note, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(200)
+        self._vpn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        scroll.add(self._vpn_box)
+        box.pack_start(scroll, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        add_btn = Gtk.Button(label="+ Add VPN")
+        add_btn.connect("clicked", lambda *_: self._add_vpn_row())
+        rem_btn = Gtk.Button(label="- Remove Last")
+        rem_btn.connect("clicked", lambda *_: self._remove_vpn_row())
+        btn_row.pack_start(add_btn, False, False, 0)
+        btn_row.pack_start(rem_btn, False, False, 0)
+        box.pack_start(btn_row, False, False, 0)
+
+        self._rebuild_vpn_rows()
         return box
+
+    def _rebuild_vpn_rows(self):
+        for child in self._vpn_box.get_children():
+            self._vpn_box.remove(child)
+        self._vpn_rows = []
+        for i, v in enumerate(self._vpns):
+            exp, w = self._build_vpn_row(i, v)
+            self._vpn_box.pack_start(exp, False, False, 0)
+            self._vpn_rows.append(w)
+        self._vpn_box.show_all()
+
+    def _add_vpn_row(self):
+        name = f"vpn{len(self._vpns)+1}"
+        self._vpns.append({"name": name, "enabled": False, "type": "fortinet", "port": 443})
+        self._rebuild_vpn_rows()
+
+    def _remove_vpn_row(self):
+        if self._vpns:
+            self._vpns.pop()
+            self._rebuild_vpn_rows()
 
     def _tab_status(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -1183,28 +1227,30 @@ class ConfigWindow(Gtk.Window):
             overrides["_display"] = disp
             changes["_display"] = disp
 
-        if self._vpn is not None and self._vpn_w:
-            w = self._vpn_w
-            vpncfg = vpn_form_to_dict({
-                "enabled": w["enabled"].get_active(),
-                "type": w["type"].get_active_text() or "fortinet",
-                "gateway": _safe_gateway(w["gateway"].get_text()),
-                "port": int(w["port"].get_value()),
-                "vault_item": _sanitize_len(w["vault_item"].get_text(), MAX_VAULT_ITEM_LEN),
-                "config": _sanitize_len(w["config"].get_text(), MAX_VPN_CONFIG_LEN),
-                "domain": _safe_gateway(w["domain"].get_text()),
-                "realm": _safe_gateway(w["realm"].get_text()),
-                "trusted_cert": w["trusted_cert"].get_text(),
-                "ready_probe": w["ready_probe"].get_text(),
-                "insecure": w["insecure"].get_active(),
-                "config_from_vault": w["config_from_vault"].get_active(),
-                "captcha_auto": w["captcha_auto"].get_active(),
-                "captcha_show": w["captcha_show"].get_active(),
-                "captcha_retries": int(w["captcha_retries"].get_value()),
-                "extra_args": w["extra_args"].get_text(),
-            })
-            overrides["_vpn"] = vpncfg
-            changes["_vpn"] = vpncfg
+        if self._vpns is not None and self._vpn_rows:
+            vpns_list = []
+            for w in self._vpn_rows:
+                vpncfg = vpn_form_to_dict({
+                    "name": _sanitize_len(w["name"].get_text(), 100),
+                    "enabled": w["enabled"].get_active(),
+                    "type": w["type"].get_active_text() or "fortinet",
+                    "gateway": _safe_gateway(w["gateway"].get_text()),
+                    "port": int(w["port"].get_value()),
+                    "vault_item": _sanitize_len(w["vault_item"].get_text(), MAX_VAULT_ITEM_LEN),
+                    "config": _sanitize_len(w["config"].get_text(), MAX_VPN_CONFIG_LEN),
+                    "domain": _safe_gateway(w["domain"].get_text()),
+                    "realm": _safe_gateway(w["realm"].get_text()),
+                    "trusted_cert": w["trusted_cert"].get_text(),
+                    "ready_probe": w["ready_probe"].get_text(),
+                    "insecure": w["insecure"].get_active(),
+                    "config_from_vault": w["config_from_vault"].get_active(),
+                    "captcha_auto": w["captcha_auto"].get_active(),
+                    "captcha_show": w["captcha_show"].get_active(),
+                    "captcha_retries": int(w["captcha_retries"].get_value()),
+                })
+                vpns_list.append(vpncfg)
+            overrides["_vpns"] = vpns_list
+            changes["_vpns"] = vpns_list
 
         try:
             save_overrides(overrides)
