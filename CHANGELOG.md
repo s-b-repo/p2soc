@@ -3,6 +3,88 @@
 All notable changes to **p2soc** (the SOC video-wall kiosk). Format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.0] - 2026-06-30
+
+A UX, security, and multi-VPN release. Theme flows from setup to wall,
+panels are managed dynamically, PIN-gated lock secures the display, and
+multiple VPNs run in parallel with Vaultwarden-backed credentials.
+
+### Added
+
+- **Theme sync** — branding-driven wall CSS (`style.py`); cross-process marker
+  file (`~/.cache/soc-display/branding-changed`) for live theme propagation
+  from setup wizard → running wall (5s poll). Notebook tabs now styled from
+  branding (no more black-on-black Adwaita fallback).
+- **Dynamic panel management** — on-screen settings (⚙) now has ➕ Add Panel,
+  ✕ Remove, and ↑↓ Reorder buttons. Panels created/destroyed live without
+  restart. Export/Import YAML config from the settings window.
+- **PIN-gated panel lock** — 🔒 Lock button in wall toolbar (or Ctrl+Alt+L)
+  shows a branded popup window with PIN entry and brute-force protection
+  (3 failures → escalating cooldown). PIN stored in `~/.config/soc-wall/`.
+- **Chromium insecure certs** — `--ignore-certificate-errors` flag when
+  `allow_insecure: true` (matches WebKit's TLS error policy). Checkbox in
+  panel UI below the URL field.
+- **Multi-VPN support** — settings VPN tab now manages a list with ➕ Add VPN
+  / ➖ Remove Last. Each VPN gets its own expander card. Multiple VPNs run
+  in parallel via `vpnmanager.py`. VPN credentials pull from Vaultwarden
+  per VPN's `vault_item`.
+- **iNode SSL-VPN** — tested against live H3C gateway with cert pin + captcha
+  auto-solve (tesseract OCR). Dedicated iNode options in VPN tab (captcha
+  auto/show/retries).
+- **Health dashboard** — Status tab shows memory from `/proc/meminfo` plus
+  panel count and grid layout.
+- **Screenshot** — 📷 Shot button in wall toolbar saves `~/soc-wall-*.png`.
+- **Tenant field** — optional per-panel tenant tag for multi-tenant deployments.
+- **`make install-local` / `make uninstall-local`** — user-local install
+  without root. Creates desktop entries, PATH symlinks, and auto-launches
+  the control center after install.
+- **Input validation** — length limits on all config fields (URL 2048,
+  title 200, vault 200, selectors 500, marker 200). VPN gateway
+  shell-injection blocking (`_safe_gateway` strips `;&|$\`(){}` and null bytes).
+- **Documentation** — `QUICKSTART.md` covering install, launch, theme, panels,
+  VPN, shortcuts, and troubleshooting.
+
+### Changed
+
+- **Shell scripts self-locate** — all 14 scripts now find the install root
+  from their own path (no `/opt/soc-display` hardcoding). `$SOC_ROOT` still
+  overrides. Error instead of silent fallback on missing `kiosk-host/`.
+- **Desktop shortcuts** — `.desktop` files use absolute `Exec=` paths
+  generated at install time. `~/.local/bin/` symlinks for PATH access.
+- **Install guards relaxed** — only `display` config required (panels
+  optional — wall opens with blank frames). Guard in both `setupgui.py`
+  and `provision.py`.
+- **Install completion** — control center auto-launches after install
+  (`install.sh` and `make install-local`). `_install_finish` spawns
+  directly via `subprocess.Popen` (no fragile wrapper chain).
+- **Config write redirect** — when `/etc/soc-display/` isn't writable
+  (non-root user), `write_file()` redirects to `~/.config/soc-display/`
+  and drops the `active` marker so the wall picks it up.
+- **`backup()` non-fatal** — catches `PermissionError` on root-owned
+  files; original file untouched.
+- **pkexec hardening** — `sysaction.py` checks setuid bit before trusting
+  pkexec; falls through to terminal/sudo on broken installs.
+- **Theme save target** — `branding.save_colors()` now writes to the same
+  file `load()` reads first (user file priority), fixing theme changes not
+  persisting.
+- **Entry placeholder** — uses `{text}` at 90% opacity instead of
+  `{text_dim}` for better contrast on all themes.
+- **PIN lock** — replaced `Gtk.Overlay` approach (broken event delivery)
+  with a proper popup `Gtk.Window`. No auto-lock on start — operator
+  locks manually.
+
+### Fixed
+
+- **`_screen_size` missing** — method definition restored after being lost
+  during PIN lock overlay insertion.
+- **Permissions on install** — `[Errno 13] Permission denied` on
+  `/etc/soc-display/panels.yaml.bak` resolved by redirect + non-fatal backup.
+- **`configpaths.py`** — `ETC_DIR` replaced with `etc_dir()` supporting
+  `$SOC_ETC_DIR` override.
+- **`siteguard.py`** — uses `etc_dir()` instead of removed `ETC_DIR`.
+- **Tests updated** — `test_configpaths.py`, `test_websecurity.py`,
+  `test_websecurity_config.py` patched for API changes.
+
 ## [1.2.0] - 2026-06-26
 
 A GUI + renderer overhaul: one unified control center, an honest launcher, a

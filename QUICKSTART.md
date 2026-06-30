@@ -96,11 +96,17 @@ The Remove button is hidden when only one panel remains (wall needs at least one
 |-----|-------------|
 | Credentials | Store usernames/passwords directly in Vaultwarden |
 | Display | Change grid layout and gap (gap applies live; layout on restart) |
-| VPN | Configure Fortinet/OpenVPN/WireGuard connection |
+| VPN | Configure Fortinet/OpenVPN/WireGuard/iNode connection. ➕ Add VPN / ➖ Remove Last for parallel tunnels. Each VPN has its own vault_item for credentials. |
 | Status | Connection state, memory usage, panel health |
 
 If a **PIN is set** (Setup → Security), the settings window prompts for it before
 showing any tabs.
+
+### Lock the wall
+
+Click 🔒 **Lock** in the wall toolbar (or Ctrl+Alt+L). A popup window
+appears — enter your PIN to unlock. 3 wrong attempts = escalating cooldown
+(5s, 10s, 15s…). Set the PIN in ⚙ Settings → Security.
 
 ## Desktop shortcuts
 
