@@ -424,12 +424,28 @@ class WallWindow:
 
     def _try_unlock(self):
         """Verify PIN from the lock overlay entry."""
+        try:
+            self.log("[lock] _try_unlock called")
+        except Exception:
+            pass
         from .locker import verify_pin
         from .configwin import state_dir
         pin = self._lock_entry.get_text()
+        try:
+            self.log(f"[lock] PIN entered: {len(pin)} chars")
+        except Exception:
+            pass
         if verify_pin(state_dir(), pin):
+            try:
+                self.log("[lock] PIN correct — unlocking")
+            except Exception:
+                pass
             self.unlock_panels()
             return
+        try:
+            self.log("[lock] PIN incorrect")
+        except Exception:
+            pass
         self._lock_entry.set_text("")
         self._lock_fails += 1
         if self._lock_fails >= 3:
