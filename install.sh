@@ -30,7 +30,7 @@
 #                             xlibre/xorg/x11 install the X11 server + openbox.
 #   INSTALL_MODE=desktop|kiosk how the wall starts             (default: desktop)
 #                             desktop = deploy everything but DON'T touch the boot
-#                             (your DE/login manager keeps working; launch the wall
+#                             (your DE/login manager keeps working); launch the wall
 #                             from the desktop icon or `systemctl start soc-wall`).
 #                             kiosk   = dedicated appliance: enable tty1 autologin +
 #                             `systemctl set-default multi-user.target`.
@@ -88,6 +88,11 @@ ETC="/etc/soc-display"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 ARCH="$(uname -m)"
 
+# Pinned SHA-256 of the get.docker.com convenience script, computed 2025-07.
+# The script is only used as a last resort when the distro's native docker/docker.io
+# package is unavailable. The hash MUST match before execution.
+_DOCKER_SCRIPT_SHA256="37eb71347a4353a6ff7ae9a2aa3dddc71cd142f3512cb18f90d10ae4770a7bd2"
+
 log(){ printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn(){ printf '\033[33m!!\033[0m %s\n' "$*"; }
 die(){ printf '\033[31mEE\033[0m %s\n' "$*" >&2; exit 1; }
@@ -103,6 +108,22 @@ docker_pull_retry(){ # $1=image
     warn "docker pull $img failed (attempt $n/3) — retrying in $((n*3))s (network/registry)"
     sleep "$((n*3))"
   done
+}
+
+# Last-resort Docker install via get.docker.com — downloads to a temp file, verifies
+# the pinned SHA-256, and only executes on match. Cleans up the temp file always.
+_install_docker_official(){
+  local tmp; tmp="$(mktemp /tmp/get-docker.XXXXXX)"
+  trap 'rm -f "$tmp"' EXIT
+  if ! curl -fsSL -o "$tmp" https://get.docker.com; then
+    die "failed to download get.docker.com installer"
+  fi
+  if ! printf '%s  %s\n' "$_DOCKER_SCRIPT_SHA256" "$tmp" | sha256sum -c --status; then
+    die "get.docker.com installer hash mismatch (expected $_DOCKER_SCRIPT_SHA256) — refusing to execute"
+  fi
+  sh "$tmp"
+  rm -f "$tmp"
+  trap - EXIT
 }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo ./install.sh)"
@@ -571,9 +592,13 @@ if [ "$VW_MODE" = "docker" ]; then
   if ! command -v docker >/dev/null 2>&1; then
     log "installing Docker"
     case "$FAMILY" in
-      arch)  pm_install docker ;;
-      suse)  pm_install docker ;;
-      *)     curl -fsSL https://get.docker.com | sh ;;
+      arch)   pm_install docker ;;
+      suse)   pm_install docker ;;
+      debian) pm_install docker.io || _install_docker_official ;;
+      fedora) pm_install docker || _install_docker_official ;;
+      alpine) pm_install docker || _install_docker_official ;;
+      void)   pm_install docker || _install_docker_official ;;
+      *)      _install_docker_official ;;
     esac
   fi
   [ "$HAS_SYSTEMD" = "1" ] && systemctl enable --now docker >/dev/null 2>&1 || true
@@ -867,18 +892,31 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
   install -d -m 0755 /usr/share/applications
   # GENERATE the entry from branding (run from kiosk-host so `host` is importable;
   # SOC_BRANDING_FILE points at the just-installed source so operator edits win).
+  branding_errors=""
   if [ -x "$VENV_PY" ] && SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
        PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -m host.branding desktop \
-       "$SOC_ROOT/scripts/soc-wall-menu" soc-wall > "$DESKTOP_DST" 2>/dev/null \
+       "$SOC_ROOT/scripts/soc-wall-menu" soc-wall > "$DESKTOP_DST" 2>/tmp/soc-desktop-gen-err.$$ \
      && [ -s "$DESKTOP_DST" ]; then
     log "generated $DESKTOP_DST from branding"
     DESKTOP_FILE="$DESKTOP_DST"
-  elif [ -f "$SOC_ROOT/soc-wall.desktop" ]; then
-    warn "branding render unavailable — copying the static soc-wall.desktop"
-    install -Dm0644 "$SOC_ROOT/soc-wall.desktop" "$DESKTOP_DST"
-    DESKTOP_FILE="$DESKTOP_DST"
+    rm -f /tmp/soc-desktop-gen-err.$$ 2>/dev/null || true
   else
-    warn "no branding/python and no static soc-wall.desktop — skipping desktop entry"
+    branding_errors="$(cat /tmp/soc-desktop-gen-err.$$ 2>/dev/null || true)"
+    rm -f /tmp/soc-desktop-gen-err.$$ 2>/dev/null || true
+    if [ -f "$SOC_ROOT/soc-wall.desktop" ]; then
+      warn "branding render failed — copying the static soc-wall.desktop"
+      [ -n "$branding_errors" ] && warn "  branding error: $(echo "$branding_errors" | head -n 1)"
+      install -Dm0644 "$SOC_ROOT/soc-wall.desktop" "$DESKTOP_DST"
+      DESKTOP_FILE="$DESKTOP_DST"
+    else
+      warn "no branding/python and no static soc-wall.desktop — skipping desktop entry"
+      [ -n "$branding_errors" ] && warn "  branding error: $(echo "$branding_errors" | head -n 1)"
+    fi
+  fi
+
+  # Validate the desktop entry if the tooling is available (best-effort).
+  if [ -n "$DESKTOP_FILE" ] && command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$DESKTOP_FILE" 2>/dev/null || warn "$DESKTOP_FILE failed desktop-file-validate — the entry may not appear in app menus"
   fi
 
   # Icon: a custom branding icon (if it resolves to a real file) wins; otherwise

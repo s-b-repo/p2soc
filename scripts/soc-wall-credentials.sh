@@ -61,6 +61,7 @@ export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
 
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+[ -n "${PYBIN:-}" ] || { echo "soc-wall-credentials: no Python interpreter found at $ROOT/.venv/bin/python or on PATH" >&2; exit 2; }
 
 cd "$ROOT" 2>/dev/null || true
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 import sys
 
+_HAS_YAML = None
+
 _DEFAULTS = {
     "name": "SOC Video Wall",
     "short_name": "SOC Wall",
@@ -113,28 +115,32 @@ def _warn_ignored(path: str, exc: BaseException) -> None:
 
 
 def _load_file(path: str) -> dict:
+    global _HAS_YAML
+    if _HAS_YAML is None:
+        try:
+            import yaml  # type: ignore
+            _HAS_YAML = True
+        except ImportError:
+            _HAS_YAML = False
+    if _HAS_YAML:
+        try:
+            import yaml  # type: ignore
+            with open(path, encoding="utf-8") as fh:
+                d = yaml.safe_load(fh)
+            return d if isinstance(d, dict) else {}
+        except ImportError:
+            pass
+        except Exception as yaml_exc:
+            try:
+                return _parse_flat(path)
+            except (OSError, ValueError, UnicodeDecodeError):
+                _warn_ignored(path, yaml_exc)
+                return {}
     try:
-        import yaml  # type: ignore
-        with open(path, encoding="utf-8") as fh:
-            d = yaml.safe_load(fh)
-        return d if isinstance(d, dict) else {}
-    except ImportError:
-        try:
-            return _parse_flat(path)
-        except (OSError, ValueError, UnicodeDecodeError) as exc:
-            _warn_ignored(path, exc)
-            return {}
-    except Exception as yaml_exc:  # noqa: BLE001 — some loader errors are not YAMLError.
-        # malformed YAML — try the lenient parser, else give up to defaults. Keep the
-        # broad catch so non-YAMLError loader faults still hit the fallback parser.
-        try:
-            return _parse_flat(path)
-        except (OSError, ValueError, UnicodeDecodeError):
-            # Realistic file/parse faults degrade to defaults, but surface the ORIGINAL
-            # yaml cause so the operator can tell 'rejected' from 'missing'. An unexpected
-            # programmer error in _parse_flat is NOT caught here and propagates.
-            _warn_ignored(path, yaml_exc)
-            return {}
+        return _parse_flat(path)
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        _warn_ignored(path, exc)
+        return {}
 
 
 def _deep_merge(base: dict, over: dict) -> dict:
@@ -189,6 +195,18 @@ def _rgb(hexc: str) -> "tuple[int, int, int]":
         return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     except (ValueError, IndexError):
         return 136, 136, 136
+
+
+def rgb(hexc: str) -> "tuple[int, int, int]":
+    """Public alias for _rgb() — parse a #RRGGBB (or #RGB) string to (r, g, b)
+    ints.  Fallback is neutral grey (136,136,136) on a malformed input."""
+    return _rgb(hexc)
+
+
+def rgba(hexc: str, alpha: float) -> str:
+    """Return a CSS `rgba(r,g,b,alpha)` string for `hexc`."""
+    r, g, b = _rgb(hexc)
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 def relative_luminance(hexc: str) -> float:
@@ -448,7 +466,7 @@ def save_colors(colors: dict, path: str | None = None) -> str:
             fh.write(text)
         os.chmod(tmp, 0o644)
         os.replace(tmp, target)
-    except BaseException:
+    except Exception:
         try:
             os.unlink(tmp)
         except OSError:
@@ -482,7 +500,8 @@ def _main(argv) -> int:
         print("Terminal=false")
         print("Type=Application")
         print("Categories=System;")
-        print("Keywords=soc;security;wall;kiosk;dashboard;")
+        print("StartupNotify=true")
+        print("Keywords=soc;security;wall;kiosk;dashboard")
         return 0
     sys.stderr.write("usage: python -m host.branding [get KEY|color NAME|desktop EXEC [ICON]]\n")
     return 2

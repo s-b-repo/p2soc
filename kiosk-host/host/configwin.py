@@ -83,7 +83,7 @@ def save_overrides(d: dict):
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
-    except BaseException:
+    except Exception:
         try:
             os.unlink(tmp)
         except OSError:

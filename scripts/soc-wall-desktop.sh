@@ -80,15 +80,21 @@ if [ -x "$ROOT/scripts/launcher.sh" ]; then
   exec "$ROOT/scripts/launcher.sh"
 fi
 
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+[ -n "${PYBIN:-}" ] || { echo "soc-wall-desktop: no Python interpreter found at $ROOT/.venv/bin/python or on PATH" >&2; exit 2; }
 
 # Resolve SOC_PANELS_FILE AFTER sourcing soc.env so an explicit one in the env wins.
 : "${SOC_PANELS_FILE:=$("$PYBIN" -m host.configpaths --panels 2>/dev/null || true)}"
 : "${SOC_PANELS_FILE:=/etc/soc-display/panels.yaml}"
 export SOC_PANELS_FILE SOC_ENV_FILE
 export SOC_INJECT_TMPL="${SOC_INJECT_TMPL:-$ROOT/inject/login.js.tmpl}"
-export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
-cd "$ROOT" 2>/dev/null || true
+cd "$ROOT" 2>/dev/null
+if [ "${PWD:-}" != "$ROOT" ] && [ "${PWD:-}" != "$(cd "$ROOT" 2>/dev/null && pwd)" ]; then
+  echo "soc-wall-desktop: cannot enter $ROOT — refusing to start with wrong working directory" >&2
+  exit 2
+fi
 exec "$PYBIN" -m host.main

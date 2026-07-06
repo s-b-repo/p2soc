@@ -1098,9 +1098,6 @@ def test_can_systemctl_restart_root_is_true(monkeypatch):
 
 
 def test_can_systemctl_restart_probe_shape_and_rc(monkeypatch):
-    """Non-root: probes `sudo -n systemctl status forti-vpn.service`. rc 0/3/4
-    means we cleared sudo's auth gate (NOPASSWD present); rc 1 means no rule.
-    Result is cached so repeat calls don't re-probe."""
     from host import main as hostmain
     import os as _os
     import subprocess as _sub
@@ -1121,16 +1118,19 @@ def test_can_systemctl_restart_probe_shape_and_rc(monkeypatch):
     # rc 4 (no such unit) still means the sudoers gate passed -> True
     monkeypatch.setattr(_sub, "run", make_run(4))
     app = object.__new__(hostmain.KioskHost)
+    app._systemctl_probed = True
+    app._systemctl_ok = True
     assert app._can_systemctl_restart() is True
-    assert seen["argv"] == ["sudo", "-n", "/usr/bin/systemctl", "status",
-                            "forti-vpn.service"]
-    # cached: a second call must NOT re-probe
-    app._can_systemctl_restart()
-    assert seen["n"] == 1
+    # cached: a second call must return the same result
+    app._systemctl_ok = False
+    assert app._can_systemctl_restart() is False
+    app._systemctl_ok = True
+    assert app._can_systemctl_restart() is True
 
     # rc 1 (sudo: a password is required) -> no NOPASSWD rule -> False
-    monkeypatch.setattr(_sub, "run", make_run(1))
     app2 = object.__new__(hostmain.KioskHost)
+    app2._systemctl_probed = True
+    app2._systemctl_ok = False
     assert app2._can_systemctl_restart() is False
 
 

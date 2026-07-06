@@ -68,21 +68,6 @@ def _esc(s) -> str:
 # building (no gi); mirrors setupgui._css so the control center reads as the same
 # app, plus a tinted left sidebar rail + active-row highlight.
 # --------------------------------------------------------------------------- #
-def _to_rgb(hexc: str) -> "tuple[int, int, int]":
-    h = (hexc or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(ch * 2 for ch in h)
-    try:
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except (ValueError, IndexError):
-        return 136, 136, 136
-
-
-def _rgba(hexc: str, alpha: float) -> str:
-    r, g, b = _to_rgb(hexc)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
 def _css(branding) -> bytes:
     c = branding.load().get("colors", {})
 
@@ -98,15 +83,15 @@ def _css(branding) -> bytes:
     accent_strong = col("accent_strong", "#157A49")
     good = col("good", "#1FA463")
     bad = col("bad", "#C0341D")
-    glow = _rgba(accent, 0.28)
+    glow = branding.rgba(accent, 0.28)
     accent_surf = branding.accent_on(surface, accent=accent, strong=accent_strong)
     btn_fg = branding.text_on(accent_strong, dark=text)
     dark = branding.is_dark(bg)
     glow_css = ""
     if dark:
         glow_css = f"""
-.soc-section-title {{ text-shadow: 0 0 6px {_rgba(accent, 0.6)}; }}
-.soc-rail-btn:checked {{ box-shadow: inset 3px 0 0 {accent}, 0 0 10px {_rgba(accent, 0.25)}; }}
+.soc-section-title {{ text-shadow: 0 0 6px {branding.rgba(accent, 0.6)}; }}
+.soc-rail-btn:checked {{ box-shadow: inset 3px 0 0 {accent}, 0 0 10px {branding.rgba(accent, 0.25)}; }}
 """
     return f"""
 window.soc-center {{ background-color: {bg}; }}
@@ -142,11 +127,11 @@ window.soc-center {{ background-color: {bg}; }}
 list.soc-list {{ background-color: {surface}; border: 1px solid {border};
   border-radius: 8px; }}
 list.soc-list row {{ padding: 2px 4px; }}
-list.soc-list row:selected {{ background-color: {_rgba(accent, 0.16)};
+list.soc-list row:selected {{ background-color: {branding.rgba(accent, 0.16)};
   box-shadow: inset 3px 0 0 {accent}; }}
 list.soc-list row:selected label {{ color: {text}; }}
-.soc-badge {{ background-color: {_rgba(accent, 0.16)}; color: {accent_strong};
-  border: 1px solid {_rgba(accent, 0.5)}; border-radius: 10px;
+.soc-badge {{ background-color: {branding.rgba(accent, 0.16)}; color: {accent_strong};
+  border: 1px solid {branding.rgba(accent, 0.5)}; border-radius: 10px;
   padding: 0 7px; font-size: 9px; font-weight: bold; }}
 
 entry {{ background-color: {sunken}; color: {text};
@@ -154,7 +139,7 @@ entry {{ background-color: {sunken}; color: {text};
 entry:focus {{ border: 1px solid {accent}; box-shadow: 0 0 0 2px {glow}; }}
 entry image, entry placeholder {{ color: {text_dim}; }}
 .soc-field-bad {{ border: 1px solid {bad}; }}
-.soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.28)}; }}
+.soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {branding.rgba(bad, 0.28)}; }}
 
 textview, textview text {{ background-color: {sunken}; color: {text}; }}
 
@@ -176,9 +161,9 @@ button.soc-ghost {{ background-image: none; background-color: transparent;
   padding: 6px 12px; }}
 button.soc-ghost:hover {{ background-color: {sunken}; border-color: {accent}; }}
 button.soc-danger {{ background-image: none; background-color: transparent;
-  color: {bad}; border: 1px solid {_rgba(bad, 0.5)}; border-radius: 6px;
+  color: {bad}; border: 1px solid {branding.rgba(bad, 0.5)}; border-radius: 6px;
   padding: 6px 12px; }}
-button.soc-danger:hover {{ background-color: {_rgba(bad, 0.10)}; border-color: {bad}; }}
+button.soc-danger:hover {{ background-color: {branding.rgba(bad, 0.10)}; border-color: {bad}; }}
 button.soc-danger:disabled {{ color: {text_dim}; border-color: {border}; }}
 
 /* Keyboard focus rings — the rail, list rows, and every button (entries get
@@ -194,7 +179,7 @@ button.soc-primary:focus, button.soc-primary:focus-visible {{
 button.soc-ghost:focus, button.soc-ghost:focus-visible {{ border-color: {accent};
   box-shadow: 0 0 0 2px {glow}; }}
 button.soc-danger:focus, button.soc-danger:focus-visible {{ border-color: {bad};
-  box-shadow: 0 0 0 2px {_rgba(bad, 0.28)}; }}
+  box-shadow: 0 0 0 2px {branding.rgba(bad, 0.28)}; }}
 list.soc-list row:focus {{ box-shadow: inset 3px 0 0 {accent}, 0 0 0 2px {glow}; }}
 
 .soc-mono {{ font-family: monospace; }}
@@ -250,7 +235,7 @@ def _resolve_master() -> str:
     except Exception:  # noqa: BLE001
         pass
     try:
-        from host import secretstore  # type: ignore
+        from . import secretstore  # type: ignore
         sd = os.environ.get("SOC_SECRET_DIR")
         if secretstore.is_sealed(sd):
             return secretstore.unseal(sd) or ""
@@ -406,6 +391,8 @@ class ControlCenter:
         holder = {}
 
         def _cb():
+            if self._destroyed:
+                return False
             keep = False
             try:
                 keep = bool(fn())
@@ -829,6 +816,8 @@ class ControlCenter:
         self._run_bg(work)
 
     def _auto_unlock_done(self, master):
+        if self._destroyed:
+            return False
         if master:
             self._master = master
             self._cred_set_status("vault unlocked (host-bound master)")
@@ -872,6 +861,8 @@ class ControlCenter:
         self._run_bg(work)
 
     def _populate_logins(self, rows):
+        if self._destroyed:
+            return False
         Gtk = self.Gtk
         # Pango isn't imported at module top (gi only inits inside run()); by the
         # time rows render the GUI is up, so requiring it here is safe + idempotent.
@@ -938,6 +929,8 @@ class ControlCenter:
         self._run_bg(work)
 
     def _fill_editor(self, rec):
+        if self._destroyed:
+            return False
         if not rec:
             self._cred_set_status("login not found", bad=True)
             return False
@@ -1041,6 +1034,8 @@ class ControlCenter:
         self._run_bg(work)
 
     def _save_done(self, action, name, err):
+        if self._destroyed:
+            return False
         self._save_btn.set_sensitive(True)
         if err:
             self._cred_set_status(f"could not save '{name}': {err}", bad=True)
@@ -1078,6 +1073,8 @@ class ControlCenter:
         self._run_bg(work)
 
     def _delete_done(self, name, ok, err):
+        if self._destroyed:
+            return False
         if err:
             self._cred_set_status(f"could not delete '{name}': {err}", bad=True)
             return False
@@ -1166,7 +1163,7 @@ class ControlCenter:
     def _cred_set_status(self, text, ok_unused=False, bad=False, dim=False):
         # Signature accommodates GLib.idle_add(positional) callers: idle_add passes
         # extra args positionally, so (text, bad, dim) map cleanly.
-        if self._cred_status is None:
+        if self._destroyed or self._cred_status is None:
             return False
         color = self._color("bad") if bad else (
             self._color("text_dim") if dim else self._color("text"))

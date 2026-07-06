@@ -44,7 +44,7 @@ import shutil
 import subprocess
 import sys
 
-from host import secretstore
+from . import secretstore
 
 # Default Secret Service attribute pair. A lookup and a store must present the
 # SAME attributes or they won't match. Overridable via SOC_SECRET_ATTRS (space-

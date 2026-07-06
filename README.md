@@ -231,7 +231,23 @@ panels:
 ```
 
 The same file also holds the `display.layout` (auto/windows/single), `tunnel`,
-`vpn`, and `proxy` sections — for example, an authenticated proxy for all panels:
+and `proxy` sections, plus a `vpns:` list for one or more independent VPNs.
+For example, a single VPN (the common case) still uses a plain `vpn:` block;
+two or more VPNs, or named/default-route entries, use `vpns:`:
+
+```yaml
+# Single VPN (plain, no name):
+vpn: { enabled: true, type: fortinet, gateway: "vpn.example.com",
+       vault_item: "SOC FortiGate VPN" }
+
+# Multi-VPN list:
+vpns:
+  - {name: corp, enabled: true, type: fortinet, gateway: "g.corp.example",
+     vault_item: "SOC Corp VPN", default_route: true}
+  - {name: lab, enabled: true, type: wireguard, config: "/etc/wireguard/lab.conf"}
+```
+
+And an authenticated proxy for all panels:
 
 ```yaml
 proxy:

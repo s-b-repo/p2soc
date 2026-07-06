@@ -114,6 +114,17 @@ window, grid, stack { background-color: #0b1020; }
 .soc-vpn-pill.offline   { border-color: rgba(255,120,110,0.7); color: #ff8f80; }
 .soc-vpn-pill.checking  { color: #d9c66a; }
 .soc-vpn-pill.unconfigured { color: #8694c4; }
+
+/* Vault unreachable warning label (top bar, yellow) */
+.soc-vault-warn {
+  color: #e6c74c;
+  font-size: 13px;
+  font-weight: bold;
+  padding: 3px 10px;
+  margin: 0 2px;
+  border: 1px solid rgba(230,199,76,0.45);
+  border-radius: 12px;
+}
 """
 
 _applied = False

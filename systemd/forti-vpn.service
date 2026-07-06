@@ -9,7 +9,8 @@ Wants=network-online.target
 Before=getty@tty1.service
 # Never stop retrying: the supervisor owns backoff (incl. long auth/cert
 # holds); this only covers supervisor crashes.
-StartLimitIntervalSec=0
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 # The supervisor (host/fortivpn.py) sends READY=1 immediately and surfaces

@@ -117,7 +117,8 @@ def test_should_block_trackers_precedence():
 def test_build_allowlist_includes_own_origin_and_sso():
     al = ws.build_allowlist(_Panel(), _Sec())
     assert "dash.example.com" in al          # own origin
-    assert "*.okta.com" in al                # bundled SSO
+    assert "okta.com" in al                  # bundled SSO (normalised from *.okta.com)
+    assert "oktacdn.com" in al               # bundled SSO (normalised from *.oktacdn.com)
     # and it actually allows the panel's own SSO redirect + own subdomain
     assert ws.host_matches("login.microsoftonline.com", al)
     assert ws.host_matches("auth.dash.example.com", al)

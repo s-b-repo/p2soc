@@ -12,9 +12,9 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _KIOSK = os.path.join(_REPO, "kiosk-host")
 
 
-def test_seven_grouped_entries_with_system_actions():
+def test_eight_grouped_entries_with_system_actions():
     e = launchermenu._ENTRIES
-    assert len(e) == 7
+    assert len(e) == 8
     # each row is now an 8-tuple: (section, glyph, title, sub, tag, class, ckey, action)
     assert all(len(row) == 8 for row in e)
     # action is a plain callable OR a known in-process sentinel (install/uninstall).
@@ -42,7 +42,7 @@ def test_seven_grouped_entries_with_system_actions():
 def test_entries_use_known_mode_glyphs():
     # index-1 is the mode GLYPH key (gear/window/expand/swatch/shield/download/trash).
     keys = [row[1] for row in launchermenu._ENTRIES]
-    assert keys == ["window", "expand", "gear", "swatch", "shield", "download", "trash"]
+    assert keys == ["window", "expand", "gear", "swatch", "shield", "download", "trash", "check"]
     assert all(k in launchermenu._GLYPHS for k in keys)
     # each glyph template renders a non-empty accent-stroked SVG body (headless,
     # no gi) and has a unicode fallback so a box without the SVG loader still shows.

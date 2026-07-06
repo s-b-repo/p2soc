@@ -57,8 +57,20 @@ MAX_LOGIN_ATTEMPTS = 3        # real fill+submit attempts before the "sign in" p
 MAX_LOGIN_MISSES = 10         # consecutive structural misses (socLogin false/undefined)
 #                               before we stop re-injecting + show the popup
 
+_hardening_warned = set()
+
 _default_ctx_proxied = False
 _mem_pressure_done = False
+
+_swallow_warned: set = set()
+
+def _warn_once(msg: str):
+    if msg not in _swallow_warned:
+        _swallow_warned.add(msg)
+        try:
+            print(f"webkit: {msg}", flush=True)
+        except Exception:
+            pass
 
 # The compiled tracker UserContentFilter is process-wide (it holds no secrets and
 # the rule set is identical for every blocking panel). Compile ONCE, lazily, off
@@ -164,8 +176,8 @@ def _ensure_tracker_filter(panel, on_ready, log):
         for cb in _filter_waiters.pop(key, []):
             try:
                 cb(filt)
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_once(f"tracker filter callback failed: {e}")
 
     try:
         _filter_store.save(ident, GLib.Bytes.new(rules.encode("utf-8")), None, _done)
@@ -257,15 +269,27 @@ def _harden_settings(s, panel):
     ):
         try:
             s.set_property(_prop, _val)
-        except Exception:                    # unknown on this build -> skip
-            pass
+        except Exception:
+            if _prop not in _hardening_warned:
+                import logging
+                logging.warning(
+                    f"[{panel.id}] hardening: could not set {_prop} — "
+                    "property may have been renamed/removed in this webkit2gtk version"
+                )
+                _hardening_warned.add(_prop)
     # UA override (some dashboards gate on UA). Only when explicitly set.
     ua = getattr(panel, "user_agent", None)
     if ua:
         try:
             s.set_property("user-agent", ua)
         except Exception:
-            pass
+            if "user-agent" not in _hardening_warned:
+                import logging
+                logging.warning(
+                    f"[{panel.id}] hardening: could not set user-agent — "
+                    "property may have been renamed/removed in this webkit2gtk version"
+                )
+                _hardening_warned.add("user-agent")
 
 
 def _apply_tls(ctx, panel, log):
@@ -275,7 +299,7 @@ def _apply_tls(ctx, panel, log):
             log(f"[{panel.id}] TLS verification DISABLED for this panel "
                 f"(allow_insecure: self-signed cert accepted)")
         except Exception:                                  # very old 4.0 builds
-            pass
+            _warn_once(f"[{panel.id}] TLS error policy set failed — TLS may be ON unexpectedly")
 
 
 def _data_manager_for(panel, log):
@@ -326,7 +350,7 @@ def _setup_cookies(ctx, dm, panel, log):
     try:
         cm.set_accept_policy(WebKit2.CookieAcceptPolicy.NO_THIRD_PARTY)
     except Exception:
-        pass
+        _warn_once("cookie accept policy NO_THIRD_PARTY could not be set")
 
 
 def _new_context(dm):
@@ -405,6 +429,8 @@ class WebKitPanel:
         # that it's probably a config/URL problem, not a transient blip.
         self._consec_fail = 0
         self._first_fail_at = 0.0
+        self._consecutive_crashes = 0
+        self._max_crashes = cfg.env_int("SOC_MAX_CONSECUTIVE_CRASHES", 10, lo=1, hi=10000)
         self._build()
 
     # ---- construction ------------------------------------------------------
@@ -494,7 +520,8 @@ class WebKitPanel:
                     _obj.connect(_sig, self._on_download_started)
                     break
                 except Exception:
-                    pass
+                    _warn_once("download-started signal connection failed — "
+                               "downloads may not be blocked")
         # Tracker blocklist: compile-once WKContentRuleList (4.1) added when ready;
         # 4.0 fallback observes resource loads and redirects matches to about:blank.
         self._install_tracker_block(ctx)
@@ -519,7 +546,7 @@ class WebKitPanel:
         try:
             win.set_wmclass(p.wmclass, p.wmclass)         # deprecated; X11 only
         except Exception:
-            pass
+            _warn_once(f"[{p.id}] set_wmclass failed — window manager placement may be incorrect")
         # On Wayland there is no per-window WM_CLASS; the generated labwc rules
         # match the title instead, so keep it equal to the wmclass and stable.
         win.set_title(p.wmclass)
@@ -625,7 +652,7 @@ class WebKitPanel:
         try:
             download.cancel()
         except Exception:
-            pass
+            _warn_once("download.cancel() failed — download may proceed")
         self.log(f"[{self.panel.id}] download refused (downloads disabled)")
         return True
 
@@ -655,7 +682,8 @@ class WebKitPanel:
                 self.webview.connect("resource-load-started",
                                      self._on_resource_load_started)
             except Exception:
-                pass
+                _warn_once(f"[{self.panel.id}] resource-load-started signal "
+                           "connect failed — 4.0 tracker blocking disabled")
 
     def _on_resource_load_started(self, _wv, resource, request):
         """4.0 tracker fallback: redirect a matched request to about:blank (a true
@@ -731,6 +759,7 @@ class WebKitPanel:
         self._ever_loaded = False
         self._consec_fail = 0
         self._first_fail_at = 0.0
+        self._consecutive_crashes = 0
         self.log(f"[{self.panel.id}] reconfigured -> {url or '(cleared)'}")
         self.load()
 
@@ -747,6 +776,10 @@ class WebKitPanel:
 
     def _on_terminated(self, _wv, reason):
         why = reason.value_nick if hasattr(reason, "value_nick") else "crashed"
+        self._consecutive_crashes += 1
+        if self._consecutive_crashes >= self._max_crashes:
+            self._show_crash_card()
+            return
         persistent = self._note_failure()
         # Use the same exponential backoff as load failures. On a 1 GB Pi a
         # web-process termination is usually the memory-pressure killer; a fixed
@@ -816,6 +849,7 @@ class WebKitPanel:
                 # the "unreachable Nx" state.
                 self._consec_fail = 0
                 self._first_fail_at = 0.0
+                self._consecutive_crashes = 0
             self._loaded_at = now
             self._ever_loaded = True
             # a finished load means the proxy accepted the creds — reset the
@@ -833,6 +867,13 @@ class WebKitPanel:
             self.load()
             return False                   # one-shot
         GLib.timeout_add_seconds(int(delay), _go)
+
+    def _show_crash_card(self):
+        self.log(f"[{self.panel.id}] CRASHED {self._consecutive_crashes}x — "
+                 f"giving up (threshold {self._max_crashes}). "
+                 f"Reload / Ctrl+Shift+C to reconfigure or restart the service.")
+        self.status.update("panel crashed too many times — verify the URL "
+                           "is valid, then reload or restart", error=True, busy=False)
 
     # ---- proxy auth ---------------------------------------------------------
     def _on_authenticate(self, _wv, request):
@@ -1006,10 +1047,24 @@ class WebKitPanel:
                 return
         # 4.0 fallback: run_javascript (removed on some 4.1 builds). Wrap so a
         # missing/changed API logs once and degrades instead of escaping the
-        # signal handler. We can't easily read its result here, so report None.
+        # signal handler.
+        def _on_js_4_0_result(source, result, user_data):
+            val = None
+            try:
+                val = source.run_javascript_finish(result)
+            except Exception as e:      # noqa: BLE001 — JS threw / web process gone
+                self.log(f"[{self.panel.id}] run_javascript result error: {e}")
+            if user_data is not None:
+                try:
+                    user_data(val)
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"[{self.panel.id}] eval callback error: {e}")
         try:
-            self.webview.run_javascript(js, None, None, None)
-        except Exception as e:          # noqa: BLE001 — API absent/changed
+            self.webview.run_javascript(js, None, _on_js_4_0_result, on_result)
+            return
+        except TypeError:
+            pass                    # API too old for callback -> fall through
+        except Exception as e:      # noqa: BLE001 — API absent/changed
             self.log(f"[{self.panel.id}] run_javascript failed: {e}")
         if on_result is not None:
             on_result(None)

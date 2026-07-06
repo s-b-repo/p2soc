@@ -86,7 +86,9 @@ def launch_wall(mode: str) -> "tuple[bool, str]":
             if e:
                 env["SOC_ENV_FILE"] = e
     except Exception:  # noqa: BLE001 — resolver best-effort; host.main self-resolves too
-        pass
+        sys.stderr.write("soc-wall menu: could not resolve config paths "
+                         "(SOC_PANELS_FILE/SOC_ENV_FILE); the wall will "
+                         "self-resolve at startup\n")
     # Use the venv interpreter (deps live there), not the menu's own — same as scripts/*.sh.
     return _spawn([_venv_python(), "-m", "host.main"], cwd=kiosk, env=env)
 
@@ -152,6 +154,19 @@ def launch_credentials() -> "tuple[bool, str]":
 _ACT_INSTALL = "install"      # sentinel -> _on_install(win) (in-process; needs win)
 _ACT_UNINSTALL = "uninstall"  # sentinel -> _on_uninstall(win) (in-process; needs win)
 
+def launch_validate() -> "tuple[bool, str]":
+    """Run the health-check probe and return (ok, reason) — pure validation, no spawn."""
+    try:
+        from host import health
+        results = health.check()
+        if results.get("ok"):
+            return True, "All checks pass — wall is healthy."
+        issues = results.get("issues", [])
+        return False, "Issues found:\n" + "\n".join(f"  • {i}" for i in issues[:8])
+    except Exception as e:
+        return False, f"Health check failed: {e}"
+
+
 _ENTRIES = (
     ("run", "window", "Desktop mode", "Run the wall in a window", "windowed",
      "soc-desktop", "desktop", lambda: launch_wall("--window")),
@@ -167,6 +182,8 @@ _ENTRIES = (
      "soc-install", "accent_strong", _ACT_INSTALL),
     ("system", "trash", "Uninstall", "Remove the deployed wall", "",
      "soc-uninstall", "bad", _ACT_UNINSTALL),
+    ("system", "check", "Validate", "Check wall health & config", "",
+     "soc-validate", "good", launch_validate),
 )
 
 # Ordered section eyebrows, with a human label for the '// ' line. Drives both the
@@ -192,17 +209,6 @@ def _shorten_path(p: str, limit: int = 42) -> str:
     parts = p.split(os.sep)
     tail = parts[-2:] if len(parts) >= 2 else parts[-1:]
     return "…/" + "/".join(tail)
-
-
-def _rgba(hexc: str, alpha: float) -> str:
-    h = (hexc or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(ch * 2 for ch in h)
-    try:
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except (ValueError, IndexError):
-        r, g, b = 136, 136, 136
-    return f"rgba({r},{g},{b},{alpha})"
 
 
 # --------------------------------------------------------------------------- #
@@ -270,7 +276,14 @@ def _svg_shield(ac: str) -> str:
             f'<path d="M12 3.2 L19 6 V11.5 C19 16 15.8 19.2 12 20.8 '
             f'C8.2 19.2 5 16 5 11.5 V6 Z"/>'
             f'<circle cx="12" cy="10.5" r="1.9"/>'
-            f'<path d="M12 12.4 V15.2"/></g>')
+             f'<path d="M12 12.4 V15.2"/></g>')
+
+
+def _svg_check(ac: str) -> str:
+    return (f'<g fill="none" stroke="{ac}" stroke-width="1.8" '
+            f'stroke-linecap="round" stroke-linejoin="round">'
+            f'<circle cx="12" cy="12" r="9.5"/>'
+            f'<path d="M7.5 12 L10.5 15 L16.5 9"/></g>')
 
 
 def _svg_download(ac: str) -> str:
@@ -293,12 +306,12 @@ def _svg_trash(ac: str) -> str:
 
 _GLYPHS = {"gear": _svg_gear, "window": _svg_window,
            "expand": _svg_expand, "swatch": _svg_swatch,
-           "shield": _svg_shield,
+           "shield": _svg_shield, "check": _svg_check,
            "download": _svg_download, "trash": _svg_trash}
 # Unicode fallback per glyph (themed Pango) if the SVG loader is unavailable.
 _GLYPH_FALLBACK = {"gear": "⚙", "window": "▢",
                    "expand": "⤢", "swatch": "▦",
-                   "shield": "⛨",
+                   "shield": "⛨", "check": "✓",
                    "download": "⤓", "trash": "✕"}
 
 
@@ -353,9 +366,9 @@ def _css(colors=None) -> bytes:
                              col("kiosk", "#0E7C7B"))
     appearance = col("primary", "#1FA463")  # the Appearance tile uses the brand accent
     credentials = col("setup", "#1FA463")   # credentials/security rides the setup accent
-    glow = _rgba(accent, 0.28)
-    emph_glow = _rgba(accent, 0.22)
-    bad_glow = _rgba(bad, 0.26)
+    glow = branding.rgba(accent, 0.28)
+    emph_glow = branding.rgba(accent, 0.22)
+    bad_glow = branding.rgba(bad, 0.26)
 
     def card(cls, ac):
         # flat fill at rest; on hover the accent left-border, an inset accent ring
@@ -385,10 +398,10 @@ def _css(colors=None) -> bytes:
     # already gated above.
     glow_css = ""
     if branding.is_dark(bg):
-        halo = _rgba(accent, 0.5)
+        halo = branding.rgba(accent, 0.5)
         glow_css = f"""
 .soc-header {{ box-shadow: inset 0 2px 0 -1px {halo}; }}
-.soc-card:hover {{ box-shadow: inset 0 0 0 1px {border}, 0 4px 16px {_rgba(accent, 0.18)}; }}
+.soc-card:hover {{ box-shadow: inset 0 0 0 1px {border}, 0 4px 16px {branding.rgba(accent, 0.18)}; }}
 """
 
     return f"""
@@ -1271,10 +1284,35 @@ def _build_window():
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Validate critical dependencies EARLY — a clickable .desktop launch discards
+    # stderr (Terminal=false), so an import failure here would look like "the button
+    # does nothing." Fail loudly with a visible diagnostic before anything else.
+    if "--check" not in argv:
+        _failures = []
+        for mod, name in [("branding", "branding"), ("health", "health checks"),
+                          ("configpaths", "config resolver")]:
+            try:
+                __import__("host", fromlist=[mod])
+            except Exception as e:
+                _failures.append(f"{name}: {e}")
+        if _failures:
+            err = "Cannot start SOC Wall control center — missing modules:\n  " + \
+                  "\n  ".join(_failures) + \
+                  "\n\nCheck that kiosk-host/ is on PYTHONPATH and all dependencies are installed."
+            try:
+                import subprocess as _sp
+                _sp.run([sys.executable, "-m", "host.guierror",
+                         "SOC Wall cannot start", err],
+                        timeout=10)
+            except Exception:
+                print(err, file=sys.stderr)
+            return 2
+
     if "--check" in argv:               # CI: verify wiring, no GTK / no display
-        # SEVEN tiles now, each an 8-tuple (section, glyph, title, sub, tag, class,
+        # EIGHT tiles now, each an 8-tuple (section, glyph, title, sub, tag, class,
         # colour_key, action) with a callable-or-sentinel action.
-        assert len(_ENTRIES) == 7
+        assert len(_ENTRIES) == 8
         assert all(len(e) == 8 for e in _ENTRIES), "every entry is an 8-tuple"
         assert all(callable(e[-1]) or e[-1] in (_ACT_INSTALL, _ACT_UNINSTALL)
                    for e in _ENTRIES), "action must be callable or a known sentinel"
@@ -1285,6 +1323,7 @@ def main(argv=None) -> int:
         assert by_class["soc-credentials"][-1] is launch_credentials
         assert by_class["soc-install"][-1] == _ACT_INSTALL
         assert by_class["soc-uninstall"][-1] == _ACT_UNINSTALL
+        assert by_class["soc-validate"][-1] is launch_validate
         # Spawn-tile contract: the helpers return (ok, reason) so the menu can gate
         # win.destroy() on success and surface the cause on failure (never a silent
         # dead-end). A bad argv must fail closed to a (False, reason) tuple.

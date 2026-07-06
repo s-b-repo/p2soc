@@ -62,10 +62,10 @@ def make_backup(src_dir: str, passphrase: str) -> bytes:
         raise BackupError(
             f"backup passphrase too short: need at least {_MIN_PASSPHRASE} "
             "characters (NIST SP 800-63B)")
-    AESGCM = ss._aesgcm()
+    AESGCM = ss.aesgcm()
     salt = os.urandom(16)
     nonce = os.urandom(12)
-    key = ss._kdf(passphrase.encode("utf-8"), salt)
+    key = ss.kdf(passphrase.encode("utf-8"), salt)
     ct = AESGCM(key).encrypt(nonce, _tar_gz(src_dir), None)
     return _MAGIC + salt + nonce + ct
 
@@ -76,9 +76,9 @@ def open_backup(blob: bytes, passphrase: str) -> bytes:
         raise BackupError("not a p2soc backup file (bad magic) or truncated")
     off = len(_MAGIC)
     salt, nonce, ct = blob[off:off + 16], blob[off + 16:off + 28], blob[off + 28:]
-    AESGCM = ss._aesgcm()
+    AESGCM = ss.aesgcm()
     try:
-        key = ss._kdf(passphrase.encode("utf-8"), salt)
+        key = ss.kdf(passphrase.encode("utf-8"), salt)
         return AESGCM(key).decrypt(nonce, ct, None)
     except Exception:                  # InvalidTag -> wrong passphrase / tampered
         raise BackupError("could not decrypt backup — wrong passphrase or the "

@@ -64,6 +64,7 @@ export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+[ -n "${PYBIN:-}" ] || { echo "soc-wall-setup-gui: no Python interpreter found at $ROOT/.venv/bin/python or on PATH" >&2; exit 2; }
 
 cd "$ROOT" 2>/dev/null || true
 

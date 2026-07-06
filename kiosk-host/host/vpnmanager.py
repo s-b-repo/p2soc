@@ -64,9 +64,8 @@ def _is_enabled(entry: dict) -> bool:
 def coerce_split_tunnel(entry: dict, *, is_owner: bool, log: Callable[[str], None]):
     """Force a NON-owner VPN to split-tunnel so it cannot grab the default route.
 
-    Mutates a COPY (callers pass the manager's private per-entry dict). The owner
-    (or a single/legacy VPN with no list semantics) is left untouched — it may
-    honour its own set_routes / full-tunnel config.
+    The owner (or a single/legacy VPN with no list semantics) is left
+    untouched — it may honour its own set_routes / full-tunnel config.
 
     Levers, per backend (all already understood by config.openfortivpn_args /
     openvpn_args, and by wg-quick):
@@ -79,6 +78,7 @@ def coerce_split_tunnel(entry: dict, *, is_owner: bool, log: Callable[[str], Non
                    the materialize path honours it AND warn loudly so the operator
                    scopes AllowedIPs. The wg 0.0.0.0/0 guard runs at materialize.
     """
+    entry = copy.deepcopy(entry)
     if is_owner or not isinstance(entry, dict):
         return entry
     kind = cfg.vpn_kind(entry)
@@ -248,7 +248,7 @@ class VpnManager:
             name = _name_of(entry, i)
             entry["name"] = name
             is_owner = (name == owner_name)
-            coerce_split_tunnel(entry, is_owner=is_owner, log=self._log)
+            entry = coerce_split_tunnel(entry, is_owner=is_owner, log=self._log)
             self._entries.append((name, entry, is_owner))
 
     # ---- lifecycle ----------------------------------------------------------

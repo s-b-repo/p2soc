@@ -59,7 +59,7 @@ GTK chooser (`scripts/soc-wall-menu` → `kiosk-host/host/launchermenu.py`) with
 three actions: **Setup**, **Desktop mode** (windowed), and **Kiosk mode**
 (fullscreen). This is the everyday entry point in desktop installs — no terminal
 needed. (The launcher's "Setup" entry is the graphical front door; the full GUI
-setup wizard is still in progress.)
+setup wizard is available via the launcher's Setup entry.)
 
 ## 2. Configure (the wizard does this)
 

@@ -1,6 +1,6 @@
 [project]
 name = "soc-kiosk-host"
-version = "1.0.0"
+version = "1.2.0"
 description = "SOC video-wall kiosk host: renders 4 panels (WebKitGTK + Chromium fallback), injects logins from Vaultwarden, keeps sessions alive."
 requires-python = ">=3.9"
 # NOTE: PyGObject + WebKit2 come from SYSTEM packages, not pip:
@@ -9,6 +9,7 @@ requires-python = ">=3.9"
 dependencies = [
   "PyYAML>=6.0",
   "websocket-client>=1.6",   # Chrome DevTools Protocol (CDP) client for the chromium fallback
+  "cryptography>=41",
 ]
 
 [project.optional-dependencies]
@@ -26,3 +27,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["host"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = ["gi: tests that require PyGObject/GTK (skipped without display)"]
+filterwarnings = [
+  "ignore::gi.PyGIDeprecationWarning",
+]

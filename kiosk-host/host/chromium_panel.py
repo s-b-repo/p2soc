@@ -42,7 +42,7 @@ from . import config as cfg
 from . import configpaths
 from . import inject
 from . import perf
-from . import siteguard
+from . import websecurity
 
 RESPAWN_INITIAL = 5.0    # seconds; doubled up to RESPAWN_MAX after each death
 RESPAWN_MAX = 60.0
@@ -126,12 +126,14 @@ class CDPError(Exception):
 
 
 class _CDP:
-    def __init__(self, port: int):
+    def __init__(self, port: int, log=None, panel_id: str = ""):
         self.port = port
         self.ws = None
         self._id = 0
         self._noreply_ids = set()
         self.on_event = None        # callable(method, params) | None
+        self._log = log
+        self._panel_id = panel_id
 
     def _targets(self):
         url = f"http://127.0.0.1:{self.port}/json"
@@ -168,8 +170,10 @@ class _CDP:
             if self.on_event and msg.get("method"):
                 try:
                     self.on_event(msg["method"], msg.get("params", {}))
-                except Exception:   # an event handler must never kill the loop
-                    pass
+                except Exception as e:   # an event handler must never kill the loop
+                    if self._log:
+                        self._log(f"[{self._panel_id}] CDP event "
+                                  f"handler error ({msg.get('method')}): {e}")
             return True
         if mid in self._noreply_ids:
             self._noreply_ids.discard(mid)
@@ -293,10 +297,10 @@ class ChromiumPanel:
         #  * the top-level nav allowlist set (own origin + SSO + per-panel/global),
         #  * the tracker URL patterns for Network.setBlockedURLs.
         # Identical to the WebKit leg so a panel is contained the same either way.
-        self._nav_gate = siteguard.nav_gate_enabled(self.security)
-        self._allowlist = siteguard.build_allowlist(panel, self.security)
-        self._block_trackers = siteguard.trackers_enabled(panel, self.security)
-        self._blocked_urls = (siteguard.chromium_blocked_urls(panel)
+        self._nav_gate = websecurity.nav_gate_enabled(self.security)
+        self._allowlist = websecurity.build_allowlist(panel, self.security)
+        self._block_trackers = websecurity.trackers_enabled(panel, self.security)
+        self._blocked_urls = (websecurity.chromium_blocked_urls(panel)
                               if self._block_trackers else [])
         self._login_attempts = 0
         self.proc = None
@@ -307,6 +311,9 @@ class ChromiumPanel:
         self._auth_failed = False
         self._last_fetch_event = 0.0
         self._poll_failures = 0         # consecutive failed CDP polls (dead-ws watchdog)
+        self._consecutive_crashes = 0
+        self._max_crashes = cfg.env_int("SOC_MAX_CONSECUTIVE_CRASHES", 10, lo=1, hi=10000)
+        self._proc_lock = threading.Lock()
 
     def _uses_proxy(self) -> bool:
         return bool(self.proxy and self.proxy.enabled and self.panel.proxy)
@@ -468,8 +475,30 @@ class ChromiumPanel:
             args.append("--no-sandbox")
         self.log(f"[{p.id}] chromium spawning (CDP :{self.cdp_port}, "
                  f"ozone {_ozone_platform()})")
-        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE)
+        with self._proc_lock:
+            self.proc = proc
+
+        stderr_pipe = getattr(self.proc, "stderr", None)
+        if stderr_pipe is not None:
+
+            def _read_stderr():
+                try:
+                    for raw_line in iter(stderr_pipe.readline, b""):
+                        if self._stop.is_set():
+                            break
+                        if len(raw_line) > 4096:
+                            raw_line = raw_line[:4096]
+                        try:
+                            text = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                        except Exception:
+                            text = repr(raw_line)
+                        self.log(f"[{p.id}] [chromium_stderr] {text}")
+                except Exception:
+                    pass
+
+            threading.Thread(target=_read_stderr, daemon=True).start()
 
     # ---- proxy auth + nav allowlist over CDP --------------------------------
     def _nav_blocked(self, params) -> bool:
@@ -487,7 +516,7 @@ class ChromiumPanel:
         if params.get("resourceType") != "Document":
             return False
         uri = (params.get("request") or {}).get("url", "")
-        return not siteguard.nav_allowed(uri, self._allowlist)
+        return not websecurity.nav_allowed(uri, self._allowlist)
 
     def _on_cdp_event(self, method, params):
         self._last_fetch_event = time.time()
@@ -627,7 +656,7 @@ class ChromiumPanel:
             self.cdp.close()
             self.cdp = None
         try:
-            cdp = _CDP(self.cdp_port)
+            cdp = _CDP(self.cdp_port, log=self.log, panel_id=self.panel.id)
             cdp.connect()
             cdp.rpc("Page.enable")
             cdp.rpc("Runtime.enable")
@@ -646,7 +675,8 @@ class ChromiumPanel:
                 self.log(f"[{p.id}] chromium CDP socket lost during proxy-auth; "
                          f"respawning")
                 self._reap()
-                self.proc = None
+                with self._proc_lock:
+                    self.proc = None
                 return False
             # Steady-state security guards go up AFTER the brief proxy-auth phase
             # (which owns Fetch for its window and disables it at the end): the
@@ -667,7 +697,8 @@ class ChromiumPanel:
             # cleanly respawns next iteration instead of dereferencing self.cdp
             # (now None) while the async-terminated process is still polling alive.
             self._reap()
-            self.proc = None
+            with self._proc_lock:
+                self.proc = None
             return False
 
     def _control_loop(self):
@@ -678,6 +709,10 @@ class ChromiumPanel:
             # (re)spawn + (re)attach when the process is missing or dead
             if self.proc is None or self.proc.poll() is not None:
                 if self.proc is not None:
+                    self._consecutive_crashes += 1
+                    if self._consecutive_crashes >= self._max_crashes:
+                        self._show_crash_card()
+                        break
                     self.log(f"[{p.id}] chromium exited "
                              f"({self.proc.returncode}); restarting in "
                              f"{respawn_delay:.0f}s")
@@ -747,6 +782,7 @@ class ChromiumPanel:
                 # forever instead of climbing to RESPAWN_MAX.
                 if time.monotonic() - spawn_time >= RESPAWN_STABLE_SEC:
                     respawn_delay = RESPAWN_INITIAL      # healthy again
+                    self._consecutive_crashes = 0
             except Exception as e:  # noqa: BLE001
                 if self.proc and self.proc.poll() is not None:
                     continue        # process died — handled by the respawn branch
@@ -817,18 +853,20 @@ class ChromiumPanel:
         self.panel.url = url or None
         if url:
             self.panel.mode = "direct"
+        self._consecutive_crashes = 0
         # Recompute the nav allowlist: it includes the panel's OWN origin host,
         # which just changed. The respawn below picks up the new set (read by the
         # worker thread; assignment is atomic in CPython).
-        self._allowlist = siteguard.build_allowlist(self.panel, self.security)
+        self._allowlist = websecurity.build_allowlist(self.panel, self.security)
         self.log(f"[{self.panel.id}] reconfigured -> {url or '(cleared)'}; "
                  f"restarting chromium")
         # Don't touch self.cdp here: this runs on the GTK main thread while the
         # control-loop worker may be mid-RPC on the same (non-thread-safe)
         # websocket. Just terminate the process; the worker detects the dead
         # proc and closes/reattaches the CDP on its own thread (_attach_cdp).
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()        # control loop respawns with the new URL
+        with self._proc_lock:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()    # control loop respawns with the new URL
 
     def mem_rss_kb(self):
         """RSS of the Chromium process (KiB), or None if it isn't running. Note
@@ -839,6 +877,11 @@ class ChromiumPanel:
             return perf.proc_rss_kb(p.pid)
         return None
 
+    def _show_crash_card(self):
+        self.log(f"[{self.panel.id}] CRASHED {self._consecutive_crashes}x — "
+                 f"giving up (threshold {self._max_crashes}). "
+                 f"Reload / Ctrl+Shift+C to reconfigure or restart the service.")
+
     def recycle(self):
         """Reclaim memory by restarting the Chromium process; the control loop
         respawns it with the current URL within a few seconds."""
@@ -847,8 +890,9 @@ class ChromiumPanel:
         # be mid-RPC on the same non-thread-safe websocket. Terminating the proc
         # is enough — the worker reaps the dead proc and closes/reattaches the
         # CDP on its own thread (_attach_cdp).
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        with self._proc_lock:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
 
     def _reap(self):
         """Terminate the Chromium child and actually wait for it, escalating to

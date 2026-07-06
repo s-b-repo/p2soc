@@ -99,7 +99,7 @@ MAX_VPNS = 8
 _VPN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 _TOP_KEYS = {"display", "panels", "tunnel", "vpn", "vpns", "proxy", "security"}
-_DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout"}
+_DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout", "fullscreen"}
 _PANEL_KEYS = {"id", "engine", "grid", "mode", "url", "tunnel", "path", "scheme",
                "vault_item", "selectors", "login_marker", "keepalive", "proxy",
                "title", "allow_insecure", "allow_media",
@@ -236,6 +236,7 @@ class DisplayCfg:
     rows: int = 2
     gap: int = 0
     layout: str = "auto"            # auto | windows | single
+    fullscreen: bool = True
 
 
 @dataclass
@@ -502,6 +503,9 @@ def _validate_display(d: dict, errs: list, warns: list):
             errs.append(f"display.{k}: must be a positive integer, got {d[k]!r}")
     if "gap" in d and (not _is_int(d["gap"]) or d["gap"] < 0):
         errs.append(f"display.gap: must be an integer >= 0, got {d['gap']!r}")
+    if "fullscreen" in d and not isinstance(d["fullscreen"], (bool, int)):
+        errs.append(f"display.fullscreen: must be true/false (or 0/1), "
+                    f"got {d['fullscreen']!r}")
     layout = d.get("layout", "auto")
     if layout not in VALID_LAYOUTS:
         errs.append(f"display.layout: must be one of {sorted(VALID_LAYOUTS)}, got {layout!r}")
@@ -973,6 +977,9 @@ def _parse(raw, path: str) -> Config:
         rows=int(d.get("rows", 2) or 2),
         gap=int(d.get("gap", 0) or 0),
         layout=str(d.get("layout", "auto")),
+        fullscreen=(bool(d["fullscreen"]) if isinstance(d.get("fullscreen"), bool)
+                    else bool(int(str(d["fullscreen"])))
+                    if "fullscreen" in d else True),
     ) if not errs or all("display." not in e for e in errs) else DisplayCfg()
 
     panels_raw = raw.get("panels", []) or []
@@ -1100,7 +1107,8 @@ def to_yaml(conf: "Config") -> str:
     d = conf.display
     out = {
         "display": {"auto": bool(d.auto), "width": d.width, "height": d.height,
-                    "cols": d.cols, "rows": d.rows, "gap": d.gap, "layout": d.layout},
+                    "cols": d.cols, "rows": d.rows, "gap": d.gap, "layout": d.layout,
+                    "fullscreen": d.fullscreen},
         "panels": [],
     }
     for p in conf.panels:
@@ -1173,5 +1181,10 @@ def to_yaml(conf: "Config") -> str:
         if pr.ignore_hosts:
             out["proxy"]["ignore_hosts"] = list(pr.ignore_hosts)
     else:
-        out["proxy"] = {"enabled": False}
+        pd: dict = {"enabled": False}
+        if pr.vault_item:
+            pd["vault_item"] = pr.vault_item
+        if pr.ignore_hosts:
+            pd["ignore_hosts"] = list(pr.ignore_hosts)
+        out["proxy"] = pd
     return yaml.safe_dump(out, sort_keys=False, default_flow_style=False)

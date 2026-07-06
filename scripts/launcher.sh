@@ -13,6 +13,7 @@ ROOT="${SOC_ROOT:-/opt/soc-display}"
 export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+[ -n "${PYBIN:-}" ] || { echo "[launcher] no Python interpreter found at $ROOT/.venv/bin/python or on PATH" >&2; exit 2; }
 
 # Resolve SOC_ENV_FILE BEFORE sourcing it (so we source the right env). `|| true`
 # + the literal fallback (== read tier #3) keeps the non-systemd/pre-install path
@@ -77,11 +78,11 @@ while true; do
   code=$?
   ran=$(( $(date +%s) - started ))
 
-  # Exit 2 = a fail-safe screen the operator already saw + dismissed (bad config,
+  # Exit 20 = a fail-safe screen the operator already saw + dismissed (bad config,
   # vault locked, or the Unlock-Vaultwarden prompt cancelled). Relaunching would
   # just re-pop it forever ("won't close"), so STOP supervising and hand back to
   # the launcher menu ("start") instead of restarting the wall.
-  if [ "$code" -eq 2 ]; then
+  if [ "$code" -eq 20 ]; then
     echo "[launcher] host exited with the operator-action code (2); returning to the menu" >&2
     menu="$ROOT/scripts/soc-wall-menu"
     [ -x "$menu" ] && exec "$menu"

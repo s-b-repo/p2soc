@@ -148,7 +148,7 @@ class Session:
         # PBKDF2 vault (kdf==0) derive_master_key / master_password_hash are
         # byte-identical to the previous inline PBKDF2 (salt=email.lower(), same
         # iters; auth hash = pbkdf2(master_key, pw, 1, 32)).
-        from host import litebw
+        from . import litebw
         master_key = litebw.derive_master_key(master_password, email, kdf,
                                               iters, mem, par)
         master_hash = litebw.master_password_hash(master_key, master_password)

@@ -123,7 +123,7 @@ def register_account(url: str, email: str, master: str,
         "keys": {"publicKey": pub_b64, "encryptedPrivateKey": enc_priv},
     }
 
-    last_err = None
+    errors = []
     for ep in ("/api/accounts/register", "/identity/accounts/register"):
         try:
             _req(base + ep, data=body, method="POST")
@@ -140,10 +140,17 @@ def register_account(url: str, email: str, master: str,
                     "Vaultwarden is refusing signups — enable SIGNUPS_ALLOWED "
                     "(or whitelist this email domain) on the server, or create "
                     f"the account in the web vault. Server said: {msg}")
-            last_err = e
+            errors.append((ep, msg))
         except urllib.error.URLError as e:  # pragma: no cover - transport
             raise VaultSeedError(f"could not reach Vaultwarden at {base}: {e}")
-    raise last_err or VaultSeedError(f"registration failed at {base}")
+    if len(errors) == 2:
+        first_url, first_msg = errors[0]
+        second_url, second_msg = errors[1]
+        raise VaultSeedError(
+            f"{first_msg} (also tried {second_url}: {second_msg})")
+    if errors:
+        raise errors[0][1]
+    raise VaultSeedError(f"registration failed at {base}")
 
 
 def account_exists(url: str, email: str) -> bool:

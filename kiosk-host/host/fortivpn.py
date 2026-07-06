@@ -254,10 +254,19 @@ class Supervisor:
 
     def _otp_code(self) -> str:
         item = self.vpn["vault_item"]
-        # Use the same CLI the configured backend uses (litebw is the default;
-        # rbw stays selectable). Both expose an rbw-compatible `code <item>`.
-        cli = "rbw" if os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND).lower() == "rbw" \
-            else "litebw"
+        backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND).lower()
+        # In-process TOTP for the litebw/native backend — no subprocess fork on a
+        # 1GB Pi (avoids doubling COW memory). Must have an open vault (the normal
+        # case after _creds() has already called _open_vault()).
+        if backend in ("litebw", "native") and self._vault is not None and self._vault.ready():
+            try:
+                return self._vault.backend.code(item)
+            except VaultError as e:
+                self.log(f"WARNING OTP fetch from vault item '{item}' failed: {e}")
+                return ""
+        # CLI path for rbw (or litebw if the vault isn't open yet — early-boot
+        # edge case). Both expose an rbw-compatible `code <item>`.
+        cli = "rbw" if backend == "rbw" else "litebw"
         try:
             r = subprocess.run([cli, "code", item], capture_output=True,
                                text=True, stdin=subprocess.DEVNULL, timeout=30)

@@ -52,6 +52,12 @@ def _aesgcm():
             "master password (pip install cryptography)")
 
 
+def aesgcm():
+    """Public alias for _aesgcm() — exposed for backup.py and other consumers
+    that need the same vetted AES-256-GCM primitive."""
+    return _aesgcm()
+
+
 def available() -> bool:
     """True if the crypto backend needed to seal/unseal is importable."""
     try:
@@ -79,6 +85,12 @@ def _machine_id() -> bytes:
 
 def _kdf(material: bytes, salt: bytes) -> bytes:
     return hashlib.scrypt(material, salt=salt, **_SCRYPT)
+
+
+def kdf(material: bytes, salt: bytes) -> bytes:
+    """Public alias for _kdf() — exposed for backup.py and other consumers
+    that need the same vetted scrypt KDF."""
+    return _kdf(material, salt)
 
 
 def _encrypt(material: bytes, plaintext: bytes) -> bytes:

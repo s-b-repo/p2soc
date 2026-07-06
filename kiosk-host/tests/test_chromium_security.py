@@ -1,8 +1,8 @@
-"""Chromium renderer-security leg: the engine-shared siteguard logic + the
+"""Chromium renderer-security leg: the engine-shared websecurity logic + the
 Chromium launch-arg / CDP-guard assembly.
 
 Covers (no display, no real Chromium — pure assembly + decision logic):
-  * siteguard host-matching (subdomain-inclusive), allowlist composition,
+  * websecurity host-matching (subdomain-inclusive), allowlist composition,
     nav decisions, tracker host extraction + per-panel unblock, chromium URL
     patterns, and the global toggles.
   * ChromiumPanel._spawn arg assembly: persistent vs ephemeral --user-data-dir,
@@ -19,7 +19,7 @@ import os
 import tempfile
 
 from host import config
-from host import siteguard
+from host import websecurity
 from host import chromium_panel
 
 
@@ -47,36 +47,36 @@ panels:
 
 
 # --------------------------------------------------------------------------- #
-# siteguard: host matching
+# websecurity: host matching
 # --------------------------------------------------------------------------- #
 def test_host_matches_subdomain_inclusive():
     allowed = {"dashboard.com"}
-    assert siteguard.host_matches("dashboard.com", allowed)
-    assert siteguard.host_matches("auth.dashboard.com", allowed)
-    assert siteguard.host_matches("a.b.dashboard.com", allowed)
+    assert websecurity.host_matches("dashboard.com", allowed)
+    assert websecurity.host_matches("auth.dashboard.com", allowed)
+    assert websecurity.host_matches("a.b.dashboard.com", allowed)
     # not a subdomain — a lookalike suffix must NOT match
-    assert not siteguard.host_matches("evildashboard.com", allowed)
-    assert not siteguard.host_matches("dashboard.com.evil.com", allowed)
-    assert not siteguard.host_matches("other.com", allowed)
+    assert not websecurity.host_matches("evildashboard.com", allowed)
+    assert not websecurity.host_matches("dashboard.com.evil.com", allowed)
+    assert not websecurity.host_matches("other.com", allowed)
 
 
 def test_host_matches_case_insensitive_and_empty():
-    assert siteguard.host_matches("DASH.Example.COM", {"example.com"})
-    assert not siteguard.host_matches("", {"example.com"})
+    assert websecurity.host_matches("DASH.Example.COM", {"example.com"})
+    assert not websecurity.host_matches("", {"example.com"})
 
 
 def test_host_of():
-    assert siteguard.host_of("https://dash.example.com:8443/x") == "dash.example.com"
-    assert siteguard.host_of("not a url") == ""
+    assert websecurity.host_of("https://dash.example.com:8443/x") == "dash.example.com"
+    assert websecurity.host_of("not a url") == ""
 
 
 # --------------------------------------------------------------------------- #
-# siteguard: allowlist composition + nav decision
+# websecurity: allowlist composition + nav decision
 # --------------------------------------------------------------------------- #
 def test_build_allowlist_includes_own_origin_and_sso():
     conf = _load(_DASH)
     p = conf.panels[0]
-    allowed = siteguard.build_allowlist(p, conf.security)
+    allowed = websecurity.build_allowlist(p, conf.security)
     assert "dash.example.com" in allowed                 # own origin
     assert "accounts.google.com" in allowed              # bundled SSO
     # wildcard SSO entries are normalised to bare hosts
@@ -87,7 +87,7 @@ def test_build_allowlist_adds_per_panel_and_global():
     conf = _load(_DASH + "    allow: ['*.cdn.example.net', 'extra.io']\n"
                  "security:\n  allow: ['global.example.org']\n")
     p = conf.panels[0]
-    allowed = siteguard.build_allowlist(p, conf.security)
+    allowed = websecurity.build_allowlist(p, conf.security)
     assert "cdn.example.net" in allowed and "extra.io" in allowed
     assert "global.example.org" in allowed
 
@@ -95,35 +95,35 @@ def test_build_allowlist_adds_per_panel_and_global():
 def test_nav_allowed_decisions():
     conf = _load(_DASH)
     p = conf.panels[0]
-    allowed = siteguard.build_allowlist(p, conf.security)
+    allowed = websecurity.build_allowlist(p, conf.security)
     # own origin + subdomain + bundled SSO -> allowed
-    assert siteguard.nav_allowed("https://dash.example.com/page", allowed)
-    assert siteguard.nav_allowed("https://sub.dash.example.com/", allowed)
-    assert siteguard.nav_allowed("https://accounts.google.com/o/oauth2", allowed)
+    assert websecurity.nav_allowed("https://dash.example.com/page", allowed)
+    assert websecurity.nav_allowed("https://sub.dash.example.com/", allowed)
+    assert websecurity.nav_allowed("https://accounts.google.com/o/oauth2", allowed)
     # off-allowlist top-level nav -> refused
-    assert not siteguard.nav_allowed("https://evil.example/", allowed)
+    assert not websecurity.nav_allowed("https://evil.example/", allowed)
     # about:/data: placeholder pages are always allowed
-    assert siteguard.nav_allowed("about:blank", allowed)
-    assert siteguard.nav_allowed(chromium_panel.UNCONFIGURED_URL, allowed)
+    assert websecurity.nav_allowed("about:blank", allowed)
+    assert websecurity.nav_allowed(chromium_panel.UNCONFIGURED_URL, allowed)
 
 
 def test_nav_gate_can_be_disabled():
     conf = _load(_DASH + "security:\n  nav_allowlist: false\n")
-    assert siteguard.nav_gate_enabled(conf.security) is False
+    assert websecurity.nav_gate_enabled(conf.security) is False
 
 
 def test_nav_gate_env_kill_switch(monkeypatch):
     monkeypatch.setenv("SOC_NAV_ALLOWLIST", "0")
     conf = _load(_DASH)
-    assert siteguard.nav_gate_enabled(conf.security) is False
+    assert websecurity.nav_gate_enabled(conf.security) is False
 
 
 # --------------------------------------------------------------------------- #
-# siteguard: tracker blocklist
+# websecurity: tracker blocklist
 # --------------------------------------------------------------------------- #
 def test_tracker_hosts_loaded_and_curated():
     conf = _load(_DASH)
-    hosts = siteguard.tracker_hosts(conf.panels[0])
+    hosts = websecurity.tracker_hosts()
     assert "google-analytics.com" in hosts
     assert "doubleclick.net" in hosts
     assert "connect.facebook.net" in hosts
@@ -133,27 +133,27 @@ def test_tracker_hosts_loaded_and_curated():
 
 def test_chromium_blocked_urls_are_wildcards():
     conf = _load(_DASH)
-    urls = siteguard.chromium_blocked_urls(conf.panels[0])
+    urls = websecurity.chromium_blocked_urls(conf.panels[0])
     assert "*google-analytics.com*" in urls
     assert all(u.startswith("*") and u.endswith("*") for u in urls)
 
 
 def test_per_panel_unblock_removes_a_tracker():
     p = _panel(_DASH + "    unblock: ['segment.io']\n")
-    hosts = siteguard.tracker_hosts(p)
+    hosts = websecurity.effective_tracker_hosts(p, None)
     assert "segment.io" not in hosts
     assert "google-analytics.com" in hosts          # the rest stay blocked
 
 
 def test_trackers_enabled_honours_both_toggles():
     on = _load(_DASH)
-    assert siteguard.trackers_enabled(on.panels[0], on.security) is True
+    assert websecurity.trackers_enabled(on.panels[0], on.security) is True
     per_panel_off = _load(_DASH + "    block_trackers: false\n")
-    assert siteguard.trackers_enabled(per_panel_off.panels[0],
-                                      per_panel_off.security) is False
+    assert websecurity.trackers_enabled(per_panel_off.panels[0],
+                                        per_panel_off.security) is False
     global_off = _load(_DASH + "security:\n  block_trackers: false\n")
-    assert siteguard.trackers_enabled(global_off.panels[0],
-                                      global_off.security) is False
+    assert websecurity.trackers_enabled(global_off.panels[0],
+                                        global_off.security) is False
 
 
 # --------------------------------------------------------------------------- #

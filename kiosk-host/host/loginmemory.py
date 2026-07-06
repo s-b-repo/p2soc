@@ -45,13 +45,29 @@ def domain_of(url: str) -> str:
         return ""
 
 
+_load_cache: dict | None = None
+_load_mtime: float = 0.0
+
+
 def load() -> dict:
+    global _load_cache, _load_mtime
+    path = _path()
     try:
-        with open(_path(), encoding="utf-8") as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _load_cache = {}
+        _load_mtime = 0.0
         return {}
+    if _load_cache is not None and mtime == _load_mtime:
+        return _load_cache
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        _load_cache = d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        _load_cache = {}
+    _load_mtime = mtime
+    return _load_cache
 
 
 def vault_item_for(url: str) -> str:

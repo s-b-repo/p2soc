@@ -24,6 +24,8 @@ import socket
 import sys
 import time
 
+import threading
+
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -32,41 +34,13 @@ from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 from . import config as cfg  # noqa: E402
 from . import configpaths  # noqa: E402  (shared read/write-location resolver)
 from . import perf  # noqa: E402
+from . import branding  # noqa: E402  (shared colour helpers: rgb, rgba, text_on)
 from .vault import Vault, VaultError  # noqa: E402
 
 
 def log(msg: str):
     t = time.strftime("%H:%M:%S")
     print(f"{t} [soc-kiosk] {msg}", flush=True)
-
-
-def _to_rgb(hexc: str) -> "tuple[int, int, int]":
-    h = (hexc or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(ch * 2 for ch in h)
-    try:
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except (ValueError, IndexError):
-        return 136, 136, 136
-
-
-def _rgba(hexc: str, alpha: float) -> str:
-    r, g, b = _to_rgb(hexc)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
-def _on_color(hexc: str) -> str:
-    """Pick black or white for text drawn ON a filled accent, by WCAG relative
-    luminance — so a button label stays readable over any accent colour the
-    palette supplies (e.g. a pale Amber fill needs black, a dark green needs
-    white). Mirrors the contrast maths used by the appearance editor."""
-    def _lin(v: float) -> float:
-        v /= 255.0
-        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
-    r, g, b = _to_rgb(hexc)
-    lum = 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
-    # Contrast vs white = 1.05/(L+0.05); vs black = (L+0.05)/0.05. Pick the higher.
-    return "#FFFFFF" if (1.05 / (lum + 0.05)) >= ((lum + 0.05) / 0.05) else "#0B1F14"
 
 
 def _resolved_panels() -> str:
@@ -185,6 +159,9 @@ class KioskHost:
         self.wall = None               # WallWindow in single-window layout
         self._config_win = None        # the on-screen config window, when open
         self._vpn_log_viewer = None    # live VPN-log viewer window, when open
+        self._vpn_poll_lock = threading.Lock()
+        self._vault_down_count = 0
+        self._vault_down = False
         # Kiosk locker: PIN/TOTP-gated transparent overlay. State files live
         # under configwin.state_dir(). Built lazily so a missing module never
         # blocks boot.
@@ -291,7 +268,8 @@ class KioskHost:
                                    on_config=config_cb, on_vpn=self.vpn_action,
                                    on_lock=(self._lock_wall
                                             if self._locker is not None else None),
-                                   on_show_vpn_log=self.open_vpn_log_viewer)
+                                   on_show_vpn_log=self.open_vpn_log_viewer,
+                                   on_reload_all=self.reload_all_panels)
 
         stagger = cfg.env_float("SOC_LAUNCH_STAGGER", 1.5, lo=0.0, hi=60.0)
         cdp_base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
@@ -421,9 +399,8 @@ class KioskHost:
 
         # Skip this tick if the previous probe is still running, so a slow/hung
         # connect near the poll interval can't pile up daemon threads.
-        if getattr(self, "_vpn_poll_busy", False):
+        if not self._vpn_poll_lock.acquire(blocking=False):
             return False
-        self._vpn_poll_busy = True
 
         def work():
             # Per-name states for EACH enabled VPN, plus one aggregate for the
@@ -435,10 +412,10 @@ class KioskHost:
                     if isinstance(v, dict) and v.get("enabled"):
                         nm = v.get("name") or "vpn"
                         states[nm] = vpnstatus.vpn_state(v)
-            except Exception:                          # never let the pill crash us
+            except Exception:  # never let the pill crash us
                 states = {}
             finally:
-                self._vpn_poll_busy = False
+                self._vpn_poll_lock.release()
             agg = vpnmanager.aggregate_state(states)
             n = len(states)
             if n <= 1:
@@ -453,19 +430,51 @@ class KioskHost:
                 f"{nm}: {st.replace('_', ' ')}" for nm, st in states.items()
             ) or "VPN: not configured"
             GLib.idle_add(self._set_pill, css, label, tip)
+
+            # Vault reachability: TCP connect to Vaultwarden host:port.
+            vault_reachable = self._check_vault()
+            if vault_reachable:
+                self._vault_down_count = 0
+                if self._vault_down:
+                    self._vault_down = False
+                    GLib.idle_add(self.wall.set_vault_warning, False)
+            else:
+                self._vault_down_count += 1
+                if self._vault_down_count >= 2 and not self._vault_down:
+                    self._vault_down = True
+                    GLib.idle_add(self.wall.set_vault_warning, True)
         # If thread start fails (RuntimeError 'can't start new thread' under
         # thread exhaustion / OOM on the 1 GB board), work()'s finally never
-        # runs to reset _vpn_poll_busy — which would wedge every future tick at
-        # the early-return above and freeze the pill forever. Reset the flag and
-        # log here so the next tick can retry. Keep setting the flag on the GTK
+        # runs to reset the lock — which would wedge every future tick at the
+        # early-return above and freeze the pill forever. Reset the lock and
+        # log here so the next tick can retry. Keep holding the lock on the GTK
         # thread (do NOT move it into the worker — the early-return must already
-        # see it set before work() is scheduled).
+        # see it held before work() is scheduled).
         try:
             threading.Thread(target=work, daemon=True).start()
         except RuntimeError as e:
-            self._vpn_poll_busy = False
+            self._vpn_poll_lock.release()
             log(f"[vpn] could not start status-poll thread; will retry next tick: {e}")
         return False
+
+    def _check_vault(self) -> bool:
+        url = os.environ.get("SOC_VAULT_URL", "")
+        if not url:
+            return True
+        from urllib.parse import urlsplit
+        try:
+            u = urlsplit(url if "://" in url else "https://" + url)
+        except ValueError:
+            return True
+        host = u.hostname
+        if not host:
+            return True
+        port = u.port or (443 if u.scheme == "https" else 80)
+        try:
+            with socket.create_connection((host, port), timeout=3.0):
+                return True
+        except OSError:
+            return False
 
     def _set_pill(self, css, label, tip=None):
         if self.wall is not None:
@@ -523,29 +532,33 @@ class KioskHost:
              systemctl.
           3. Otherwise False.
 
-        Cached after the first probe so the apply path stays fast."""
+        Cached after the first probe so the apply path stays fast.
+        The first call spawns a daemon thread to avoid blocking the GTK thread
+        on subprocess.run(); returns False (unknown) until the probe finishes."""
         import os as _os
         if _os.geteuid() == 0:
             return True
-        cached = getattr(self, "_sudo_systemctl_ok", None)
-        if cached is not None:
-            return cached
+        if getattr(self, "_systemctl_probed", False):
+            return getattr(self, "_systemctl_ok", False)
+        self._systemctl_probed = True
+        self._systemctl_ok = False
         import subprocess
-        ok = False
-        try:
-            r = subprocess.run(
-                ["sudo", "-n", "/usr/bin/systemctl", "status",
-                 "forti-vpn.service"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=4,
-            )
-            ok = r.returncode in (0, 3, 4)
-        except (OSError, subprocess.SubprocessError):
-            ok = False
-        self._sudo_systemctl_ok = ok
-        return ok
+        def _probe():
+            try:
+                r = subprocess.run(
+                    ["sudo", "-n", "/usr/bin/systemctl", "status",
+                     "forti-vpn.service"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=4,
+                )
+                self._systemctl_ok = r.returncode in (0, 3, 4)
+            except (OSError, subprocess.SubprocessError):
+                self._systemctl_ok = False
+        t = threading.Thread(target=_probe, daemon=True)
+        t.start()
+        return False
 
     def _privileged_systemctl(self, *args) -> "tuple[bool, str]":
         """Run `systemctl <args>` with the minimum privilege needed: bare if
@@ -671,15 +684,23 @@ class KioskHost:
             self._config_win.present()
             return
         try:
-            from .configwin import ConfigWindow
-            win = ConfigWindow(self.conf.panels, self.apply_config,
-                               on_close=self._config_closed,
-                               display=self.conf.display,
-                               vpn=self.conf.vpn,
-                               proxy_vault_item=self.conf.proxy.vault_item)
-            self._config_win = win
-            win.show_all()
-            win.present()
+            from .configcenter import ControlCenter
+            cc = ControlCenter((Gtk, Gdk, GLib))
+            # configcenter._on_destroy calls Gtk.main_quit() — replace with a
+            # close hook that only cleans up the window without exiting the wall.
+            def _cc_close(*_a):
+                cc._destroyed = True
+                for sid in list(cc._timeouts):
+                    try:
+                        GLib.source_remove(sid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                cc._timeouts.clear()
+                cc._master = ""
+                self._config_closed()
+            cc._on_destroy = _cc_close
+            self._config_win = cc
+            cc.show()
         except Exception as e:  # noqa: BLE001 — never let the config UI kill the wall
             self._config_win = None
             log(f"config window failed to open: {e}")
@@ -807,6 +828,29 @@ class KioskHost:
         except Exception as e:  # noqa: BLE001
             log(f"[{view.panel.id}] show failed: {e}")
         return False  # one-shot timeout
+
+    def reload_all_panels(self):
+        """Reload every panel on the wall (Ctrl+R / F5)."""
+        for v in self.panels_view:
+            self._recycle_one(v)
+
+    def reload_panel(self, panel_id: str):
+        """Reload a single panel by its config id."""
+        for v in self.panels_view:
+            if v.panel.id == panel_id:
+                self._recycle_one(v)
+                return True
+        return False
+
+    @staticmethod
+    def _recycle_one(view):
+        try:
+            view.recycle()
+        except Exception as e:  # noqa: BLE001
+            # log + skip — never let one bad panel break the others
+            import sys
+            print(f"[soc-kiosk] recycle failed for {getattr(getattr(view, 'panel', None), 'id', '?')}: {e}",
+                  file=sys.stderr, flush=True)
 
     def shutdown(self, *_):
         # try/finally so Gtk.main_quit() ALWAYS runs — even if the leading log()
@@ -1039,8 +1083,8 @@ def _unlock_dialog(email: str, url: str, verify=None, timeout: float = 180.0):
         sunken = c.get("surface_bottom", "#EAF1EC")
         border = c.get("border", "#CFE0D4")
         accent_strong = c.get("accent_strong", "#157A49")
-        on_accent = _on_color(accent_strong)        # readable label over the fill
-        glow = _rgba(primary, 0.28)
+        on_accent = branding.text_on(accent_strong)        # readable label over the fill
+        glow = branding.rgba(primary, 0.28)
         prov = Gtk.CssProvider()
         prov.load_from_data(
             (f"dialog, window {{ background-color: {bg}; color: {text}; }}"
@@ -1189,7 +1233,7 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
     falls back to a log-only exit when there is no display (headless / pre-session)."""
     log(f"FATAL: {title}: {detail}")
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return 2  # nothing to render on; the journal line above is the diagnostic
+        return 20  # nothing to render on; the journal line above is the diagnostic
     try:
         import gi
         gi.require_version("Gtk", "3.0")
@@ -1274,7 +1318,7 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
         Gtk.main()
     except Exception as e:  # noqa: BLE001 — never let the diagnostic mask the real error
         log(f"(could not show the fail-safe error screen: {e})")
-    return 2
+    return 20
 
 
 def main():
@@ -1475,6 +1519,21 @@ def main():
         # 5. signals + main loop
         for sig in (signal.SIGINT, signal.SIGTERM):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, host.shutdown)
+
+        # watchdog heartbeat — tell systemd the service is alive every 60 s
+        try:
+            import ctypes
+            _sd_notify = ctypes.CDLL("libsystemd.so.0").sd_notify
+            def _watchdog_heartbeat() -> bool:
+                try:
+                    _sd_notify(0, b"WATCHDOG=1")
+                except Exception:  # noqa: BLE001
+                    pass
+                return True
+            GLib.timeout_add_seconds(60, _watchdog_heartbeat)
+        except Exception:  # noqa: BLE001
+            pass
+
         log("entering GTK main loop")
     except KeyboardInterrupt:
         raise

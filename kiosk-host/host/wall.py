@@ -25,7 +25,7 @@ from . import style  # noqa: E402
 
 class WallWindow:
     def __init__(self, conf, log, on_destroy=None, on_config=None, on_vpn=None,
-                 on_lock=None, on_show_vpn_log=None):
+                 on_lock=None, on_show_vpn_log=None, on_reload_all=None):
         self.conf = conf
         self.log = log
         self.on_config = on_config        # callable() -> open the config window
@@ -35,6 +35,7 @@ class WallWindow:
         # reconnect. Kept SEPARATE from the pill (which reconnects): the 📜
         # button only observes, the pill only restarts.
         self.on_show_vpn_log = on_show_vpn_log
+        self.on_reload_all = on_reload_all
         self.vpn_pill = None
         win = Gtk.Window()
         win.set_title("soc-wall")
@@ -64,6 +65,10 @@ class WallWindow:
         pill.connect("clicked", lambda *_: self.on_vpn and self.on_vpn())
         self.vpn_pill = pill
         toolbar.pack_start(pill, False, False, 0)
+        self._vault_warn = Gtk.Label(label="⚠ Vault unreachable")
+        self._vault_warn.get_style_context().add_class("soc-vault-warn")
+        self._vault_warn.set_no_show_all(True)
+        toolbar.pack_start(self._vault_warn, False, False, 0)
         toolbar.pack_start(Gtk.Box(), True, True, 0)        # spacer
         if on_config is not None:
             gear = Gtk.Button(label="⚙ Settings")
@@ -103,8 +108,9 @@ class WallWindow:
 
         win.connect("key-press-event", self._on_key)
         # window-wide accelerators so the hotkeys still work even when a webview
-        # has the keyboard focus: Ctrl+Shift+C opens settings, Ctrl+Alt+L locks.
-        if on_config is not None or on_lock is not None:
+        # has the keyboard focus: Ctrl+Shift+C opens settings, Ctrl+Alt+L locks,
+        # Ctrl+R reloads all panels.
+        if on_config is not None or on_lock is not None or on_reload_all is not None:
             accel = Gtk.AccelGroup()
             win.add_accel_group(accel)
             if on_config is not None:
@@ -115,6 +121,10 @@ class WallWindow:
                 key, mod = Gtk.accelerator_parse("<Control><Alt>l")
                 if key:
                     accel.connect(key, mod, 0, self._accel_lock)
+            if on_reload_all is not None:
+                key, mod = Gtk.accelerator_parse("<Control>r")
+                if key:
+                    accel.connect(key, mod, 0, self._accel_reload)
 
         if on_destroy:
             # losing the wall window (e.g. the compositor killed it) leaves
@@ -152,6 +162,11 @@ class WallWindow:
             self.on_lock()
         return True
 
+    def _accel_reload(self, *_):
+        if self.on_reload_all:
+            self.on_reload_all()
+        return True
+
     def _on_key(self, _w, event):
         ctrl = event.state & Gdk.ModifierType.CONTROL_MASK
         shift = event.state & Gdk.ModifierType.SHIFT_MASK
@@ -159,6 +174,11 @@ class WallWindow:
         if ctrl and shift and event.keyval in (Gdk.KEY_c, Gdk.KEY_C):
             if self.on_config:
                 self.on_config()
+            return True
+        # Ctrl+R / F5: reload all panels
+        if (ctrl and event.keyval in (Gdk.KEY_r, Gdk.KEY_R)) or event.keyval == Gdk.KEY_F5:
+            if self.on_reload_all:
+                self.on_reload_all()
             return True
         # F11 toggles fullscreen (handy when running windowed/in dev)
         if event.keyval == Gdk.KEY_F11:
@@ -316,6 +336,14 @@ class WallWindow:
         ctx.add_class(state)
         dot = {"online": "● ", "offline": "● ", "checking": "… "}.get(state, "")
         self.vpn_pill.set_label(f"{dot}{label}")
+
+    def set_vault_warning(self, visible: bool):
+        """Show/hide the vault-unreachable warning label in the toolbar.
+        Called from the poll worker via GLib.idle_add, so it's GTK-thread-safe."""
+        if visible:
+            self._vault_warn.show()
+        else:
+            self._vault_warn.hide()
 
     def attach(self, panel, widget):
         col, row = panel.grid

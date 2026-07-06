@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from typing import Iterable
 
 MANIFEST_PATH = "/etc/soc-display/manifest.json"
@@ -56,9 +57,12 @@ def hash_file(path: str) -> str:
     doesn't blow up memory. Reads in binary mode — works for source
     code, vendored binaries, anything."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except PermissionError:
+        return "PERMISSION_DENIED"
     return h.hexdigest()
 
 
@@ -72,7 +76,14 @@ def _walk_tracked(root: str) -> Iterable[str]:
         for f in sorted(fs):
             if f in _SKIP_NAMES or f.endswith(_SKIP_SUFFIXES):
                 continue
-            yield os.path.join(d, f)
+            p = os.path.join(d, f)
+            try:
+                with open(p, "rb"):
+                    pass
+            except PermissionError:
+                print(f"manifest: skipping unreadable file {p}", file=sys.stderr)
+                continue
+            yield p
 
 
 def build_manifest(root: str, commit_sha: str = "") -> dict:
@@ -166,7 +177,10 @@ def check_drift(deploy_root: str,
         if not os.path.exists(p):
             missing.append(rel)
             continue
-        if hash_file(p) != want:
+        try:
+            if hash_file(p) != want:
+                changed.append(rel)
+        except PermissionError:
             changed.append(rel)
         seen.add(rel)
     # Discover extras — files on disk that the manifest doesn't know about.

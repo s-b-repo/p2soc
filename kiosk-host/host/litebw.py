@@ -286,14 +286,14 @@ def generate_totp(totp_secret: str, at: float | None = None) -> str:
         # set). Guard + range-clamp BEFORE the dangerous 10**digits / // period
         # math below: a huge digits builds a 100M-digit int (hard DoS on the
         # 1GB board), period=0 is a ZeroDivisionError, and non-numeric raises.
-        # The bounds cover every legitimate code (digits 6-8, period 15-60), so
+        # The bounds cover every legitimate code (digits 6-10, period 15-60), so
         # no real secret is affected and no wire/crypto behaviour changes.
         if q.get("digits"):
             try:
                 digits = int(q["digits"][0])
             except ValueError:
                 raise ValueError("TOTP digits is not an integer")
-            if not (1 <= digits <= 10):
+            if not (6 <= digits <= 10):
                 raise ValueError("TOTP digits out of range")
         if q.get("period"):
             try:
@@ -382,14 +382,33 @@ class ReadSession:
         except urllib.error.HTTPError as e:
             detail = e.read().decode()[:200]
             raise _HTTPStatusError(e.code, f"{method} {url} -> HTTP {e.code}: "
-                                   f"{detail}")
+                                    f"{detail}", e.headers)
         except OSError as e:
             raise VaultSeedError(f"could not reach Vaultwarden at {url}: {e}")
 
+    # -- HTTP 429 retry helper ---------------------------------------------- #
+    def _req429(self, path, headers=None, data=None, method="GET", form=False):
+        for attempt in range(2):
+            try:
+                return self._req(path, headers=headers, data=data,
+                                 method=method, form=form)
+            except _HTTPStatusError as e:
+                if e.code != 429 or attempt > 0:
+                    raise
+                delay = 5
+                if e.headers is not None:
+                    ra = e.headers.get("Retry-After", "")
+                    if ra:
+                        try:
+                            delay = int(ra)
+                        except ValueError:
+                            pass
+                time.sleep(max(1, min(delay, 60)))
+
     # -- login / token ------------------------------------------------------ #
     def _login(self):
-        pre = self._req("/identity/accounts/prelogin",
-                        data={"email": self.email}, method="POST")
+        pre = self._req429("/identity/accounts/prelogin",
+                           data={"email": self.email}, method="POST")
         kdf = int(pre.get("kdf", pre.get("Kdf", 0)) or 0)
         iters = int(pre.get("kdfIterations",
                             pre.get("KdfIterations", 600000)) or 600000)
@@ -402,7 +421,7 @@ class ReadSession:
         senc = _hkdf_expand(master_key, b"enc")
         smac = _hkdf_expand(master_key, b"mac")
 
-        tok = self._req("/identity/connect/token", data={
+        tok = self._req429("/identity/connect/token", data={
             "grant_type": "password", "username": self.email,
             "password": master_hash, "scope": "api offline_access",
             "client_id": "cli", "deviceType": "8",
@@ -427,7 +446,7 @@ class ReadSession:
         if not self.refresh_token:
             return False
         try:
-            tok = self._req("/identity/connect/token", data={
+            tok = self._req429("/identity/connect/token", data={
                 "grant_type": "refresh_token",
                 "refresh_token": self.refresh_token, "client_id": "cli",
             }, method="POST", form=True)
@@ -502,9 +521,10 @@ class _HTTPStatusError(VaultSeedError):
     """A VaultSeedError that also carries the HTTP status code, so sync() can
     branch on 401 without parsing a flattened error string."""
 
-    def __init__(self, code: int, message: str):
+    def __init__(self, code: int, message: str, headers=None):
         super().__init__(message)
         self.code = code
+        self.headers = headers
 
 
 class VaultLockedError(VaultSeedError):

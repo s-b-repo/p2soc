@@ -139,7 +139,7 @@ def _make_backend():
     if name == "dev":
         return DevFileBackend()
     if name in ("litebw", "native"):
-        from host.litebw import LitebwBackend
+        from .litebw import LitebwBackend
         return LitebwBackend()
     if name == "rbw":
         return RbwBackend()
@@ -159,7 +159,7 @@ class Vault:
         # actually worked instead of de-authenticating a live panel.
         self._lastgood: Dict[str, Tuple[float, Tuple[str, str]]] = {}
         try:
-            self.stale_ttl = max(0.0, float(os.environ.get("SOC_CRED_STALE_TTL", "0")))
+            self.stale_ttl = max(0.0, float(os.environ.get("SOC_CRED_STALE_TTL", "60")))
         except ValueError:
             self.stale_ttl = 0.0
         self._stale_logged: set = set()    # per-item log throttle

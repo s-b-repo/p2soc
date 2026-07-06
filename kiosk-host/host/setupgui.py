@@ -466,27 +466,12 @@ def _esc(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _to_rgb(hexc: str) -> "tuple[int, int, int]":
-    h = (hexc or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(ch * 2 for ch in h)
-    try:
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except (ValueError, IndexError):
-        return 136, 136, 136
-
-
-def _rgba(hexc: str, alpha: float) -> str:
-    r, g, b = _to_rgb(hexc)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
-def _mix(fg: str, bg: str, t: float) -> str:
+def _mix(fg: str, bg: str, t: float, branding) -> str:
     """Solid #RRGGBB = `fg` blended `t` of the way toward `bg`. Used for the
     low-opacity watermark numerals, since Pango markup ``foreground=`` accepts a
     colour spec but NOT an rgba() with alpha (unlike CSS)."""
-    fr, fgc, fb = _to_rgb(fg)
-    br, bg2, bb = _to_rgb(bg)
+    fr, fgc, fb = branding.rgb(fg)
+    br, bg2, bb = branding.rgb(bg)
     t = max(0.0, min(1.0, t))
     r = round(fr + (br - fr) * t)
     g = round(fgc + (bg2 - fgc) * t)
@@ -514,12 +499,12 @@ def _css(branding) -> bytes:
     setup_c = col("setup", "#1FA463")
     good = col("good", "#1FA463")
     bad = col("bad", "#C0341D")
-    glow = _rgba(accent, 0.28)
-    ring = _rgba(accent, 0.34)              # crisper focus-visible ring
+    glow = branding.rgba(accent, 0.28)
+    ring = branding.rgba(accent, 0.34)              # crisper focus-visible ring
     # A soft neutral drop-shadow for the slightly-elevated card (text-derived so it
     # stays subtle on both light and dark palettes — never a hard black box).
-    shade = _rgba(text, 0.10)
-    shade_hi = _rgba(text, 0.16)
+    shade = branding.rgba(text, 0.10)
+    shade_hi = branding.rgba(text, 0.16)
     # On-surface accent for the section-title TEXT (sits on `surface`): swap the
     # brand green for accent_strong where it dips below AA on the tinted surface.
     accent_surf = branding.accent_on(surface, accent=accent, strong=accent_strong)
@@ -530,11 +515,11 @@ def _css(branding) -> bytes:
     dark = branding.is_dark(bg)
     glow_css = ""
     if dark:
-        halo = _rgba(accent, 0.5)
+        halo = branding.rgba(accent, 0.5)
         glow_css = f"""
-.soc-section-title {{ text-shadow: 0 0 6px {_rgba(accent, 0.6)}; }}
+.soc-section-title {{ text-shadow: 0 0 6px {branding.rgba(accent, 0.6)}; }}
 .soc-header {{ box-shadow: inset 0 2px 0 -1px {halo}; }}
-.soc-card:hover {{ box-shadow: inset 0 0 0 1px {accent}, 0 6px 18px {_rgba(accent, 0.22)}; }}
+.soc-card:hover {{ box-shadow: inset 0 0 0 1px {accent}, 0 6px 18px {branding.rgba(accent, 0.22)}; }}
 """
     return f"""
 window.soc-assistant {{ background-color: {bg}; }}
@@ -593,10 +578,10 @@ entry:focus, entry:focus-visible {{ border: 1px solid {accent};
   box-shadow: 0 0 0 2px {ring}; }}
 entry image, entry placeholder {{ color: {text_dim}; }}
 .soc-field-bad {{ border: 1px solid {bad}; }}
-.soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.30)}; }}
+.soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {branding.rgba(bad, 0.30)}; }}
 .soc-field-good {{ border: 1px solid {good}; }}
 .soc-field-good:focus {{ border: 1px solid {good};
-  box-shadow: 0 0 0 2px {_rgba(good, 0.26)}; }}
+  box-shadow: 0 0 0 2px {branding.rgba(good, 0.26)}; }}
 
 /* SpinButton, ComboBox + its dropdown popup, and any plain button — palette-driven
    so they don't fall back to GTK's stock LIGHT theme (a white spin/combo + white
@@ -902,7 +887,7 @@ class SetupAssistant:
             num.set_valign(Gtk.Align.START)
             num.set_markup(
                 f'<span font_family="monospace" size="20000" weight="bold" '
-                f'foreground="{_mix(accent, surface, 0.62)}">{n + 1:02d}</span>')
+                f'foreground="{_mix(accent, surface, 0.62, self.branding)}">{n + 1:02d}</span>')
             card.pack_start(num, False, False, 0)
             txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             t = Gtk.Label(xalign=0)
@@ -1111,7 +1096,7 @@ class SetupAssistant:
         num = Gtk.Label()
         num.set_markup(
             f'<span font_family="monospace" size="13000" weight="bold" '
-            f'foreground="{_mix(self.branding.color("primary"), self.branding.color("surface_top"), 0.30)}">'
+            f'foreground="{_mix(self.branding.color("primary"), self.branding.color("surface_top"), 0.30, self.branding)}">'
             f'{idx + 1:02d}</span>')
         title = Gtk.Label(xalign=0)
         title.set_markup(f'<span weight="bold" letter_spacing="-300" foreground="'
@@ -1979,7 +1964,7 @@ class SetupAssistant:
         num = Gtk.Label()
         num.set_markup(
             f'<span font_family="monospace" size="13000" weight="bold" '
-            f'foreground="{_mix(self.branding.color("primary"), self.branding.color("surface_top"), 0.30)}">'
+            f'foreground="{_mix(self.branding.color("primary"), self.branding.color("surface_top"), 0.30, self.branding)}">'
             f'{idx + 1:02d}</span>')
         title = Gtk.Label(xalign=0)
         title.set_markup(f'<span weight="bold" letter_spacing="-300" foreground="'

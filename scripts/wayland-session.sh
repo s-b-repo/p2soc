@@ -27,7 +27,7 @@ log(){ echo "[wayland-session] $*" >&2; }
 
 # What does the wall need? (layout=..., all_webkit=...)
 layout=windows; all_webkit=0
-eval "$("$PYBIN" "$ROOT/scripts/session-info.py" 2>/dev/null)" || true
+set -a; . <("$PYBIN" "$ROOT/scripts/session-info.py" 2>/dev/null); set +a
 
 start_cage(){
   # host draws the whole grid in one fullscreen window — no WM needed

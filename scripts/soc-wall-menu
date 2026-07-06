@@ -21,6 +21,7 @@ export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
 PYBIN="$ROOT/.venv/bin/python"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+[ -n "${PYBIN:-}" ] || { echo "soc-wall-menu: no Python interpreter found at $ROOT/.venv/bin/python or on PATH" >&2; exit 2; }
 
 # Resolve SOC_ENV_FILE via the SHARED resolver (host.configpaths) BEFORE sourcing,
 # so the menu-spawned wall inherits the SAME soc.env the wall would read. Literal
@@ -28,6 +29,25 @@ PYBIN="$ROOT/.venv/bin/python"
 : "${SOC_ENV_FILE:=$("$PYBIN" -m host.configpaths --env 2>/dev/null || true)}"
 : "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
 ENV_FILE="$SOC_ENV_FILE"
+
+# Headless / discovery runs (CI): import launchermenu without GTK.
+HEADLESS=0
+for a in "$@"; do
+  case "$a" in
+    --check) HEADLESS=1 ;;
+  esac
+done
+
+if [ "$HEADLESS" -eq 1 ]; then
+  exec "$PYBIN" -m host.launchermenu "$@"
+fi
+
+# GUI run requires a display.
+if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  echo "soc-wall-menu: no graphical display detected" >&2
+  echo "  Run this from inside your desktop session (\$DISPLAY or \$WAYLAND_DISPLAY)." >&2
+  exit 1
+fi
 
 # Load the (non-secret) env if present so the launched wall sees the same config.
 if [ -r "$ENV_FILE" ]; then
@@ -46,4 +66,30 @@ fi
 : "${SOC_PANELS_FILE:=/etc/soc-display/panels.yaml}"
 export SOC_ENV_FILE SOC_PANELS_FILE
 
-exec "$PYBIN" -m host.launchermenu "$@"
+# Attach to a Wayland-only display via the native GTK backend.
+if [ -z "${DISPLAY:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  export GDK_BACKEND="${GDK_BACKEND:-wayland}"
+fi
+
+# GUI run: do NOT exec — a clickable .desktop launch (Terminal=false) discards
+# stderr, so a silent early failure would look like "the button does nothing".
+# Run it, and if it dies, surface the cause in a visible themed dialog (fail-safe).
+ERRLOG="$(mktemp 2>/dev/null || echo "/tmp/soc-wall-menu.$$.log")"
+# Reap the temp file on EVERY exit — including Ctrl-C / SIGTERM while the blocking
+# guierror dialog is open — so repeated desktop launches don't litter /tmp.
+trap 'rm -f "$ERRLOG" 2>/dev/null' EXIT INT TERM
+set +e
+"$PYBIN" -m host.launchermenu "$@" 2>"$ERRLOG"
+rc=$?
+set -e
+
+if [ "$rc" -ne 0 ]; then
+  cat "$ERRLOG" >&2 2>/dev/null || true
+  detail="$(tail -n 15 "$ERRLOG" 2>/dev/null)"
+  [ -n "$detail" ] || detail="The SOC wall control center exited with status $rc and produced no message."
+  "$PYBIN" -m host.guierror "SOC Wall couldn't start (exit $rc)" "$detail" 2>/dev/null || true
+  rm -f "$ERRLOG" 2>/dev/null || true
+  exit "$rc"
+fi
+rm -f "$ERRLOG" 2>/dev/null || true
+exit 0

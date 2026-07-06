@@ -129,49 +129,11 @@ _PICKER_GROUPS = (
 
 
 # --------------------------------------------------------------------------- #
-# Colour helpers — identical maths to launchermenu/setupgui so the sample card
-# reads exactly like the real UI. No gi (pure string building).
+# Colour helpers — delegated to branding.py so all modules use the same math.
+# No gi (pure string building).
 # --------------------------------------------------------------------------- #
-def _to_rgb(hexc: str) -> "tuple[int, int, int]":
-    h = (hexc or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(ch * 2 for ch in h)
-    try:
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except (ValueError, IndexError):
-        return 136, 136, 136
-
-
-def _rgba(hexc: str, alpha: float) -> str:
-    r, g, b = _to_rgb(hexc)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
 def _esc(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-# --- WCAG 2.x relative luminance / contrast (also feeds the contrast audit) --- #
-def _rel_lum(hexc: str) -> float:
-    """WCAG 2.x relative luminance of an #RRGGBB colour (0..1)."""
-    def _ch(c: int) -> float:
-        s = c / 255.0
-        return s / 12.92 if s <= 0.03928 else ((s + 0.055) / 1.055) ** 2.4
-    r, g, b = _to_rgb(hexc)
-    return 0.2126 * _ch(r) + 0.7152 * _ch(g) + 0.0722 * _ch(b)
-
-
-def _contrast(fg: str, bg: str) -> float:
-    """WCAG 2.x contrast ratio between two #RRGGBB colours (1.0..21.0)."""
-    l1, l2 = _rel_lum(fg), _rel_lum(bg)
-    hi, lo = max(l1, l2), min(l1, l2)
-    return (hi + 0.05) / (lo + 0.05)
-
-
-def _is_dark(hexc: str) -> bool:
-    """True for a near-black/dark surface — used to gate the cyber glow so the
-    default SOC-green (white field) stays flat and only dark palettes light up."""
-    return _rel_lum(hexc) < 0.18
 
 
 def _on_accent(fill: str, *candidates: str) -> str:
@@ -180,12 +142,7 @@ def _on_accent(fill: str, *candidates: str) -> str:
     button label is legible on ANY accent fill (bright green/amber included)
     instead of a hardcoded white that fails on light/bright fills."""
     options = [c for c in candidates if c] + ["#FFFFFF", "#101010"]
-    best, best_ratio = options[0], -1.0
-    for c in options:
-        r = _contrast(c, fill)
-        if r > best_ratio:
-            best, best_ratio = c, r
-    return best
+    return max(options, key=lambda c: branding.contrast_ratio(c, fill))
 
 
 def _animations_enabled() -> bool:
@@ -229,7 +186,7 @@ def build_css(colors: dict) -> bytes:
     good = col("good", "#1FA463")
     warn = col("warn", "#B8860B")
     bad = col("bad", "#C0341D")
-    glow = _rgba(accent, 0.28)
+    glow = branding.rgba(accent, 0.28)
 
     # Button label: palette-derived foreground that clears contrast against the
     # fill — never a hardcoded white that fails on a bright accent. Both rest and
@@ -239,32 +196,32 @@ def build_css(colors: dict) -> bytes:
     btn_fg = _on_accent(accent_strong, text, bg)
 
     # --- cyber glow (dark palettes only), gated by reduced motion --------------
-    dark = _is_dark(bg)
+    dark = branding.is_dark(bg)
     animate = _animations_enabled()
     glow_css = ""
     if dark:
-        halo = _rgba(accent, 0.55)         # bright accent halo for borders/dots
-        tshadow = _rgba(accent, 0.65)      # text glow
-        good_halo = _rgba(good, 0.6)
+        halo = branding.rgba(accent, 0.55)         # bright accent halo for borders/dots
+        tshadow = branding.rgba(accent, 0.65)      # text glow
+        good_halo = branding.rgba(good, 0.6)
         # Static glow (always present on dark): text-shadow on headings, a halo on
         # the accent left-border and the status dots.
         glow_css = f"""
 /* --- cyber glow: dark-palette only, branding-derived (accent={accent}) --- */
 .soc-ap-eyebrow {{ text-shadow: 0 0 6px {tshadow}; }}
-.soc-ap-title {{ text-shadow: 0 0 5px {_rgba(accent, 0.35)}; }}
+.soc-ap-title {{ text-shadow: 0 0 5px {branding.rgba(accent, 0.35)}; }}
 .soc-ap-header {{ box-shadow: inset 0 2px 0 -1px {halo}; }}
 .soc-ap-sample {{ box-shadow: -3px 0 10px -4px {halo}, 0 6px 18px {glow}; }}
 .soc-ap-good {{ text-shadow: 0 0 7px {good_halo}; }}
-.soc-ap-warn {{ text-shadow: 0 0 7px {_rgba(warn, 0.6)}; }}
-.soc-ap-bad {{ text-shadow: 0 0 7px {_rgba(bad, 0.6)}; }}
+.soc-ap-warn {{ text-shadow: 0 0 7px {branding.rgba(warn, 0.6)}; }}
+.soc-ap-bad {{ text-shadow: 0 0 7px {branding.rgba(bad, 0.6)}; }}
 """
         if animate:
             # A slow pulse on the status dots — only when animations are enabled.
             glow_css += f"""
 @keyframes soc-ap-pulse {{
-  0%   {{ text-shadow: 0 0 4px {_rgba(good, 0.35)}; }}
-  50%  {{ text-shadow: 0 0 10px {good_halo}; }}
-  100% {{ text-shadow: 0 0 4px {_rgba(good, 0.35)}; }}
+   0%   {{ text-shadow: 0 0 4px {branding.rgba(good, 0.35)}; }}
+   50%   {{ text-shadow: 0 0 4px {branding.rgba(good, 0.35)}; }}
+   100% {{ text-shadow: 0 0 4px {branding.rgba(good, 0.35)}; }}
 }}
 .soc-ap-good {{ animation: soc-ap-pulse 2.4s ease-in-out infinite; }}
 """

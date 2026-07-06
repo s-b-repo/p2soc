@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 
 from . import config as cfg
 
 STATE_NOT_CONFIGURED = "not_configured"
 STATE_ONLINE = "online"
 STATE_OFFLINE = "offline"
+STATE_CHECKING = "checking"
+STATE_ERROR = "error"
 
 
 def _tcp_ok(hostport: str, timeout: float = 2.0) -> bool:
@@ -73,4 +76,21 @@ LABELS = {
     STATE_NOT_CONFIGURED: "VPN: not configured",
     STATE_ONLINE: "VPN: online",
     STATE_OFFLINE: "VPN: offline",
+    STATE_CHECKING: "VPN: checking…",
+    STATE_ERROR: "VPN: error",
 }
+
+VPN_UP_SINCE_FILE = "/tmp/soc-vpn-up-since"
+
+
+def vpn_uptime() -> float | None:
+    try:
+        with open(VPN_UP_SINCE_FILE) as fh:
+            ts = float(fh.read().strip())
+        return time.time() - ts
+    except (OSError, ValueError):
+        return None
+
+
+def vpn_type(vpn: dict) -> str:
+    return cfg.vpn_kind(vpn)
