@@ -36,7 +36,7 @@ panels:
     engine: webkit              # webkit (default, light) | chromium (fallback)
     grid: [0, 0]                # [col, row]  -> top-left
     mode: direct                # direct | tunnel
-    url: "http://192.168.1.50:3000/login"
+    url: "http://10.0.0.50:3000/login"
     vault_item: "SOC Panel 1"   # name of the Bitwarden/Vaultwarden login item
     selectors:
       user: "#username"
@@ -64,7 +64,7 @@ panels:
     engine: webkit
     grid: [1, 0]                # top-right
     mode: direct
-    url: "http://192.168.1.60:8080/login"
+    url: "http://10.0.0.60:8080/login"
     vault_item: "SOC Panel 2"
     selectors:
       user: "input[name=user]"
@@ -73,7 +73,7 @@ panels:
     login_marker: "input[name=pass]"
     keepalive:
       strategy: xhr
-      url: "http://192.168.1.60:8080/api/ping"
+      url: "http://10.0.0.60:8080/api/ping"
       intervalSec: 300
 
   # --- Panel 3 (behind the SSH jump host, reached via the autossh tunnel) ---
@@ -103,7 +103,7 @@ panels:
     engine: webkit
     grid: [1, 1]                # bottom-right
     mode: direct
-    url: "http://192.168.1.70:9000/login"
+    url: "http://10.0.0.70:9000/login"
     vault_item: "SOC Panel 4"
     selectors:
       user: "#email"

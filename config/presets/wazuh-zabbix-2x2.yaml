@@ -22,7 +22,7 @@ panels:
     engine: webkit
     grid: [0, 0]
     mode: direct
-    url: "https://192.168.1.50/app/login"
+    url: "https://10.0.0.50/app/login"
     vault_item: "SOC Wazuh"
     selectors:
       user: "#username"
@@ -38,7 +38,7 @@ panels:
     engine: webkit
     grid: [1, 0]
     mode: direct
-    url: "http://192.168.1.60/zabbix/index.php"
+    url: "http://10.0.0.60/zabbix/index.php"
     vault_item: "SOC Zabbix"
     selectors:
       user: "#name"
@@ -54,7 +54,7 @@ panels:
     engine: webkit
     grid: [0, 1]
     mode: direct
-    url: "http://192.168.1.70:3000/login"
+    url: "http://10.0.0.70:3000/login"
     vault_item: "SOC Panel 3"
     selectors:
       user: "#username"
@@ -70,7 +70,7 @@ panels:
     engine: webkit
     grid: [1, 1]
     mode: direct
-    url: "http://192.168.1.80:9000/login"
+    url: "http://10.0.0.80:9000/login"
     vault_item: "SOC Panel 4"
     selectors:
       user: "#username"
