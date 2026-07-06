@@ -160,5 +160,6 @@ def save(path: str, secret_b32: str) -> None:
 def clear(path: str) -> None:
     try:
         os.remove(path)
-    except OSError:
-        pass
+    except OSError as e:
+        if not isinstance(e, FileNotFoundError):
+            sys.stderr.write(f"totp: could not remove {path}: {e}\n")

@@ -194,6 +194,10 @@ class Vault:
         now = now if now is not None else time.time()
         for k in [k for k, (ts, _) in self._cache.items() if now - ts >= self.ttl]:
             self._cache.pop(k, None)
+        for k in [k for k, (ts, _) in list(self._lastgood.items())
+                  if now - ts >= max(self.stale_ttl, 3600)]:
+            self._lastgood.pop(k, None)
+            self._stale_logged.discard(k)
 
     def cached(self, item: str) -> bool:
         """True if a fresh credential is in the cache (no backend call needed)."""

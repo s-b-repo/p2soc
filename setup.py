@@ -68,7 +68,8 @@ try:
     step_write_config = provision.step_write_config
     provision_all = provision.provision_all
     provision_plan = provision.plan
-except Exception:  # noqa: BLE001
+except Exception as e:  # noqa: BLE001
+    sys.stderr.write(f"WARNING: could not import provision module: {e}\n")
     provision = None  # type: ignore
 
 
@@ -405,8 +406,17 @@ def load_env_file(path: str) -> dict:
 
 
 def load_yaml(path: str):
-    """Load a YAML file if PyYAML is available (used only for re-run defaults)."""
+    """Load a YAML file if PyYAML is available (used only for re-run defaults).
+    Rejects files >1 MB as a YAML-bomb guard (billion-laughs alias expansion)."""
     if not os.path.exists(path):
+        return None
+    try:
+        sz = os.path.getsize(path)
+    except OSError:
+        return None
+    if sz > (1024 * 1024):
+        err(f"{path}: config file is {sz} bytes — refusing to parse "
+            f"(YAML bomb guard). If this is real, edit it smaller.")
         return None
     try:
         import yaml  # type: ignore
@@ -415,7 +425,8 @@ def load_yaml(path: str):
     try:
         with open(path, encoding="utf-8") as fh:
             return yaml.safe_load(fh)
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"could not parse {path}: {e}\n")
         return None
 
 
@@ -1153,14 +1164,17 @@ def validate_panels(panels_path: str):
         err(f"generated config did NOT parse: {e}")
 
 
-def _run(cmd: list, cwd=REPO):
+def _run(cmd: list, cwd=REPO, timeout: int = 300):
     print(dim("   $ " + " ".join(cmd)))
     try:
-        return subprocess.run(cmd, cwd=cwd).returncode
+        return subprocess.run(cmd, cwd=cwd, timeout=timeout).returncode
     except KeyboardInterrupt:
-        return 130
+        print()
+        raise
+    except subprocess.TimeoutExpired:
+        err(f"command timed out after {timeout}s: {' '.join(cmd)}")
+        return 124
     except FileNotFoundError:
-        err(f"command not found: {cmd[0]}")
         return 127
 
 
@@ -1345,7 +1359,8 @@ def _alive(url):
     try:
         with urllib.request.urlopen(url.rstrip("/") + "/alive", timeout=4) as r:
             return r.status == 200
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"could not reach Vaultwarden /alive: {e}\n")
         return False
 
 
@@ -1935,7 +1950,9 @@ def _seal_housekeeping(secretstore, sd, record_src, paths, soc_env, backend) -> 
     if soc_env.get("SOC_VAULT_PASSWORD") and secretstore.is_sealed(sd):
         try:
             secretstore.unseal(sd)
-        except Exception:  # noqa: BLE001 — keep the plaintext if it won't unseal here
+        except Exception as e:  # noqa: BLE001 — keep the plaintext if it won't unseal here
+            sys.stderr.write(f"WARNING: seal verification failed ({e}) — "
+                             f"plaintext master kept in soc.env for this session\n")
             pass
         else:
             updates = {}
@@ -2075,7 +2092,7 @@ def cmd_firstrun(args) -> int:
         note("Write this PIN down and keep it safe. It is needed ONLY to re-seal")
         note("later (re-deploy, new hardware, or changing the master password) —")
         note("NOT for normal boots (the wall self-unlocks from the host-bound seal).")
-        if not ASSUME_DEFAULTS and not args.dry_run:
+        if not ASSUME_DEFAULTS and not args.dry_run and not getattr(args, "no_wait", False):
             _readline("   press Enter once you have recorded the PIN ... ")
     else:
         note("kept the existing sealed secret.")
@@ -2119,6 +2136,7 @@ def push_config_to_vault(soc_env, cfg, paths, dry) -> bool:
     try:
         from host import vaultseed  # type: ignore
         action = vaultseed.upsert_login(url, email, pw, item, "", "", notes=yaml_text)
+        pw = ""  # scrub
         ok(f"{action} config note '{item}' ({len(yaml_text)} bytes)")
         return True
     except Exception as e:  # noqa: BLE001
@@ -2143,7 +2161,8 @@ def clean_state(paths, args) -> None:
         marker = paths.get("marker") or _configpaths().active_marker()
         if marker:
             targets.append(marker)
-    except Exception:  # noqa: BLE001 — resolver optional during clean
+    except Exception as e:  # noqa: BLE001 — resolver optional during clean
+        sys.stderr.write(f"could not resolve active marker: {e}\n")
         pass
     if paths["mode"] == "dev":
         targets.append(os.path.join(REPO, "dev", "run"))
@@ -2485,10 +2504,11 @@ def main():
     ap = argparse.ArgumentParser(
         description="Setup, diagnose, repair + install the SOC video wall.")
     ap.add_argument("command", nargs="?", default=None,
-                    choices=["menu", "deploy", "first-run", "wizard", "wizard-gui",
-                             "doctor", "repair", "install", "creds",
-                             "provision", "create-users", "vault-register",
-                             "vault-seed", "seal", "write-config", "uninstall"],
+                     choices=["menu", "deploy", "first-run", "wizard", "wizard-gui",
+                              "doctor", "repair", "install", "creds",
+                              "provision", "create-users", "vault-register",
+                              "vault-seed", "seal", "write-config", "push-config",
+                              "uninstall"],
                     help="menu (default on a TTY) | deploy (full automated "
                          "deploy) | first-run (seal the one-time PIN) | wizard "
                          "(config) | wizard-gui (graphical config) | doctor "
@@ -2521,8 +2541,9 @@ def main():
                     help="provision: do NOT seed panel-login items")
     ap.add_argument("--purge", action="store_true", help="uninstall: also remove users + Vaultwarden data")
     ap.add_argument("--yes", action="store_true", help="non-interactive: accept every prompt")
+    ap.add_argument("--no-wait", action="store_true", help="first-run: skip the press-Enter-after-PIN prompt")
     args = ap.parse_args()
-    ASSUME_DEFAULTS = args.defaults
+    ASSUME_DEFAULTS = args.defaults or args.yes
 
     cmd = args.command
     if cmd is None:
@@ -2541,6 +2562,7 @@ def main():
         "provision": cmd_provision, "create-users": cmd_create_users,
         "vault-register": cmd_vault_register, "vault-seed": cmd_vault_seed,
         "seal": cmd_seal, "write-config": cmd_write_config,
+        "push-config": cmd_push_config,
         "uninstall": cmd_uninstall,
     }
     return dispatch[cmd](args)
@@ -2743,6 +2765,24 @@ def cmd_uninstall(args) -> int:
     return _run(cmd if env.is_root else ["sudo"] + cmd)
 
 
+def cmd_push_config(args) -> int:
+    """Push the wall config YAML into Vaultwarden as a secure-note — non-interactive
+    when --master-fd or a sealed master is available. Useful after editing
+    panels.yaml by hand."""
+    env = Env()
+    paths = resolve_paths(args.target or _default_target(env))
+    cfg = load_yaml(paths["panels_installed"]) or {}
+    soc_env = load_env_file(paths["soc_env"])
+    if not cfg:
+        err("no config loaded — run the wizard first (setup.py wizard)")
+        return 1
+    if not soc_env:
+        err("no soc.env found — run the wizard first (setup.py wizard)")
+        return 1
+    ok = push_config_to_vault(soc_env, cfg, paths, args.dry_run)
+    return 0 if ok else 1
+
+
 def cmd_wizard(args) -> int:
     env = Env()
     target = args.target or _default_target(env)
@@ -2790,7 +2830,18 @@ def cmd_wizard(args) -> int:
           f"proxy {'ON' if cfg.get('proxy', {}).get('enabled') else 'off'}")
     for v in enabled_vpns:
         owner = "  [default-route]" if v.get("default_route") else ""
-        print(dim(f"     - vpn {v.get('name', '?')} [{v.get('type', 'fortinet')}]{owner}"))
+        t = v.get("type", "fortinet")
+        detail = ""
+        if t == "fortinet":
+            detail = f"gateway={v.get('gateway','?')}:{v.get('port',443)}"
+        elif t == "inode":
+            detail = f"gateway={v.get('gateway','?')}:{v.get('port',443)}"
+        elif t in ("openvpn", "wireguard"):
+            detail = f"config={v.get('config','?')}"
+        vi = v.get("vault_item", "")
+        if vi:
+            detail += f"  vault={vi}"
+        print(dim(f"     - vpn {v.get('name', '?')} [{t}]{owner}  {detail}"))
     for p in cfg["panels"]:
         tgt = p.get("url") or f"tunnel:{p.get('tunnel', {}).get('local_port')}"
         print(dim(f"     - {p['id']} [{p['engine']}/{p['mode']}] {tgt}  <- {p['vault_item']}"))

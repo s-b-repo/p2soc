@@ -49,7 +49,7 @@ class Options:
     keepalive_max_miss: int = C.DEFAULT_KEEPALIVE_MAX_MISS
     # CAPTCHA handling (the live gateway gates login on a weak BMP captcha)
     auto_captcha: bool = True       # OCR-solve and auto-retry on "Verify code error"
-    captcha_retries: int = 8        # max fresh-captcha attempts before giving up
+    captcha_retries: int = 40       # max fresh-captcha attempts before giving up
     show_captcha: bool = True       # render the captcha image in the terminal
 
 
@@ -375,8 +375,8 @@ class SslVpnSession:
                 self.auth.conn.get(self.auth.gateway.logout_url, ua=C.UA_V7,
                                    cookies=True)
                 self._log("logged out")
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"logout failed: {e}")
 
 
 def _is_verify_error(result: P.LoginResult) -> bool:

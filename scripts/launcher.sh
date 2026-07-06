@@ -71,6 +71,7 @@ esac
 native_fails=0
 
 delay=3
+consecutive_short=0  # crashes lasting <10s, reset when a run lasts >=60s
 while true; do
   started=$(date +%s)
   echo "[launcher] starting kiosk host $(date -Is) (GDK_BACKEND=${GDK_BACKEND:-default})" >&2
@@ -102,9 +103,26 @@ while true; do
   # ran fine for a while -> fast restart; crashing on boot -> back off to 30s
   if [ "$ran" -ge 60 ]; then
     delay=3
+    consecutive_short=0
   else
     delay=$(( delay * 2 )); [ "$delay" -gt 30 ] && delay=30
+    if [ "$ran" -lt 10 ]; then
+      consecutive_short=$(( consecutive_short + 1 ))
+    fi
   fi
+
+  # Hard cap: 8 consecutive short-lived crashes (wall dies in <10s) means
+  # something is fundamentally broken (corrupt config, missing binary, broken
+  # display). Stop restarting and hand back to the menu so the operator can
+  # diagnose instead of churning CPU + journal forever.
+  if [ "$consecutive_short" -ge 8 ]; then
+    echo "[launcher] $consecutive_short consecutive short-lived crashes —" \
+         "config or hardware may be broken; returning to the menu" >&2
+    menu="$ROOT/scripts/soc-wall-menu"
+    [ -x "$menu" ] && exec "$menu"
+    exit 1
+  fi
+
   echo "[launcher] kiosk host exited ($code); restarting in ${delay}s" >&2
   sleep "$delay"
 done

@@ -72,8 +72,8 @@ def coerce_split_tunnel(entry: dict, *, is_owner: bool, log: Callable[[str], Non
       * fortinet : set_routes=False + half_internet_routes=False -> the gateway
                    cannot push a default route onto us.
       * openvpn  : set_routes=False -> emits --route-nopull (ignore pushed routes).
-      * inode    : no global-route lever in our wrapper; left as-is (it installs
-                   only the routes the gateway scopes — documented).
+      * inode    : set split_tunnel=True -> the backend rules only the gateway's
+                    subnets, leaving the default route and system resolver untouched.
       * wireguard: we cannot rewrite a vault .conf; force set_routes=False where
                    the materialize path honours it AND warn loudly so the operator
                    scopes AllowedIPs. The wg 0.0.0.0/0 guard runs at materialize.
@@ -102,6 +102,11 @@ def coerce_split_tunnel(entry: dict, *, is_owner: bool, log: Callable[[str], Non
             f"MUST scope AllowedIPs (never 0.0.0.0/0 or ::/0). The wall cannot "
             f"rewrite a vault-sourced .conf — a catch-all here would hijack the "
             f"default route from the owner.")
+    elif kind == "inode":
+        if not entry.get("split_tunnel"):
+            log(f"[vpn:{name}] not the default-route owner — forcing split-tunnel "
+                f"(--split-tunnel)")
+        entry["split_tunnel"] = True
     # inode: no global lever; documented.
     return entry
 
@@ -162,10 +167,21 @@ class _GuardedSupervisor(fortivpn.Supervisor):
             tmp = path + ".tmp"
             try:
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.writelines(out)
-                    fh.flush()
-                    os.fsync(fh.fileno())
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.writelines(out)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                except OSError:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
                 os.replace(tmp, path)
             except OSError as e:
                 try:
@@ -328,13 +344,19 @@ class VpnManager:
         for name, sup in supers.items():
             try:
                 sup.stop_event.set()
-            except Exception:                          # noqa: BLE001
-                pass
+            except Exception as e:                      # noqa: BLE001
+                try:
+                    self._log(f"WARNING stopping '{name}' supervisor (set): {e}")
+                except Exception:
+                    pass
         for name, sup in supers.items():
             try:
                 sup._terminate_child()
-            except Exception:                          # noqa: BLE001
-                pass
+            except Exception as e:                      # noqa: BLE001
+                try:
+                    self._log(f"WARNING stopping '{name}' supervisor (terminate): {e}")
+                except Exception:
+                    pass
         deadline = time.monotonic() + grace
         for name, t in threads.items():
             remaining = max(0.0, deadline - time.monotonic())

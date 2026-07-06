@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import sys
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -86,8 +87,9 @@ def set_pin(state_dir: str, pin: str) -> None:
 def clear_pin(state_dir: str) -> None:
     try:
         os.remove(_pin_path(state_dir))
-    except OSError:
-        pass
+    except OSError as e:
+        if not isinstance(e, FileNotFoundError):
+            sys.stderr.write(f"locker: could not remove PIN file: {e}\n")
 
 
 def set_totp(state_dir: str, secret_b32: str) -> None:

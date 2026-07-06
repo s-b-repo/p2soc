@@ -917,7 +917,8 @@ def _build_window():
         # adaptive // system group (Install hero vs Reinstall + Uninstall). Same
         # guard as sync_state: install-state probing must never block the open.
         inst = health.is_installed()
-    except Exception:  # noqa: BLE001 — health must never block the launcher opening
+    except Exception as e:  # noqa: BLE001 — health must never block the launcher opening
+        sys.stderr.write(f"launcher: health.sync_state() failed: {e}; using defaults\n")
         sync = {"overall_sync": "unconfigured", "panels_path": None,
                 "panels_tier": "none", "panels_count": None, "panels_valid": None,
                 "config_error": None, "vault_note": None, "vault_url_hostport": None,
@@ -1114,7 +1115,8 @@ def _build_window():
         try:
             probe = health.probe_state(sync)
             level, label = health.dot_for(sync, probe)
-        except Exception:  # noqa: BLE001 — unknown -> stay neutral/amber, never hang
+        except Exception as e:  # noqa: BLE001 — unknown -> stay neutral/amber, never hang
+            sys.stderr.write(f"launcher: health probe failed: {e}; using defaults\n")
             level, label = "amber", "unknown"
         GLib.idle_add(_recolour_dot, level, label)
     threading.Thread(target=_probe_run, daemon=True).start()

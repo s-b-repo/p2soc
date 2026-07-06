@@ -38,11 +38,12 @@ class FrameDecoder:
         self._buf = bytearray()
 
     def feed(self, data: bytes) -> list[tuple[int, int, bytes]]:
+        # Pre-check: if feeding this data would blow past the cap, reject before
+        # appending so the buffer never exceeds MAX_FRAME_BUFFER by more than
+        # one recv's worth of data (the post-check catches the remainder).
+        if len(self._buf) + len(data) > C.MAX_FRAME_BUFFER + C.BIG_BUF_SIZE + C.FRAME_HEADER_LEN:
+            raise ValueError("frame reassembly buffer overflow (stalled/garbage stream)")
         self._buf += data
-        # SECURITY: a single frame can never exceed FRAME_HEADER_LEN + 65535,
-        # so an ever-growing buffer means the gateway is dribbling partial
-        # frames (or garbage) that never complete — a slow memory-exhaustion
-        # DoS. Cap the reassembly buffer well above one max frame and bail.
         if len(self._buf) > C.MAX_FRAME_BUFFER:
             raise ValueError("frame reassembly buffer overflow (stalled/garbage stream)")
         out: list[tuple[int, int, bytes]] = []
@@ -161,6 +162,7 @@ class Tunnel:
                  on_data: Optional[Callable[[bytes], None]] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.sock = sock
+        self.sock.settimeout(2.0)  # prevents sendall/os.write from blocking forever
         self.tun_fd = tun_fd
         self.dec = FrameDecoder()
         # The binary loops every 1 s but only SENDS a heartbeat every
@@ -300,9 +302,11 @@ class Tunnel:
                 raise TunnelClosed("tunnel socket closed before netconfig")
             for ftype, subtype, payload in self.dec.feed(data):
                 if ftype == C.FRAME_NETCONFIG and subtype == C.NETCONFIG_SUB_UPDATE:
-                    return parse_netconfig(payload)
+                    found = parse_netconfig(payload)
                 self._early.append((ftype, subtype, payload))  # retain for run()
                 early_bytes += len(payload)
                 if early_bytes > C.MAX_EARLY_BYTES:
                     raise TunnelClosed("too many early frames before netconfig (flood)")
+            if found is not None:
+                return found
         return None

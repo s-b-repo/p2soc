@@ -150,10 +150,14 @@ class INodeDriver(Driver):
         ("tunnel up:", EVENT_UP),
         ("authentication failed", EVENT_AUTH),
         ("incorrect username or password", EVENT_AUTH),
+        ("incorrect username or password", EVENT_AUTH),
         ("authentication server error", EVENT_AUTH),
+        ("could not solve the CAPTCHA", EVENT_AUTH),
         ("certificate pin mismatch", EVENT_CERT),
         ("certificate verify failed", EVENT_CERT),
         ("CERTIFICATE_VERIFY_FAILED", EVENT_CERT),
+        ("did not receive a valid network-config", EVENT_DOWN),
+        ("tunnel preamble", EVENT_DOWN),
         ("heartbeat: no response", EVENT_DOWN),    # iNode keepalive missed N times
         ("going offline", EVENT_DOWN),
         ("gateway forced log-off", EVENT_DOWN),
@@ -183,6 +187,40 @@ class INodeDriver(Driver):
         return _match(line, self._PATTERNS)
 
 
+class NativeFortinetDriver(Driver):
+    """Native Python Fortinet SSL-VPN (vendor/FortiGate-Client). Opt-in via
+    ftnt_backend: native in panels.yaml. Falls back to openfortivpn by default."""
+    kind = "fortinet"
+    binary = "ftnt-connect.sh"
+    _PATTERNS = (
+        ("authentication OK", EVENT_UP),
+        ("tunnel up:", EVENT_UP),
+        ("authentication failed:", EVENT_AUTH),
+        ("auth failed", EVENT_AUTH),
+        ("certificate verify failed", EVENT_CERT),
+        ("CERTIFICATE_VERIFY_FAILED", EVENT_CERT),
+        ("cert pin mismatch", EVENT_CERT),
+        ("connection lost", EVENT_DOWN),
+        ("connection closed", EVENT_DOWN),
+        ("connection refused", EVENT_DOWN),
+        ("tunnel stopped", EVENT_DOWN),
+    )
+
+    def needs_creds(self, vpn):
+        return True
+
+    def resolve_binary(self, vpn):
+        return cfg.ftnt_script(vpn) or self.binary
+
+    def build_cmd(self, vpn, user, pinentry="", otp=""):
+        cmd = [cfg.ftnt_script(vpn), cfg.openfortivpn_args(vpn)[0], user]
+        cmd += cfg.ftnt_extra_args(vpn)
+        return cmd
+
+    def classify(self, line):
+        return _match(line, self._PATTERNS)
+
+
 _DRIVERS = {
     "fortinet": FortinetDriver,
     "openvpn": OpenVPNDriver,
@@ -192,4 +230,7 @@ _DRIVERS = {
 
 
 def get_driver(vpn: dict) -> Driver:
-    return _DRIVERS[cfg.vpn_kind(vpn)]()
+    kind = cfg.vpn_kind(vpn)
+    if kind == "fortinet" and (vpn or {}).get("ftnt_backend") == "native":
+        return NativeFortinetDriver()
+    return _DRIVERS[kind]()

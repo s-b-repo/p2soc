@@ -380,7 +380,7 @@ class ReadSession:
                 raw = buf.decode()
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as e:
-            detail = e.read().decode()[:200]
+            detail = e.read(4096).decode()[:200]
             raise _HTTPStatusError(e.code, f"{method} {url} -> HTTP {e.code}: "
                                     f"{detail}", e.headers)
         except OSError as e:

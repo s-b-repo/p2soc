@@ -78,6 +78,32 @@ def proc_rss_kb(pid: int, status_path: str = None):
     return None
 
 
+def proc_tree_rss_kb(pid: int) -> "int | None":
+    """Total RSS of a process AND all its children from /proc/<pid>/task/*/children.
+    Returns None if the process is unreachable; 0 if reachable but has no memory info."""
+    total = 0
+    try:
+        rss = proc_rss_kb(pid)
+        if rss is not None:
+            total = rss
+        for entry in os.listdir(f"/proc/{pid}/task"):
+            cpath = f"/proc/{pid}/task/{entry}/children"
+            try:
+                with open(cpath, "r") as fh:
+                    for child_pid_str in fh.read().split():
+                        try:
+                            child_rss = proc_rss_kb(int(child_pid_str))
+                            if child_rss is not None:
+                                total += child_rss
+                        except (ValueError, OSError):
+                            pass
+            except OSError:
+                pass
+    except OSError:
+        return None
+    return total
+
+
 def under_pressure(avail_mb, min_mb) -> bool:
     """True when available memory is known and below the floor."""
     return avail_mb is not None and avail_mb < min_mb

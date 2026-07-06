@@ -376,9 +376,13 @@ def _write_pgm(grid: Grid, y0: int, y1: int, x0: int, x1: int, scale: int,
                     for sx in range(scale):
                         buf[row + sx] = 0
     fd, path = tempfile.mkstemp(suffix=".pgm")
-    with os.fdopen(fd, "wb") as f:
-        f.write(b"P5\n%d %d\n255\n" % (W, H))
-        f.write(bytes(buf))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"P5\n%d %d\n255\n" % (W, H))
+            f.write(bytes(buf))
+    except Exception:
+        os.unlink(path)
+        raise
     return path
 
 

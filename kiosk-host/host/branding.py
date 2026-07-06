@@ -466,11 +466,12 @@ def save_colors(colors: dict, path: str | None = None) -> str:
             fh.write(text)
         os.chmod(tmp, 0o644)
         os.replace(tmp, target)
-    except Exception:
+    except Exception as e:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        sys.stderr.write(f"branding: failed to save colors to {target}: {e}\n")
         raise
     load(refresh=True)
     return target

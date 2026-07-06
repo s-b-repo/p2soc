@@ -377,8 +377,8 @@ class AppearanceEditor:
         if callable(self.on_apply):
             try:
                 self.on_apply(dict(self._colors))
-            except Exception:  # noqa: BLE001 — a host repaint must never crash the editor
-                pass
+            except Exception as e:  # noqa: BLE001 — a host repaint must never crash the editor
+                sys.stderr.write(f"appearance: on_apply callback failed: {e}\n")
 
     def _on_picker(self, key):
         def _cb(btn):
@@ -432,8 +432,8 @@ class AppearanceEditor:
             try:
                 from host import guierror  # type: ignore
                 guierror.show("Couldn't save the theme", str(e))
-            except Exception:  # noqa: BLE001 — status line already shows it
-                pass
+            except Exception as e:  # noqa: BLE001 — status line already shows it
+                sys.stderr.write(f"appearance: guierror.show failed during save: {e}\n")
             return
         branding.load(refresh=True)
         self.dirty = False

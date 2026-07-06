@@ -93,6 +93,7 @@ rm -f "$ERRLOG" 2>/dev/null || true
 
 # When launched from the launcher menu, return to it (the "main page").
 if [ "${SOC_RETURN_TO_MENU:-0}" = "1" ] && [ -x "$ROOT/scripts/soc-wall-menu" ]; then
+  rm -f "$ERRLOG" 2>/dev/null || true
   exec "$ROOT/scripts/soc-wall-menu"
 fi
 exit 0

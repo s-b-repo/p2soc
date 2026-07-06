@@ -893,16 +893,17 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
   # GENERATE the entry from branding (run from kiosk-host so `host` is importable;
   # SOC_BRANDING_FILE points at the just-installed source so operator edits win).
   branding_errors=""
+  branding_err_tmp="$(mktemp /tmp/soc-desktop-gen-err.XXXXXX 2>/dev/null || echo "/tmp/soc-desktop-gen-err.$$")"
   if [ -x "$VENV_PY" ] && SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
        PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -m host.branding desktop \
-       "$SOC_ROOT/scripts/soc-wall-menu" soc-wall > "$DESKTOP_DST" 2>/tmp/soc-desktop-gen-err.$$ \
+       "$SOC_ROOT/scripts/soc-wall-menu" soc-wall > "$DESKTOP_DST" 2>"$branding_err_tmp" \
      && [ -s "$DESKTOP_DST" ]; then
     log "generated $DESKTOP_DST from branding"
     DESKTOP_FILE="$DESKTOP_DST"
-    rm -f /tmp/soc-desktop-gen-err.$$ 2>/dev/null || true
+    rm -f "$branding_err_tmp" 2>/dev/null || true
   else
-    branding_errors="$(cat /tmp/soc-desktop-gen-err.$$ 2>/dev/null || true)"
-    rm -f /tmp/soc-desktop-gen-err.$$ 2>/dev/null || true
+    branding_errors="$(cat "$branding_err_tmp" 2>/dev/null || true)"
+    rm -f "$branding_err_tmp" 2>/dev/null || true
     if [ -f "$SOC_ROOT/soc-wall.desktop" ]; then
       warn "branding render failed — copying the static soc-wall.desktop"
       [ -n "$branding_errors" ] && warn "  branding error: $(echo "$branding_errors" | head -n 1)"

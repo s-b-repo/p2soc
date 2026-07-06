@@ -140,9 +140,11 @@ def test_wait_netconfig_retains_bounded_early_frames(monkeypatch):
         tun = tunnelmod.Tunnel(near, None, log=lambda m: None)
         cfg = tun.wait_netconfig(timeout=5.0)
         assert cfg is not None and cfg.ipaddress == "10.0.0.2"
-        # the two pre-netconfig data frames were retained, not dropped
-        assert len(tun._early) == 2
-        assert all(ft == C.FRAME_DATA for ft, _, _ in tun._early)
+        # all three frames (2 data + 1 netconfig) are retained, not dropped
+        assert len(tun._early) == 3
+        data_frames = [(ft, st, p) for ft, st, p in tun._early if ft == C.FRAME_DATA]
+        assert len(data_frames) == 2
+        assert all(ft == C.FRAME_DATA for ft, _, _ in data_frames)
     finally:
         near.close()
         far.close()

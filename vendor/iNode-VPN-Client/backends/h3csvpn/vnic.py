@@ -74,14 +74,16 @@ class VirtualNIC:
     def open(self) -> int:
         """Create the TUN device and return its fd (also a select()able)."""
         self._fd = os.open(C.TUN_DEVICE, os.O_RDWR)
-        flags = C.IFF_TUN | C.IFF_NO_PI
-        # struct ifreq is 40 bytes on 64-bit; zero-pad the whole thing
-        # (matches the client's memset(&ifr,0,sizeof)) instead of relying on
-        # CPython copying a short immutable buffer.
-        ifr = struct.pack("16sH", self.name_template.encode("ascii"),
-                          flags).ljust(40, b"\x00")
-        res = fcntl.ioctl(self._fd, C.TUNSETIFF, ifr)
-        self.ifname = res[:16].split(b"\x00", 1)[0].decode("ascii")
+        try:
+            flags = C.IFF_TUN | C.IFF_NO_PI
+            ifr = struct.pack("16sH", self.name_template.encode("ascii"),
+                              flags).ljust(40, b"\x00")
+            res = fcntl.ioctl(self._fd, C.TUNSETIFF, ifr)
+            self.ifname = res[:16].split(b"\x00", 1)[0].decode("ascii")
+        except Exception:
+            os.close(self._fd)
+            self._fd = -1
+            raise
         self._opened = True
         return self._fd
 
@@ -178,8 +180,8 @@ class VirtualNIC:
                                    stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, check=False,
                                    timeout=15)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    sys.stderr.write(f"[{self.ifname}] resolvectl dns failed: {e}\n")
             return
         # Idempotent + crash-safe: if a previous run left our marker / a backup,
         # restore the real original first so we never capture our own file.

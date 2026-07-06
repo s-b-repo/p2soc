@@ -100,6 +100,7 @@ rm -f "$ERRLOG" 2>/dev/null || true
 # so the operator lands back where they started and can start the wall with the
 # fresh config. Standalone (.desktop) launches just exit back to the desktop.
 if [ "${SOC_RETURN_TO_MENU:-0}" = "1" ] && [ -x "$ROOT/scripts/soc-wall-menu" ]; then
+  rm -f "$ERRLOG" 2>/dev/null || true
   exec "$ROOT/scripts/soc-wall-menu"
 fi
 exit 0

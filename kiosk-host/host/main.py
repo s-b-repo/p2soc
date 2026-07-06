@@ -1443,11 +1443,13 @@ def main():
     # apply any settings set previously from the on-screen config
     try:
         from .configwin import (load_overrides, apply_overrides_to_panels,
-                                 apply_display_override, apply_vpn_override)
+                                 apply_display_override, apply_vpn_override,
+                                 apply_vpn_override_to_vpns)
         ov = load_overrides()
         if ov:
             apply_display_override(conf.display, ov)
             apply_vpn_override(conf.vpn, ov)
+            apply_vpn_override_to_vpns(conf.vpns, ov)
             apply_overrides_to_panels(conf.panels, ov)
             for p in conf.panels:                        # geometry may have moved
                 p.geometry = cfg.compute_geometry(conf.display, p.grid)

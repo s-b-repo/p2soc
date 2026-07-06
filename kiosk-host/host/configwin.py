@@ -155,11 +155,34 @@ def apply_vpn_override(vpn: dict, overrides: dict):
     """Merge a saved VPN override (set from the on-screen VPN tab) onto the loaded
     vpn dict at startup. The override is what the operator entered at the glass;
     it merges over the config note/file so advanced fields not on the form
-    (set_routes, etc.) are preserved."""
+    (set_routes, etc.) are preserved.
+
+    When the loaded config uses the legacy single ``vpn:`` block, `vpn` is that
+    dict. When it uses the modern ``vpns:[]`` list, `vpn` should be the FIRST
+    entry in the list — the caller is responsible for picking the right target."""
     o = overrides.get("_vpn")
     if isinstance(o, dict):
         vpn.update(o)
     return vpn
+
+
+def apply_vpn_override_to_vpns(vpns: list, overrides: dict):
+    """Apply a saved single-VPN override to a modern ``vpns:[]`` list. The
+    override is merged onto the first enabled entry (or the first entry
+    unconditionally if none are enabled), so an operator's changes from the
+    on-screen tab survive across the config load path."""
+    o = overrides.get("_vpn")
+    if not isinstance(o, dict):
+        return
+    target = None
+    for entry in vpns:
+        if entry.get("enabled"):
+            target = entry
+            break
+    if target is None and vpns:
+        target = vpns[0]
+    if target:
+        target.update(o)
 
 
 def vpn_form_to_dict(v: dict) -> dict:
@@ -168,15 +191,17 @@ def vpn_form_to_dict(v: dict) -> dict:
     VPN service re-validates on restart and surfaces problems via its status."""
     out = {"enabled": bool(v.get("enabled")), "type": (v.get("type") or "fortinet")}
     for k in ("gateway", "vault_item", "config", "domain", "realm",
-              "trusted_cert", "ready_probe"):
+              "trusted_cert", "ready_probe", "spa_key", "spa_aid",
+              "spa_ports", "interface", "extra_args"):
         val = str(v.get(k) or "").strip()
         if val:
             out[k] = val
-    if v.get("insecure"):
-        out["insecure"] = True
-    if v.get("config_from_vault"):
-        out["config_from_vault"] = True
-    for k in ("port", "health_check_interval"):
+    for k in ("insecure", "config_from_vault", "set_routes", "set_dns",
+              "otp_from_vault", "split_tunnel"):
+        if v.get(k):
+            out[k] = True
+    for k in ("port", "health_check_interval", "health_check_failures",
+              "spa_knock_port"):
         try:
             n = int(v.get(k) or 0)
         except (TypeError, ValueError):
@@ -608,8 +633,54 @@ class ConfigWindow(Gtk.Window):
         w["config_from_vault"] = Gtk.CheckButton(
             label="config from the vault item's Notes (openvpn / wireguard)")
         w["config_from_vault"].set_active(bool(v.get("config_from_vault")))
+        w["set_routes"] = Gtk.CheckButton(
+            label="set routes (fortinet: --set-routes, openvpn: accept pushed routes)")
+        w["set_routes"].set_active(bool(v.get("set_routes", True)))
+        w["set_dns"] = Gtk.CheckButton(
+            label="set DNS (fortinet: --set-dns)")
+        w["set_dns"].set_active(bool(v.get("set_dns")))
+        w["otp_from_vault"] = Gtk.CheckButton(
+            label="pull TOTP from vault (fortinet: otp_from_vault)")
+        w["otp_from_vault"].set_active(bool(v.get("otp_from_vault")))
+        w["split_tunnel"] = Gtk.CheckButton(
+            label="split tunnel (inode: --split-tunnel)")
+        w["split_tunnel"].set_active(bool(v.get("split_tunnel")))
         box.pack_start(w["insecure"], False, False, 0)
         box.pack_start(w["config_from_vault"], False, False, 0)
+        box.pack_start(w["set_routes"], False, False, 0)
+        box.pack_start(w["set_dns"], False, False, 0)
+        box.pack_start(w["otp_from_vault"], False, False, 0)
+        box.pack_start(w["split_tunnel"], False, False, 0)
+
+        hg = Gtk.Grid()
+        hg.set_column_spacing(8)
+        hg.set_row_spacing(6)
+        w["spa_key"] = entry(v.get("spa_key"), "SPA HOTP key (inode --spa-key)")
+        w["spa_aid"] = entry(v.get("spa_aid"), "SPA app ID (inode --spa-aid)")
+        w["spa_ports"] = entry(v.get("spa_ports"), "SPA ports (inode --spa-ports)")
+        w["spa_knock_port"] = Gtk.SpinButton.new_with_range(1, 65535, 1)
+        w["spa_knock_port"].set_value(int(v.get("spa_knock_port", 3000) or 3000))
+        w["interface"] = entry(v.get("interface"), "tunnel iface name override")
+        w["health_check_interval"] = Gtk.SpinButton.new_with_range(0, 3600, 1)
+        w["health_check_interval"].set_value(int(v.get("health_check_interval", 0) or 0))
+        w["health_check_failures"] = Gtk.SpinButton.new_with_range(1, 100, 1)
+        w["health_check_failures"].set_value(int(v.get("health_check_failures", 3) or 3))
+        w["extra_args"] = entry(v.get("extra_args"), "extra CLI args (space-separated)")
+        adv_rows = [
+            ("SPA key", w["spa_key"]), ("SPA app ID", w["spa_aid"]),
+            ("SPA ports", w["spa_ports"]), ("SPA knock port", w["spa_knock_port"]),
+            ("interface", w["interface"]),
+            ("health interval (s)", w["health_check_interval"]),
+            ("health failures", w["health_check_failures"]),
+            ("extra args", w["extra_args"]),
+        ]
+        for r, (lbl, widget) in enumerate(adv_rows):
+            h = Gtk.Label(label=lbl)
+            h.get_style_context().add_class("soc-config-sub")
+            h.set_xalign(0.0)
+            hg.attach(h, 0, r, 1, 1)
+            hg.attach(widget, 1, r, 1, 1)
+        box.pack_start(hg, False, False, 0)
         self._vpn_w = w
         return box
 
@@ -869,6 +940,18 @@ class ConfigWindow(Gtk.Window):
                 "ready_probe": w["ready_probe"].get_text(),
                 "insecure": w["insecure"].get_active(),
                 "config_from_vault": w["config_from_vault"].get_active(),
+                "set_routes": w["set_routes"].get_active(),
+                "set_dns": w["set_dns"].get_active(),
+                "otp_from_vault": w["otp_from_vault"].get_active(),
+                "split_tunnel": w["split_tunnel"].get_active(),
+                "spa_key": w["spa_key"].get_text(),
+                "spa_aid": w["spa_aid"].get_text(),
+                "spa_ports": w["spa_ports"].get_text(),
+                "spa_knock_port": int(w["spa_knock_port"].get_value()),
+                "interface": w["interface"].get_text(),
+                "health_check_interval": int(w["health_check_interval"].get_value()),
+                "health_check_failures": int(w["health_check_failures"].get_value()),
+                "extra_args": w["extra_args"].get_text(),
             })
             overrides["_vpn"] = vpncfg
             changes["_vpn"] = vpncfg

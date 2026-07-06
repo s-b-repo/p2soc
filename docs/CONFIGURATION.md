@@ -271,7 +271,7 @@ backend with **`type`** (default `fortinet`):
 | `fortinet` (default) | openfortivpn | `gateway`, `port`, `vault_item`, `trusted_cert` | FortiGate user+pass from the vault, via pinentry |
 | `openvpn` | openvpn | `config` (`.ovpn` path), optional `vault_item` | user+pass over the OpenVPN management socket; or certificate-only |
 | `wireguard` | wg-quick | `config` (`.conf` path or interface name) | keys in the `.conf` (no interactive login) |
-| `inode` | H3C iNode SSL VPN (**bundled** in `vendor/iNode-VPN-Client`) | `gateway`, `port`, `vault_item`, optional `config` (defaults to the bundled client), `domain`, `trusted_cert`/`insecure` | SSL-VPN user+pass from the vault, via `$H3C_SVPN_PASSWORD` (never argv) |
+| `inode` | H3C iNode SSL VPN (**bundled** in `vendor/iNode-VPN-Client`) | `gateway`, `port`, `vault_item`, optional `config` (defaults to the bundled client), `domain`, `trusted_cert`/`insecure`, `split_tunnel`, `spa_key`/`spa_aid`/`spa_ports`/`spa_knock_port` | SSL-VPN user+pass from the vault, via `$H3C_SVPN_PASSWORD` (never argv) |
 
 ```yaml
 # OpenVPN (username/password auth — creds injected over the management socket):
@@ -288,6 +288,13 @@ vpn: { enabled: true, type: wireguard, config: "/etc/wireguard/wg0.conf",
 vpn: { enabled: true, type: inode, gateway: "vpn.example.com", port: 3000,
        vault_item: "SOC iNode VPN", domain: "system",
        trusted_cert: "AA:BB:CC:...", ready_probe: "10.50.0.5:443" }
+
+# iNode with split tunnel + Zero-Trust SPA knock (all SPA fields are optional):
+vpn: { enabled: true, type: inode, gateway: "gw.corp.example", port: 443,
+       vault_item: "SOC iNode Corp", domain: "RADIUS",
+       trusted_cert: "AA:BB:CC:...", split_tunnel: true,
+       spa_key: "JBSWY3DPEHPK3PXP", spa_aid: "10001",
+       spa_ports: "443,8443", spa_knock_port: 3000 }
 ```
 
 All four share the supervisor: backoff on drops, a long hold on auth/cert

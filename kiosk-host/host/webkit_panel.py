@@ -27,6 +27,7 @@ Handles both webkit2gtk-4.1 (Pi OS Bookworm) and 4.0 (older / this dev box).
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import gi
@@ -70,7 +71,7 @@ def _warn_once(msg: str):
         try:
             print(f"webkit: {msg}", flush=True)
         except Exception:
-            pass
+            sys.stderr.write(f"webkit: {msg}\n")
 
 # The compiled tracker UserContentFilter is process-wide (it holds no secrets and
 # the rule set is identical for every blocking panel). Compile ONCE, lazily, off
@@ -134,6 +135,7 @@ def _ensure_tracker_filter(panel, on_ready, log):
                     if not _rule_unblocked(r, unblock)]
             rules = _json.dumps(keep)
         except Exception:                # malformed -> fall back to the full set
+            sys.stderr.write("webkit: could not parse tracker rules JSON; using full set\n")
             unblock = ()
     key = unblock
 
@@ -225,7 +227,7 @@ def _apply_memory_pressure():
             mps.set_poll_interval(30.0)
         DM.set_memory_pressure_settings(mps)
     except Exception:                            # any 4.1 API drift -> skip safely
-        pass
+        sys.stderr.write("webkit: memory pressure settings could not be applied (API drift)\n")
 
 
 def _tune_context(ctx):
@@ -669,7 +671,7 @@ class WebKitPanel:
                 try:
                     self._ucm.add_filter(filt)
                 except Exception:
-                    pass
+                    sys.stderr.write(f"webkit: [{self.panel.id}] could not add tracker filter (API drift)\n")
             _ensure_tracker_filter(self.panel, _add, self.log)
             return
         # 4.0 fallback: no compiled-filter store. Observe resource loads and
@@ -861,12 +863,33 @@ class WebKitPanel:
         if self._retry_pending:
             return
         self._retry_pending = True
+        self._retry_source = 0
 
         def _go():
             self._retry_pending = False
+            self._retry_source = 0
             self.load()
             return False                   # one-shot
-        GLib.timeout_add_seconds(int(delay), _go)
+        self._retry_source = GLib.timeout_add_seconds(int(delay), _go)
+
+    def stop(self):
+        """Clean shutdown: cancel pending timers, destroy the window, release
+        references so the 1GB Pi can reclaim the web process on restart."""
+        if self._retry_source:
+            GLib.source_remove(self._retry_source)
+            self._retry_source = 0
+        if self.webview:
+            try:
+                self.webview.stop_loading()
+            except Exception:
+                pass
+        if self.window:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+        self.webview = None
+        self.window = None
 
     def _show_crash_card(self):
         self.log(f"[{self.panel.id}] CRASHED {self._consecutive_crashes}x — "
@@ -922,6 +945,7 @@ class WebKitPanel:
             if hasattr(v, "to_string"):
                 return v.to_string()
         except Exception:                              # noqa: BLE001
+            sys.stderr.write(f"webkit: could not extract JSCValue reason for {self.panel.id}\n")
             pass
         return "login"
 

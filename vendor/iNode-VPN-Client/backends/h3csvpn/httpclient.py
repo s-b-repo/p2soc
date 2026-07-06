@@ -13,6 +13,7 @@ classification.  It is deliberately small and readable.
 from __future__ import annotations
 
 import socket
+import time
 from dataclasses import dataclass, field
 
 from . import constants as C
@@ -90,6 +91,12 @@ class Connection:
         self.cookies = CookieJar()
         self._buf = b""
 
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
     # -- low level ---------------------------------------------------------
     def _send_all(self, data: bytes) -> None:
         self.sock.sendall(data)
@@ -100,9 +107,12 @@ class Connection:
             raise HTTPError("connection closed by peer")
         return data
 
-    def _read_until(self, marker: bytes, *, cap: int = C.MAX_HEADER_BYTES) -> bytes:
+    def _read_until(self, marker: bytes, *, cap: int = C.MAX_HEADER_BYTES,
+                    deadline: float = 0.0) -> bytes:
         while marker not in self._buf:
-            if len(self._buf) > cap:
+            if deadline and time.monotonic() > deadline:
+                raise HTTPError("read deadline exceeded (Slowloris or hung gateway)")
+            if len(self._buf) >= cap:
                 raise HTTPError(f"line/marker not found within {cap} bytes "
                                 "(hostile or non-HTTP response)")
             self._buf += self._recv_some()
@@ -110,12 +120,14 @@ class Connection:
         out, self._buf = self._buf[:idx], self._buf[idx:]
         return out
 
-    def _read_exact(self, n: int) -> bytes:
+    def _read_exact(self, n: int, deadline: float = 0.0) -> bytes:
         if n < 0:
             raise HTTPError(f"negative body/chunk size: {n}")
         if n > C.MAX_BODY_BYTES:
             raise HTTPError(f"declared body size {n} exceeds cap {C.MAX_BODY_BYTES}")
         while len(self._buf) < n:
+            if deadline and time.monotonic() > deadline:
+                raise HTTPError("read deadline exceeded")
             self._buf += self._recv_some()
         out, self._buf = self._buf[:n], self._buf[n:]
         return out
@@ -202,6 +214,8 @@ class Connection:
                 raise HTTPError("too many chunks (hostile response)")
             size_line = self._read_until(b"\r\n").strip()
             token = size_line.split(b";", 1)[0].strip()
+            if len(token) > 8:
+                raise HTTPError(f"chunk size token too long ({len(token)} bytes)")
             try:
                 size = int(token, 16)
             except ValueError:

@@ -116,7 +116,15 @@ _VPN_KEYS = {"name", "default_route",
              "vault_item", "trusted_cert", "ca_file", "realm", "set_routes",
              "set_dns", "half_internet_routes", "persistent", "otp_from_vault",
              "ready_probe", "extra_args", "health_check_interval",
-             "health_check_failures", "domain", "insecure", "interface"}
+              "health_check_failures", "domain", "insecure", "interface",
+              # --- iNode-specific keys (mapped to backend CLI flags) ---
+              "split_tunnel",           # --split-tunnel (enterprise split routing)
+              "spa_key",                # --spa-key (Zero-Trust SPA HOTP key)
+              "spa_aid",                # --spa-aid (SPA application id)
+              "spa_ports",              # --spa-ports (comma-separated knock ports)
+              "spa_knock_port",         # --spa-knock-port (UDP knock port, default 3000)
+              # --- Native Fortinet backend ---
+              "ftnt_backend"}           # "native" | "binary" (default: binary)
 
 
 @dataclass
@@ -357,11 +365,17 @@ def wireguard_target(vpn: dict) -> str:
 
 
 def inode_gateway(vpn: dict) -> str:
-    """'host:port' for the H3C iNode SSL-VPN gateway (default port 443). '' when
-    no gateway is configured."""
+    """'host:port' for the H3C iNode SSL-VPN gateway (default port 443). IPv6
+    addresses are wrapped in brackets so the backend's host:port split remains
+    unambiguous. '' when no gateway is configured."""
     vpn = vpn or {}
     host = str(vpn.get("gateway", "") or "").strip()
-    return f"{host}:{int(vpn.get('port', 443) or 443)}" if host else ""
+    if not host:
+        return ""
+    port = int(vpn.get("port", 443) or 443)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{port}"
 
 
 def _bundled_inode_dir() -> str:
@@ -383,9 +397,55 @@ def inode_script(vpn: dict) -> str:
 
 def inode_extra_args(vpn: dict) -> list:
     """The NON-secret backend args after svpn-connect.sh's '--' separator: cert
-    pin (vpn.trusted_cert) or --insecure, plus any vpn.extra_args. [] if none
-    (the username + gateway are positional; the password travels via the child
-    env $H3C_SVPN_PASSWORD, never argv)."""
+    pin (vpn.trusted_cert) or --insecure, split-tunnel, SPA knock parameters,
+    plus any vpn.extra_args. [] if none (the username + gateway are positional;
+    the password travels via the child env $H3C_SVPN_PASSWORD, never argv)."""
+    vpn = vpn or {}
+    tail = []
+    pin = str(vpn.get("trusted_cert", "") or "").strip()
+    if pin:
+        tail += ["--pin-sha256", pin]
+    elif vpn.get("insecure"):
+        tail += ["--insecure"]
+    if vpn.get("split_tunnel"):
+        tail += ["--split-tunnel"]
+    spk = str(vpn.get("spa_key", "") or "").strip()
+    if spk:
+        tail += ["--spa-key", spk]
+    aid = str(vpn.get("spa_aid", "") or "").strip()
+    if aid:
+        tail += ["--spa-aid", aid]
+    spa_ports = str(vpn.get("spa_ports", "") or "").strip()
+    if spa_ports:
+        tail += ["--spa-ports", spa_ports]
+    kport = int(vpn.get("spa_knock_port", 0) or 0)
+    if kport:
+        tail += ["--spa-knock-port", str(kport)]
+    tail += [str(a) for a in (vpn.get("extra_args") or [])]
+    return ["--"] + tail if tail else []
+
+
+def _bundled_ftnt_dir() -> str:
+    """The native Fortinet SSL-VPN client shipped with the wall
+    (vendor/FortiGate-Client)."""
+    root = os.environ.get("SOC_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(root, "vendor", "FortiGate-Client")
+
+
+def ftnt_script(vpn: dict) -> str:
+    """Resolve the native Fortinet connect script. vpn.config may be the
+    FortiGate-Client dir or a direct ftnt-connect.sh path; when unset, the
+    BUNDLED client shipped with the wall is used."""
+    base = str((vpn or {}).get("config", "") or "").strip() or _bundled_ftnt_dir()
+    base = os.path.expanduser(base)
+    return base if base.endswith(".sh") else os.path.join(base, "ftnt-connect.sh")
+
+
+def ftnt_extra_args(vpn: dict) -> list:
+    """The NON-secret backend args: cert pin or --insecure, plus extra_args.
+    The username + gateway are positional; the password travels via the child
+    env $FTNT_SVPN_PASSWORD, never argv."""
     vpn = vpn or {}
     tail = []
     pin = str(vpn.get("trusted_cert", "") or "").strip()
@@ -394,7 +454,7 @@ def inode_extra_args(vpn: dict) -> list:
     elif vpn.get("insecure"):
         tail += ["--insecure"]
     tail += [str(a) for a in (vpn.get("extra_args") or [])]
-    return ["--"] + tail if tail else []
+    return tail
 
 
 def compute_geometry(disp: DisplayCfg, grid) -> Geometry:

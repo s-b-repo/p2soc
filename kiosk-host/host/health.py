@@ -54,7 +54,7 @@ def _load_env_file(path: "str | None") -> dict:
                     v = v[1:-1]
                 out[k.strip()] = v
     except OSError:
-        pass
+        sys.stderr.write(f"health: could not read env file {path}: OSError\n")
     return out
 
 
@@ -66,6 +66,7 @@ def _read_env() -> dict:
         from . import configpaths
         path = configpaths.resolve_env()
     except Exception:
+        sys.stderr.write("health: could not import configpaths; falling back to SOC_ENV_FILE\n")
         path = os.environ.get("SOC_ENV_FILE")
     env = _load_env_file(path)
     # os.environ wins — an operator who exported SOC_VAULT_URL means it.
@@ -109,6 +110,7 @@ def sync_state() -> dict:
         from . import configpaths
         panels_path, panels_tier = configpaths.resolve_read("panels")
     except Exception:
+        sys.stderr.write("health: could not resolve panels path; falling back to SOC_PANELS_FILE\n")
         panels_path = os.environ.get("SOC_PANELS_FILE")
         panels_tier = "$SOC_PANELS_FILE" if panels_path else "none"
 
@@ -200,6 +202,7 @@ def is_installed() -> dict:
         pwd.getpwnam(os.environ.get("SOC_KIOSK_USER", "soc"))
         kiosk_user = True
     except Exception:  # noqa: BLE001 — KeyError (no user) / no pwd -> not present
+        sys.stderr.write("health: could not look up kiosk user (pwd.getpwnam)\n")
         kiosk_user = False
 
     installed = bool(stamp or (opt_present and units_present))
@@ -259,6 +262,7 @@ def _vpn_state_fast(vpn: dict, timeout: float) -> "str | None":
     try:
         from . import vpnstatus
     except Exception:
+        sys.stderr.write("health: could not import vpnstatus module\n")
         return None
     if not vpn or not vpn.get("enabled"):
         return vpnstatus.STATE_NOT_CONFIGURED
@@ -274,6 +278,7 @@ def _vpn_state_fast(vpn: dict, timeout: float) -> "str | None":
         return vpnstatus.STATE_ONLINE if vpnstatus._iface_up(iface) \
             else vpnstatus.STATE_OFFLINE
     except Exception:
+        sys.stderr.write("health: could not determine VPN state via iface check\n")
         return None
 
 
@@ -306,6 +311,7 @@ def probe_state(sync: "dict | None" = None, *, vault_timeout: float = PROBE_TIME
             try:
                 vpn_state = _vpn_state_fast(vpn, vpn_timeout)
             except Exception:
+                sys.stderr.write("health: could not probe VPN state (fast path)\n")
                 vpn_state = None
     else:
         # Either genuinely not configured, or we couldn't tell (yaml deferred).

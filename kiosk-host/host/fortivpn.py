@@ -25,6 +25,7 @@ disk. Credentials are scrubbed from our copies after each spawn.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import signal
@@ -193,24 +194,26 @@ class Supervisor:
     def _on_signal(self, signum, _frame):
         self.log(f"received {signal.Signals(signum).name}; shutting down")
         self.stop_event.set()
-        self._terminate_child()
 
     def _terminate_child(self, grace: float = 10.0):
-        """SIGTERM the child so openfortivpn tears down routes/resolv.conf,
-        escalate to SIGKILL after `grace`."""
+        """SIGTERM the child process group (start_new_session) so grandchildren
+        (pppd, route scripts, ipsec helpers) are torn down too. Escalate to
+        SIGKILL after `grace`."""
         child = self.child
         if not child or child.poll() is not None:
             return
         try:
-            child.terminate()
+            os.killpg(child.pid, signal.SIGTERM)
             try:
                 child.wait(timeout=grace)
             except subprocess.TimeoutExpired:
-                self.log(f"openfortivpn did not exit within {grace:.0f}s; killing")
-                child.kill()
+                self.log(f"{self.driver.binary} did not exit within {grace:.0f}s; killing")
+                os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=5)
-        except OSError:
+        except ProcessLookupError:
             pass
+        except OSError as e:
+            self.log(f"failed to terminate child process group: {e}")
 
     # -- credentials -----------------------------------------------------------
     def _open_vault(self):
@@ -301,27 +304,36 @@ class Supervisor:
     # -- child output ----------------------------------------------------------
     def _reader(self, pipe):
         tag = self.driver.binary
-        for line in iter(pipe.readline, ""):
-            line = line.rstrip("\n")
-            if not line.strip():
-                continue
-            self.log(f"[{tag}] {line}")
-            event = self.driver.classify(line)
-            if event == EVENT_UP:
-                self._tunnel_up = True
-                self._up_since = time.monotonic()   # reset backoff later, only if it stays up
-                self.log("tunnel established")
-                sd_notify("STATUS=connected: tunnel is up")
-            elif event == EVENT_CONNECTING:
-                # Progress feedback for the wall only — must NOT land in _saw, so
-                # it can never be mistaken for a drop and perturb the backoff.
-                sd_notify("STATUS=connecting to gateway")
-            elif event:
-                self._saw.add(event)
         try:
-            pipe.close()
-        except OSError:
-            pass
+            for line in iter(pipe.readline, ""):
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                self.log(f"[{tag}] {line}")
+                try:
+                    event = self.driver.classify(line)
+                except Exception:
+                    event = None
+                if event == EVENT_UP:
+                    self._tunnel_up = True
+                    self._up_since = time.monotonic()
+                    self.log("tunnel established")
+                    sd_notify("STATUS=connected: tunnel is up")
+                elif event == EVENT_CONNECTING:
+                    sd_notify("STATUS=connecting to gateway")
+                elif event:
+                    self._saw.add(event)
+        except Exception:
+            try:
+                import traceback
+                self.log(f"[{tag}] reader thread crashed: {traceback.format_exc()}")
+            except Exception:
+                pass
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
     # -- VPN config from the vault (keys never on disk persistently) -----------
     def _soc_vpn_dir(self) -> str:
@@ -472,7 +484,8 @@ class Supervisor:
         """Answer OpenVPN's password query over its management socket, so the
         username/password never appears on argv or disk."""
         user, password = creds
-        password = password.replace("\n", "")
+        user = user.replace("\\", "\\\\").replace('"', '\\"')
+        password = password.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
         deadline = time.monotonic() + 30
         s = None
         while time.monotonic() < deadline and not self.stop_event.is_set():
@@ -481,6 +494,10 @@ class Supervisor:
                 s.connect(sock_path)
                 break
             except OSError:
+                try:
+                    s.close()
+                except OSError:
+                    pass
                 s = None
                 self.stop_event.wait(0.3)
         if s is None:
@@ -505,8 +522,9 @@ class Supervisor:
             sd_notify("STATUS=OpenVPN management socket unreachable; backing off")
             self._terminate_child()
             return
-        f = s.makefile("rw")
+        f = None
         try:
+            f = s.makefile("rw")
             f.write("hold release\n")
             f.flush()
             for line in f:
@@ -520,10 +538,11 @@ class Supervisor:
         except OSError:
             pass
         finally:
-            try:
-                f.close()
-            except OSError:
-                pass
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
             try:
                 s.close()
             except OSError:
@@ -537,7 +556,15 @@ class Supervisor:
         self._mgmt_unreachable = False
         env = dict(os.environ)
         mgmt = None
-        if self.driver.kind == "fortinet":
+        if isinstance(self.driver, vpndrivers.NativeFortinetDriver):
+            user, password = creds
+            if not password:
+                self.log("WARNING vault returned an empty password for native "
+                         f"Fortinet VPN '{self.vpn.get('vault_item')}'")
+                raise OtpUnavailable(self.vpn.get("vault_item"))
+            cmd = self.driver.build_cmd(self.vpn, user)
+            env["FTNT_SVPN_PASSWORD"] = password
+        elif self.driver.kind == "fortinet":
             user, password = creds
             otp = ""
             if self.vpn.get("otp_from_vault"):
@@ -552,6 +579,11 @@ class Supervisor:
             env["SOC_VPN_PASSWORD"] = password
         elif self.driver.kind == "inode":
             user, password = creds
+            if not password:
+                self.log("WARNING vault returned an empty password for iNode VPN "
+                         f"'{self.vpn.get('vault_item')}'; not spawning a guaranteed "
+                         "blank-auth attempt")
+                raise OtpUnavailable(self.vpn.get("vault_item"))
             cmd = self.driver.build_cmd(self.vpn, user)
             env["H3C_SVPN_PASSWORD"] = password   # via child env, never argv/disk
         else:  # openvpn
@@ -570,7 +602,8 @@ class Supervisor:
         self._retire_attempt_threads()
         self.child = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+            stdin=subprocess.DEVNULL, text=True, bufsize=1, env=env,
+            start_new_session=True)
         self._reader_thread = threading.Thread(
             target=self._reader, args=(self.child.stdout,), daemon=True)
         self._reader_thread.start()
@@ -748,6 +781,11 @@ class Supervisor:
             if self.stop_event.is_set():
                 break
 
+            # Take a snapshot of reader-thread state before classification so
+            # late-arriving events from a still-alive reader can't flip the backoff
+            # decision mid-comparison.
+            saw = frozenset(self._saw)
+
             # the child is gone — decide how angrily to come back
             if self._mgmt_unreachable:
                 # The OpenVPN management socket never became reachable, so auth
@@ -763,8 +801,9 @@ class Supervisor:
                 self.log(f"  Backing off {self.auth_delay:.0f}s before retrying.")
                 self.log("=" * 70)
                 sd_notify("STATUS=OpenVPN management socket unreachable (long backoff)")
+                self.backoff.reset()
                 self._sleep(self.auth_delay)
-            elif EVENT_AUTH in self._saw:
+            elif EVENT_AUTH in saw:
                 item = self.vpn.get("vault_item")
                 self.log("=" * 70)
                 self.log(f"AUTHENTICATION FAILED ({self.driver.kind}, exit {rc}).")
@@ -780,8 +819,9 @@ class Supervisor:
                 self.log("=" * 70)
                 sd_notify("STATUS=authentication failed; "
                           "fix the vault credentials (long backoff)")
+                self.backoff.reset()
                 self._sleep(self.auth_delay)
-            elif EVENT_CERT in self._saw:
+            elif EVENT_CERT in saw:
                 self.log("=" * 70)
                 self.log(f"CERTIFICATE VALIDATION FAILED ({self.driver.kind}, "
                          f"exit {rc}).")
@@ -794,6 +834,7 @@ class Supervisor:
                 self.log("  Retrying cannot succeed until the config is fixed.")
                 self.log("=" * 70)
                 sd_notify("STATUS=certificate validation failed (long backoff)")
+                self.backoff.reset()
                 self._sleep(self.cert_delay)
             else:
                 # A tunnel that stayed up past the backoff floor was a real
@@ -803,7 +844,7 @@ class Supervisor:
                 if self._up_since and (time.monotonic() - self._up_since) >= self.backoff.initial:
                     self.backoff.reset()
                 delay = self.backoff.next()
-                why = "connection closed" if EVENT_DOWN in self._saw else \
+                why = "connection closed" if EVENT_DOWN in saw else \
                       f"{self.driver.binary} exited ({rc})"
                 self.log(f"{why}; reconnecting in {delay:.0f}s")
                 sd_notify(f"STATUS=disconnected; reconnecting in {delay:.0f}s")
@@ -818,6 +859,7 @@ class Supervisor:
 
     # -- the loop (interface drivers: wireguard) -------------------------------
     def _run_oneshot(self, cmd):
+        self.watchdog.ping()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=60)
@@ -907,14 +949,17 @@ class Supervisor:
                                 drc, dout = self._run_oneshot(
                                     self.driver.down_cmd(self.vpn))
                                 if drc != 0 and self._wg_is_up(iface):
-                                    # down failed but the iface is still up — the
-                                    # next `wg-quick up` would refuse ('already
-                                    # exists'). Force-remove the device so the
-                                    # cycle recovers (this drops its routes too).
                                     self.log(f"wg-quick down failed (rc {drc}): "
                                              f"{dout}; force-removing {iface}")
-                                    self._run_oneshot(["ip", "link", "delete",
-                                                       "dev", iface])
+                                    irc, _ = self._run_oneshot(["ip", "link", "delete",
+                                                                "dev", iface])
+                                    if irc != 0 and self._wg_is_up(iface):
+                                        d = self.backoff.next()
+                                        self.log(f"force-remove {iface} also failed; "
+                                                 f"backing off {d:.0f}s (may need "
+                                                 f"manual intervention)")
+                                        sd_notify("STATUS=interface stuck; backing off")
+                                        self._sleep(d)
                                 break
                     self.stop_event.wait(1)
                 if self.stop_event.is_set():
@@ -958,8 +1003,10 @@ def ensure_litebw_session(log):
                      ("base_url", os.environ.get("SOC_VAULT_URL", "")),
                      ("pinentry", os.environ.get("SOC_PINENTRY", ""))):
         if val:
-            subprocess.run([cli, "config", "set", key, val],
-                           stdin=subprocess.DEVNULL, timeout=30)
+            r = subprocess.run([cli, "config", "set", key, val],
+                               stdin=subprocess.DEVNULL, timeout=30)
+            if r.returncode != 0:
+                log(f"WARNING {cli} config set {key} returned rc={r.returncode}")
     # no-op if the device is already registered; pinentry supplies the password
     try:
         r = subprocess.run([cli, "login"], capture_output=True, text=True,
@@ -1069,6 +1116,18 @@ def main() -> int:
 
     mgr = vpnmanager.VpnManager(runnable, pinentry, log=log)
     stop = threading.Event()
+
+    def _crash_cleanup():
+        """Best-effort teardown when the process crashes (atexit). Daemon threads
+        are silently abandoned on interpreter exit, so child processes they own
+        (openfortivpn, openvpn, wg-quick) survive as orphans. This handler stops
+        the manager synchronously — it won't catch SIGKILL but it covers every
+        unhandled-exception crash path."""
+        try:
+            mgr.stop()
+        except Exception as e:
+            sys.stderr.write(f"fortivpn: crash_cleanup failed: {e}\n")
+    atexit.register(_crash_cleanup)
 
     def on_signal(signum, _frame):
         log(f"received {signal.Signals(signum).name}; shutting down all VPNs")

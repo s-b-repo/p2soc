@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 
 
@@ -63,7 +64,8 @@ def _load_policy(path: str | None = None) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             cfg = json.load(fh)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"complexity: could not load policy {path}: {e}; using defaults\n")
         return out
     for kind in ("pin", "password"):
         block = cfg.get(kind)

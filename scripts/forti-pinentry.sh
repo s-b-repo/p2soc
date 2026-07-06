@@ -57,8 +57,9 @@ while IFS= read -r line; do
            s/\x1f/\\x1f/g
            s/\x7f/\\x7f/g
          ')
-        printf 'D %s\n' "$enc"
-        printf 'OK\n'
+         printf 'D %s\n' "$enc"
+         printf 'OK\n'
+         unset SOC_VPN_PASSWORD  # single-use: clear immediately after responding
       fi
       ;;
     BYE*)

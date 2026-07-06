@@ -245,6 +245,73 @@ def _resolve_master() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# VPN config model — in-memory panels.yaml round-trip.
+# --------------------------------------------------------------------------- #
+class _VpnModel:
+    """Lightweight model for the panels.yaml VPN section. Loads the raw YAML
+    into ``_conf`` dict (mutate this for add/remove), provides ``cfg()`` (parsed
+    Config) for read-only access, and ``save()`` to validate + write back."""
+
+    def __init__(self):
+        import yaml
+        import os as _os
+        self._path = _os.environ.get("SOC_PANELS_FILE")
+        if not self._path:
+            try:
+                _ensure_host_on_path()
+                from host import configpaths
+                self._path = configpaths.resolve_panels() or "config/panels.yaml"
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"configcenter: could not resolve panels path: {e}; using default\n")
+                self._path = "config/panels.yaml"
+        self._conf: dict = {}
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh)
+                self._conf = raw if isinstance(raw, dict) else {}
+        except (FileNotFoundError, OSError, yaml.YAMLError) as e:
+            sys.stderr.write(f"configcenter: could not read panels YAML from {self._path}: {e}; using defaults\n")
+            self._conf = {}
+        if not isinstance(self._conf.get("vpns"), list):
+            self._conf["vpns"] = []
+        self._cfg = None
+        self._reparse()
+
+    def cfg(self):
+        return self._cfg
+
+    def _reparse(self):
+        _ensure_host_on_path()
+        from host import config
+        try:
+            self._cfg = config.load(self._path)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"configcenter: could not load {self._path}: {e}; using safe default\n")
+            try:
+                self._cfg = config.load_str(
+                    "display: {}\npanels: []\nvpns: []", "<default>")
+            except Exception:  # noqa: BLE001
+                self._cfg = None
+
+    def save(self):
+        import yaml
+        _ensure_host_on_path()
+        from host import config
+        yaml_text = yaml.dump(
+            self._conf, default_flow_style=False, allow_unicode=True,
+            sort_keys=False)
+        try:
+            self._cfg = config.load_str(yaml_text, "<configcenter>")
+        except Exception:  # noqa: BLE001
+            self._reparse()
+            return
+        out = config.to_yaml(self._cfg)
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+        with open(self._path, "w", encoding="utf-8") as fh:
+            fh.write(out)
+
+
+# --------------------------------------------------------------------------- #
 # The control center. Everything below touches gi; it is only built from run().
 # --------------------------------------------------------------------------- #
 class ControlCenter:
@@ -278,6 +345,9 @@ class ControlCenter:
 
         self.state_dir = _state_dir()
         self.vault_url, self.vault_email = _vault_endpoint()
+
+        # VPN model: load panels.yaml so the Network pane can read/write VPNs.
+        self.model = _VpnModel()
 
         # Master + per-pane runtime state. The master lives in memory ONLY.
         self._master = ""
@@ -321,6 +391,10 @@ class ControlCenter:
         self._sec_totp_uri = None
         self._sec_totp_code = None
         self._sec_new_totp = ""      # pending (unsaved) generated secret
+
+        # Network widgets.
+        self._net_listbox = None
+        self._net_status = None
 
         self._build()
 
@@ -525,7 +599,7 @@ class ControlCenter:
                 entry.set_sensitive(False)
                 btn.set_sensitive(False)
                 err.set_text(f"Too many attempts — locked for {wait}s")
-                self.GLib.timeout_add_seconds(wait, _rearm)
+                self._track_timeout(wait, _rearm)
             else:
                 err.set_text("Incorrect — try again")
                 entry.grab_focus()
@@ -569,12 +643,14 @@ class ControlCenter:
 
         cred = self._build_credentials()
         sec = self._build_security()
+        net = self._build_network()
         self._stack.add_named(self._scroll(cred), "credentials")
         self._stack.add_named(self._scroll(sec), "security")
+        self._stack.add_named(self._scroll(net), "network")
 
         self._rail_buttons = {}
         group = None
-        for key, label in (("credentials", "Credentials"), ("security", "Security")):
+        for key, label in (("credentials", "Credentials"), ("security", "Security"), ("network", "Network")):
             btn = Gtk.RadioButton.new_from_widget(group)
             if group is None:
                 group = btn
@@ -1415,6 +1491,226 @@ class ControlCenter:
         self._sec_status.set_markup(
             f'<span foreground="{color}">{_esc(text)}</span>')
 
+    # ===================================================================== #
+    # NETWORK pane
+    # ===================================================================== #
+    _VPN_TYPE_LABELS = {
+        "fortinet": "Fortinet SSL-VPN",
+        "openvpn": "OpenVPN",
+        "wireguard": "WireGuard",
+        "inode": "iNode / H3C",
+    }
+
+    def _build_network(self):
+        Gtk = self.Gtk
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("soc-page")
+        page.pack_start(self._section_title("VPN Connections"), False, False, 0)
+        page.pack_start(self._subtitle(
+            "Manage VPN connections for the wall. Each VPN runs independently "
+            "and auto-reconnects on failure."), False, False, 0)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("soc-card")
+        card.pack_start(self._markup("VPN Connections", weight="bold",
+                                     color=self._color("text")), False, False, 0)
+
+        listbox = Gtk.ListBox()
+        listbox.get_style_context().add_class("soc-list")
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        ph = self._empty_hint("No VPNs configured yet")
+        listbox.set_placeholder(ph)
+        self._net_listbox = listbox
+
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sc.set_min_content_height(260)
+        sc.set_vexpand(True)
+        sc.add(listbox)
+        card.pack_start(sc, True, True, 0)
+
+        addb = Gtk.Button.new_with_label("Add VPN")
+        addb.get_style_context().add_class("soc-ghost")
+        addb.connect("clicked", self._on_add_vpn_clicked)
+        addb.set_halign(Gtk.Align.START)
+        card.pack_start(addb, False, False, 0)
+
+        page.pack_start(card, True, True, 0)
+
+        self._net_status = self._markup("", color=self._color("text_dim"))
+        self._net_status.get_style_context().add_class("soc-dim")
+        page.pack_start(self._net_status, False, False, 0)
+
+        self._net_populate()
+        return page
+
+    def _net_populate(self):
+        if self._net_listbox is None:
+            return
+        Gtk = self.Gtk
+        for ch in self._net_listbox.get_children():
+            self._net_listbox.remove(ch)
+        vpns = self.model._conf.get("vpns", [])
+        if not vpns:
+            self._net_listbox.show_all()
+            return
+        for vpn in vpns:
+            self._net_listbox.add(self._net_row(vpn))
+        self._net_listbox.show_all()
+        n = len(vpns)
+        if self._net_status:
+            self._net_status.set_markup(
+                f'<span foreground="{self._color("text_dim")}">'
+                f'{n} VPN{"s" if n != 1 else ""} configured</span>')
+
+    def _net_row(self, vpn):
+        Gtk = self.Gtk
+        import gi
+        gi.require_version("Pango", "1.0")
+        from gi.repository import Pango
+
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.set_border_width(6)
+
+        enabled = bool(vpn.get("enabled", False))
+        dot_color = self._color("good") if enabled else self._color("text_dim")
+        dot = self._markup("●" if enabled else "○", color=dot_color)
+        dot.set_valign(Gtk.Align.CENTER)
+        box.pack_start(dot, False, False, 0)
+
+        txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        name = vpn.get("name", "unnamed")
+        name_lbl = self._markup(name, weight="bold", color=self._color("text"))
+        name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        name_lbl.set_max_width_chars(36)
+        txt.pack_start(name_lbl, False, False, 0)
+
+        vpn_type = vpn.get("type", "fortinet")
+        type_str = self._VPN_TYPE_LABELS.get(vpn_type, vpn_type)
+        status = "on" if enabled else "off"
+        sub_lbl = self._markup(f"{type_str}  ·  {status}", size="9000",
+                               color=self._color("text_dim"))
+        sub_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        sub_lbl.set_max_width_chars(40)
+        txt.pack_start(sub_lbl, False, False, 0)
+
+        gateway = vpn.get("gateway", "")
+        port = vpn.get("port", "")
+        if gateway:
+            port_str = f":{port}" if port else ""
+            gw_lbl = self._markup(f"{gateway}{port_str}", size="8200",
+                                  color=self._color("text_dim"), mono=True)
+            txt.pack_start(gw_lbl, False, False, 0)
+
+        box.pack_start(txt, True, True, 0)
+
+        rem = Gtk.Button.new_with_label("\u2715")
+        rem.get_style_context().add_class("soc-danger")
+        rem.set_relief(Gtk.ReliefStyle.NONE)
+        name_val = str(vpn.get("name", ""))
+        rem.connect("clicked", lambda _b, n=name_val: self._on_remove_vpn(n))
+        box.pack_end(rem, False, False, 0)
+
+        row.add(box)
+        return row
+
+    def _on_add_vpn_clicked(self, *_a):
+        Gtk = self.Gtk
+        vpns = self.model._conf.get("vpns", [])
+        if len(vpns) >= 8:
+            self._net_set_status("maximum of 8 VPNs reached", bad=True)
+            return
+
+        dlg = Gtk.Dialog(title="Add VPN", transient_for=self.win, modal=True)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        add_btn = dlg.add_button("Add", Gtk.ResponseType.OK)
+        add_btn.get_style_context().add_class("soc-primary")
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        box.pack_start(self._subtitle("Choose the VPN type:"), False, False, 0)
+
+        combo = Gtk.ComboBoxText()
+        for t in ("fortinet", "openvpn", "wireguard", "inode"):
+            combo.append(t, self._VPN_TYPE_LABELS.get(t, t))
+        combo.set_active(0)
+        box.pack_start(combo, False, False, 0)
+        dlg.show_all()
+
+        resp = dlg.run()
+        vpn_type = combo.get_active_id() or "fortinet"
+        dlg.destroy()
+
+        if resp != Gtk.ResponseType.OK:
+            return
+
+        idx = len(vpns)
+        new_vpn = {
+            "name": ("vpn" if idx == 0 else f"vpn{idx + 1}"),
+            "enabled": False,
+            "type": vpn_type,
+            "default_route": False,
+        }
+        if vpn_type == "fortinet":
+            new_vpn.update(gateway="", port=443, vault_item="", trusted_cert="")
+        elif vpn_type == "openvpn":
+            new_vpn["config"] = ""
+        elif vpn_type == "wireguard":
+            new_vpn["config"] = ""
+        elif vpn_type == "inode":
+            new_vpn["config"] = ""
+
+        if "vpns" not in self.model._conf:
+            self.model._conf["vpns"] = []
+        self.model._conf["vpns"].append(new_vpn)
+        self.model.save()
+        self._net_populate()
+        self._net_set_status(f"added {vpn_type} VPN \u2018{new_vpn['name']}\u2019")
+
+    def _on_remove_vpn(self, name):
+        Gtk = self.Gtk
+        vpns = self.model._conf.get("vpns", [])
+        if not any(v.get("name") == name for v in vpns):
+            self._net_set_status(f"no VPN named \u2018{name}\u2019", bad=True)
+            return
+
+        dlg = Gtk.MessageDialog(
+            transient_for=self.win, modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=f"Remove VPN \u2018{name}\u2019?")
+        dlg.format_secondary_text(
+            "This removes the VPN connection configuration.")
+        resp = dlg.run()
+        dlg.destroy()
+
+        if resp != Gtk.ResponseType.OK:
+            return
+
+        self.model._conf["vpns"] = [v for v in vpns if v.get("name") != name]
+        self.model.save()
+        self._net_populate()
+        self._net_set_status(f"removed VPN \u2018{name}\u2019")
+
+    def _net_set_status(self, text, bad=False):
+        if self._net_status is None:
+            return
+        color = self._color("bad") if bad else self._color("good")
+        self._net_status.set_markup(
+            f'<span foreground="{color}">{_esc(text)}</span>')
+
+    def _empty_hint(self, text):
+        Gtk = self.Gtk
+        lbl = self._markup(text, color=self._color("text_dim"))
+        lbl.set_halign(Gtk.Align.CENTER)
+        lbl.set_valign(Gtk.Align.CENTER)
+        lbl.set_margin_top(24)
+        lbl.set_margin_bottom(24)
+        lbl.set_line_wrap(True)
+        lbl.show()
+        return lbl
+
     # ---- shared: a selectable-URI dialog -------------------------------- #
     def _show_uri_dialog(self, title, uri, hint):
         Gtk = self.Gtk
@@ -1454,6 +1750,16 @@ class ControlCenter:
             except Exception:  # noqa: BLE001
                 pass
         self._timeouts.clear()
+        # Remove the theme provider from the screen so repeated open/close cycles
+        # don't accumulate providers (one per ControlCenter instance).
+        prov = getattr(self, "_provider", None)
+        if prov is not None:
+            try:
+                screen = self.Gdk.Screen.get_default()
+                if screen is not None:
+                    Gtk.StyleContext.remove_provider_for_screen(screen, prov)
+            except Exception:  # noqa: BLE001
+                pass
         # Drop our reference to the master on close (CPython cannot zero an
         # immutable str; copies in vaultseed/GC may persist until collected). (SEC-6)
         self._master = ""

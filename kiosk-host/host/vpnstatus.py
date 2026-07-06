@@ -51,7 +51,9 @@ def _expected_iface(vpn: dict) -> str:
         return vpndrivers.WireGuardDriver().iface(vpn) or "wg0"
     if kind == "openvpn":
         return "tun0"
-    return "ppp0"
+    if kind == "inode":
+        return "tun0"    # H3C iNode creates a TUN device, not PPP
+    return "ppp0"        # Fortinet (openfortivpn uses pppd)
 
 
 def _iface_up(iface: str) -> bool:

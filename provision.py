@@ -99,7 +99,7 @@ def _print_cmd(cmd: list, dry: bool) -> None:
 
 
 def _run(cmd: list, *, dry: bool, cwd: str = REPO, check: bool = False,
-         env: "dict | None" = None) -> int:
+         env: "dict | None" = None, timeout: int = 300) -> int:
     """Run (or, in dry-run, just PRINT) a command. Returns the rc (0 in dry-run).
 
     Never executes anything when ``dry`` — this is the single chokepoint that
@@ -108,9 +108,12 @@ def _run(cmd: list, *, dry: bool, cwd: str = REPO, check: bool = False,
     if dry:
         return 0
     try:
-        rc = subprocess.run(cmd, cwd=cwd, env=env).returncode
+        rc = subprocess.run(cmd, cwd=cwd, env=env, timeout=timeout).returncode
     except FileNotFoundError:
         return 127
+    except subprocess.TimeoutExpired:
+        raise ProvisionError(
+            f"command timed out after {timeout}s: {' '.join(cmd)}") from None
     if check and rc != 0:
         raise ProvisionError(f"command failed (rc={rc}): {' '.join(cmd)}")
     return rc
@@ -458,8 +461,8 @@ def _alive(url: str, timeout: float = 20.0) -> bool:
             with urllib.request.urlopen(target, timeout=3) as r:  # noqa: S310
                 if r.status == 200:
                     return True
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"provision: _alive poll failed for {url}: {e}\n")
         time.sleep(1)
     return False
 
@@ -782,7 +785,8 @@ def _load_vaultsetup():
     try:
         from host import vaultsetup  # type: ignore
         return vaultsetup
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"provision: could not load vaultsetup: {e}\n")
         return None
 
 
@@ -791,7 +795,8 @@ def _load_vaultseed():
     try:
         from host import vaultseed  # type: ignore
         return vaultseed
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"provision: could not load vaultseed: {e}\n")
         return None
 
 
@@ -812,7 +817,8 @@ def _load_setup():
         spec = importlib.util.spec_from_file_location("soc_setup", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"provision: could not load setup module: {e}\n")
         return None
     _SETUP = mod
     return mod
@@ -825,8 +831,8 @@ def _config_vault_items(cfg: dict):
     if setup is not None and hasattr(setup, "_vault_items"):
         try:
             return setup._vault_items(cfg)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"provision: could not get vault items from setup: {e}\n")
     items = []
     for p in cfg.get("panels", []):
         name = p.get("vault_item")

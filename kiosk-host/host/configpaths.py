@@ -396,8 +396,8 @@ def _install_etc() -> int:
                     os.unlink(t)
                 except FileNotFoundError:
                     pass
-                except OSError:
-                    pass
+                except OSError as e:
+                    sys.stderr.write(f"configpaths: could not unlink temp file {t}: {e}\n")
     # Best-effort group: leave to install.sh/setfacl for the kiosk user's read access.
     sys.stdout.write(f"wrote {pf} (0644) and {ef} (0644)\n")
     return 0

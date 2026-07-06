@@ -20,7 +20,7 @@ def config_path() -> str:
 class Settings:
     # CAPTCHA: auto-solve via OCR and auto-retry on "Verify code error".
     auto_captcha: bool = True
-    captcha_retries: int = 8         # max fresh-captcha attempts before giving up
+    captcha_retries: int = 40        # max fresh-captcha attempts before giving up
     show_captcha: bool = True        # render the image in the terminal each try
 
     @classmethod

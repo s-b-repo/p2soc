@@ -114,7 +114,7 @@ def _req(url, headers=None, data=None, method="GET", form=False):
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as e:
         raise VaultSeedError(f"{method} {url} -> HTTP {e.code}: "
-                             f"{e.read().decode()[:200]}")
+                             f"{e.read(4096).decode()[:200]}")
     except OSError as e:
         raise VaultSeedError(f"could not reach Vaultwarden at {url}: {e}")
 

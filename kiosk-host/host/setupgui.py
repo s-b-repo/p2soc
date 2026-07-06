@@ -2051,42 +2051,87 @@ class SetupAssistant:
         config_path = Gtk.Entry()
         config_path.set_text(str(v.get("config", "")))
         config_path.set_hexpand(True)
+        # iNode-specific widgets
+        domain = Gtk.Entry()
+        domain.set_text(str(v.get("domain", "")))
+        domain.set_hexpand(True)
+        insecure = Gtk.CheckButton.new_with_label("skip TLS verification (--insecure)")
+        insecure.set_active(bool(v.get("insecure")))
+        split_tunnel = Gtk.CheckButton.new_with_label("split tunnel (--split-tunnel)")
+        split_tunnel.set_active(bool(v.get("split_tunnel")))
+        spa_key = Gtk.Entry()
+        spa_key.set_text(str(v.get("spa_key", "")))
+        spa_key.set_hexpand(True)
+        spa_aid = Gtk.Entry()
+        spa_aid.set_text(str(v.get("spa_aid", "")))
+        spa_aid.set_hexpand(True)
+        spa_ports = Gtk.Entry()
+        spa_ports.set_text(str(v.get("spa_ports", "")))
+        spa_ports.set_hexpand(True)
+        spa_knock = Gtk.SpinButton.new_with_range(1, 65535, 1)
+        spa_knock.set_value(int(v.get("spa_knock_port", 3000) or 3000))
+        # Fortinet-specific routing/liveness widgets
+        set_routes = Gtk.CheckButton.new_with_label("accept pushed routes (--set-routes)")
+        set_routes.set_active(bool(v.get("set_routes", True)))
+        set_dns = Gtk.CheckButton.new_with_label("accept pushed DNS (--set-dns)")
+        set_dns.set_active(bool(v.get("set_dns", False)))
+        otp_vault = Gtk.CheckButton.new_with_label("pull TOTP from vault (otp_from_vault)")
+        otp_vault.set_active(bool(v.get("otp_from_vault")))
+        # Advanced fields for all types
+        ready_probe = Gtk.Entry()
+        ready_probe.set_text(str(v.get("ready_probe", "")))
+        ready_probe.set_hexpand(True)
+        hci = Gtk.SpinButton.new_with_range(0, 3600, 1)
+        hci.set_value(int(v.get("health_check_interval", 0) or 0))
+        hcf = Gtk.SpinButton.new_with_range(1, 100, 1)
+        hcf.set_value(int(v.get("health_check_failures", 3) or 3))
 
         def _collect_type():
-            """Write the type-specific keys into `v` for its CURRENT type, dropping
-            keys foreign to the chosen type so the rendered YAML stays clean."""
+            """Write the type-specific keys into `v` for its CURRENT type. Only
+            drops keys that are fundamentally foreign to the new type — advanced
+            cross-type keys (ready_probe, health_check_*) are preserved so an
+            operator can switch types without losing config."""
             t = type_combo.get_active_text() or "fortinet"
             v["enabled"] = bool(enable.get_active())
             v["type"] = t
             v["default_route"] = bool(droute.get_active())
-            # strip cross-type leftovers, keep name/enabled/type/default_route
-            for k in ("gateway", "port", "vault_item", "trusted_cert", "realm",
-                      "set_routes", "set_dns", "half_internet_routes", "persistent",
-                      "otp_from_vault", "insecure", "config", "ready_probe",
-                      "health_check_interval", "health_check_failures", "extra_args"):
-                v.pop(k, None)
+            # drop only keys that make no sense for the new type
+            if t in ("fortinet", "inode"):
+                v.pop("config", None)
+            if t in ("openvpn", "wireguard"):
+                v.pop("gateway", None)
+                v.pop("port", None)
+                v.pop("trusted_cert", None)
+            # preserve: ready_probe, health_check_*, extra_args across types
             if t == "fortinet":
                 v["gateway"] = gateway.get_text()
                 v["port"] = int(port.get_value())
                 v["vault_item"] = vault.get_text()
                 v["trusted_cert"] = cert.get_text()
-                v["realm"] = ""
-                v["set_routes"] = True
-                v["set_dns"] = False
-                v["half_internet_routes"] = False
-                v["persistent"] = 0
-                v["otp_from_vault"] = False
+                v["set_routes"] = bool(set_routes.get_active())
+                v["set_dns"] = bool(set_dns.get_active())
+                v["otp_from_vault"] = bool(otp_vault.get_active())
             elif t == "inode":
                 v["gateway"] = gateway.get_text()
                 v["port"] = int(port.get_value())
                 v["vault_item"] = vault.get_text()
+                v["domain"] = domain.get_text()
                 v["trusted_cert"] = cert.get_text()
-                v["insecure"] = False
+                v["insecure"] = bool(insecure.get_active())
+                v["split_tunnel"] = bool(split_tunnel.get_active())
+                v["spa_key"] = spa_key.get_text()
+                v["spa_aid"] = spa_aid.get_text()
+                v["spa_ports"] = spa_ports.get_text()
+                v["spa_knock_port"] = int(spa_knock.get_value())
             else:  # openvpn / wireguard
                 v["config"] = config_path.get_text()
                 if t == "openvpn":
                     v["vault_item"] = vault.get_text()
-                    v["set_routes"] = True
+                    v["set_routes"] = bool(set_routes.get_active())
+            # advanced fields: written for ALL types
+            v["ready_probe"] = ready_probe.get_text()
+            v["health_check_interval"] = int(hci.get_value())
+            v["health_check_failures"] = int(hcf.get_value())
 
         # rows for each field (built, then visibility toggled per type)
         add_field("enable", enable)
@@ -2097,6 +2142,19 @@ class SetupAssistant:
         vault_row = add_field("vault item", vault)
         cert_row = add_field("trusted cert (sha256)", cert)
         cfg_row = add_field("config path (ovpn/wg)", config_path)
+        dom_row = add_field("auth domain (iNode)", domain)
+        ins_row = add_field("", insecure)
+        st_row = add_field("", split_tunnel)
+        spk_row = add_field("SPA key", spa_key)
+        spa_row = add_field("SPA app id", spa_aid)
+        spp_row = add_field("SPA ports", spa_ports)
+        skp_row = add_field("SPA knock port", spa_knock)
+        sr_row = add_field("", set_routes)
+        sd_row = add_field("", set_dns)
+        to_row = add_field("", otp_vault)
+        rp_row = add_field("ready probe (host:port)", ready_probe)
+        hi_row = add_field("health check interval (s)", hci)
+        hf_row = add_field("health check failures", hcf)
 
         def _apply_visibility():
             t = type_combo.get_active_text() or "fortinet"
@@ -2108,8 +2166,20 @@ class SetupAssistant:
                 (port_row, on and host_type),
                 (cert_row, on and host_type),
                 (cfg_row, on and file_type),
-                # vault: fortinet/inode always; openvpn optional; wireguard never
                 (vault_row, on and t in ("fortinet", "inode", "openvpn")),
+                (dom_row, on and t == "inode"),
+                (ins_row, on and t == "inode"),
+                (st_row, on and t == "inode"),
+                (spk_row, on and t == "inode"),
+                (spa_row, on and t == "inode"),
+                (spp_row, on and t == "inode"),
+                (skp_row, on and t == "inode"),
+                (sr_row, on and t in ("fortinet", "openvpn")),
+                (sd_row, on and t == "fortinet"),
+                (to_row, on and t == "fortinet"),
+                (rp_row, on and t in ("fortinet", "inode", "wireguard")),
+                (hi_row, on and t in ("fortinet", "inode", "wireguard")),
+                (hf_row, on and t in ("fortinet", "inode", "wireguard")),
             ):
                 for x in pair:
                     x.set_visible(vis)
@@ -2137,9 +2207,17 @@ class SetupAssistant:
                     self.GLib.idle_add(self._rebuild_vpns)
             on_change()
         droute.connect("toggled", _droute_toggled)
-        for w in (vault, config_path):
+        for w in (vault, config_path, domain, spa_key, spa_aid, spa_ports, ready_probe):
             w.connect("changed", lambda *_: changed())
+        for w in (gateway, cert):
+            if hasattr(w, "connect") and not isinstance(w, Gtk.CheckButton):
+                pass  # _entry widgets have their own callback via lambda
         port.connect("value-changed", changed)
+        hci.connect("value-changed", changed)
+        hcf.connect("value-changed", changed)
+        spa_knock.connect("value-changed", changed)
+        for cb in (insecure, split_tunnel, set_routes, set_dns, otp_vault):
+            cb.connect("toggled", lambda *_: changed())
 
         box.pack_start(grid, False, False, 0)
         row.add(box)
@@ -2803,7 +2881,16 @@ class SetupAssistant:
                      f"proxy {'ON' if cfg.get('proxy', {}).get('enabled') else 'off'}")
         for v in en_vpns:
             owner = "  [default-route]" if v.get("default_route") else ""
-            lines.append(f"  - vpn {v.get('name', '?')} [{v.get('type', 'fortinet')}]{owner}")
+            t = v.get("type", "fortinet")
+            detail = ""
+            if t in ("fortinet", "inode"):
+                detail = f" — gateway={v.get('gateway','?')}:{v.get('port',443)}"
+            elif t in ("openvpn", "wireguard"):
+                detail = f" — config={v.get('config','?')}"
+            vi = v.get("vault_item", "")
+            if vi:
+                detail += f"  vault={vi}"
+            lines.append(f"  - vpn {v.get('name', '?')} [{t}]{owner}{detail}")
         for p in cfg["panels"]:
             tgt = p.get("url") or f"tunnel:{p.get('tunnel', {}).get('local_port')}"
             lines.append(f"  - {p['id']} [{p['engine']}/{p['mode']}] {tgt}  <- {p['vault_item']}")
@@ -3041,7 +3128,8 @@ class SetupAssistant:
             p = subprocess.run(
                 ["pkexec", py, helper, "--seal", "--dir", secret_dir],
                 input=payload, text=True, capture_output=True, timeout=120)
-        except Exception:  # noqa: BLE001 — treat any spawn fault as "declined/failed"
+        except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+            sys.stderr.write(f"seal pkexec failed: {e}\n")
             return None
         if p.returncode != 0:
             return None
@@ -3069,6 +3157,7 @@ class SetupAssistant:
                 input=payload, text=True,
                 capture_output=True, timeout=120)
         except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"setupgui: pkexec escalation failed: {e}\n")
             self._set_status(f"pkexec escalation failed: {e}", bad=True)
             return False
         if p.returncode != 0:

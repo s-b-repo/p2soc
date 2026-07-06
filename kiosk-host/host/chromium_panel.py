@@ -495,8 +495,8 @@ class ChromiumPanel:
                         except Exception:
                             text = repr(raw_line)
                         self.log(f"[{p.id}] [chromium_stderr] {text}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.log(f"[{p.id}] chromium stderr reader died: {e}")
 
             threading.Thread(target=_read_stderr, daemon=True).start()
 
@@ -869,12 +869,12 @@ class ChromiumPanel:
                 self.proc.terminate()    # control loop respawns with the new URL
 
     def mem_rss_kb(self):
-        """RSS of the Chromium process (KiB), or None if it isn't running. Note
-        Chromium's helper processes aren't summed, so this under-counts — it is a
-        relative signal for picking the heaviest panel, not an exact total."""
+        """Total RSS of the Chromium browser process *and* its children (renderer,
+        GPU, utilities) in KiB. Uses /proc/<pid>/task/*/children to aggregate so
+        the memory watchdog sees the real per-panel cost, not just the browser shell."""
         p = self.proc
         if p and p.poll() is None:
-            return perf.proc_rss_kb(p.pid)
+            return perf.proc_tree_rss_kb(p.pid)
         return None
 
     def _show_crash_card(self):
