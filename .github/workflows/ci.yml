@@ -28,10 +28,10 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: pip
@@ -55,7 +55,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The GUI host imports PyGObject (gi) at module scope, so the suite needs
       # system GTK + a display — mirror the Pi/dev environment with distro
@@ -85,7 +85,7 @@ jobs:
   arm-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: aarch64 no-compile-on-Pi gate
         run: |
@@ -102,7 +102,7 @@ jobs:
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so gitleaks scans every commit, not just the tip.
           fetch-depth: 0
@@ -110,7 +110,7 @@ jobs:
       - name: Secret scan (gitleaks)
         id: gitleaks
         continue-on-error: true
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
