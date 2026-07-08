@@ -1,0 +1,31 @@
+# =============================================================================
+# Universal SOC wall — four generic panels, each shows ANY URL you point it at.
+# Nothing is hard-wired to a particular tool: a panel can display any web
+# dashboard, console, or page (Grafana, Kibana, a NOC map, a status page, an
+# internal app, whatever).
+#
+# Each tile ships UNCONFIGURED. Set its URL at the glass from the on-screen
+# config — the ⚙ button (top-right) or Ctrl+Shift+C — and it loads + persists.
+# No file editing, no per-tool setup.
+#
+# Optional, per panel (edit here or keep it pure display):
+#   vault_item + selectors   -> auto-login (the host types the creds for you)
+#   allow_insecure: true     -> accept a self-signed HTTPS cert (trusted LAN)
+#   engine: chromium         -> for the rare page WebKit can't render
+# =============================================================================
+display:
+  auto: true
+  cols: 2
+  rows: 2
+  gap: 6
+  layout: single        # one fullscreen grid window; works on X11 and Wayland
+
+panels:
+  - { id: p1, engine: webkit, grid: [0, 0], title: "Panel 1" }
+  - { id: p2, engine: webkit, grid: [1, 0], title: "Panel 2" }
+  - { id: p3, engine: webkit, grid: [0, 1], title: "Panel 3" }
+  - { id: p4, engine: webkit, grid: [1, 1], title: "Panel 4" }
+
+tunnel: { enabled: false }
+vpn:    { enabled: false }
+proxy:  { enabled: false }

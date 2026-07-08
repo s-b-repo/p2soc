@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=SOC Wall
+Comment=Launch the security operations video wall
+Exec=/opt/soc-display/scripts/soc-wall-desktop.sh --fullscreen
+Icon=soc-wall
+Terminal=false
+Type=Application
+Categories=System;Utility;
+Keywords=soc;security;wall;kiosk;dashboard;

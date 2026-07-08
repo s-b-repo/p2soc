@@ -1,0 +1,25 @@
+# =============================================================================
+# DEV config for exercising the Fortinet VPN wiring without a real FortiGate.
+# Used by `make vpn-check`: forti-vpn-connect.py resolves the VPN creds from the
+# dev vault backend and prints the openfortivpn command it WOULD exec
+# (SOC_VPN_DRY_RUN=1) — no connection is attempted. The panels list is empty
+# because the connector only reads the `vpn:` section.
+# =============================================================================
+display: { auto: false, width: 1920, height: 1080, cols: 2, rows: 2 }
+panels: []
+
+vpn:
+  enabled: true
+  gateway: "vpn.example.net"
+  port: 10443
+  vault_item: "SOC Dev VPN"          # present in dev/run/dev-vault.json
+  trusted_cert: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+  realm: "soc"
+  set_routes: true
+  set_dns: false
+  half_internet_routes: true
+  persistent: 0
+  ready_probe: "127.0.0.1:9001"
+  health_check_interval: 60
+  health_check_failures: 3
+  extra_args: ["-v"]

@@ -1,0 +1,69 @@
+# =============================================================================
+# DEV panel configuration — points at the local dummy panels (dev/dummy-panels)
+# Used by `make dev` / `make verify` on the x86 workstation.
+# 4 panels on 127.0.0.1:9001-9004; p3 uses the chromium engine to exercise the
+# CDP fallback path; p2 is reached via a fake autossh tunnel on 127.0.0.1:19102.
+# =============================================================================
+
+display:
+  auto: true
+  width: 1920
+  height: 1080
+  cols: 2
+  rows: 2
+  gap: 0
+
+panels:
+  - id: p1
+    engine: webkit
+    grid: [0, 0]
+    mode: direct
+    url: "http://127.0.0.1:9001/login"
+    vault_item: "SOC Dev Panel 1"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+    keepalive: { strategy: reload, intervalSec: 30 }
+
+  - id: p2
+    engine: webkit
+    grid: [1, 0]
+    mode: tunnel
+    tunnel: { local_port: 19102, remote_host: 127.0.0.1, remote_port: 9002 }
+    path: "/login"
+    scheme: "http"
+    vault_item: "SOC Dev Panel 2"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+    keepalive: { strategy: xhr, url: "http://127.0.0.1:19102/api/ping", intervalSec: 20 }
+
+  - id: p3
+    engine: chromium
+    grid: [0, 1]
+    mode: direct
+    url: "http://127.0.0.1:9003/login"
+    vault_item: "SOC Dev Panel 3"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+    keepalive: { strategy: reload, intervalSec: 30 }
+
+  - id: p4
+    engine: webkit
+    grid: [1, 1]
+    mode: direct
+    url: "http://127.0.0.1:9004/login"      # this dummy panel renders a live chart
+    vault_item: "SOC Dev Panel 4"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+    keepalive: { strategy: reload, intervalSec: 30 }
+
+tunnel:
+  enabled: true
+  jump_host: "localhost"                     # fake jump = ssh to localhost
+  identity: "~/.ssh/id_ed25519"
+  extra_forwards: []
+
+# Fortinet VPN is off for the standard dev run (no FortiGate on the dev box).
+# To exercise the cred-resolution + command assembly without a gateway, use
+# config/panels.vpn-dev.yaml via `make vpn-check`.
+vpn:
+  enabled: false

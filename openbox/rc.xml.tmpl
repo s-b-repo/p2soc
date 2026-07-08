@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SOC video-wall Openbox config (TEMPLATE).
+     scripts/gen-openbox-rc.py replaces the SOC_APPS placeholder (inside
+     <applications> below) with one forced-placement application rule per panel
+     (matched by WM_CLASS soc-pN) and writes the result to ~/.config/openbox/rc.xml.
+
+     Design: no panel/taskbar, no root menu, single desktop, titlebars kept so
+     windows are draggable/movable, Alt+drag to move from anywhere. -->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+
+  <resistance>
+    <strength>10</strength>
+    <screen_edge_strength>20</screen_edge_strength>
+  </resistance>
+
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+    <focusLast>yes</focusLast>
+    <underMouse>no</underMouse>
+    <raiseOnFocus>no</raiseOnFocus>
+  </focus>
+
+  <placement>
+    <policy>Smart</policy>
+    <center>no</center>
+    <monitor>Primary</monitor>
+  </placement>
+
+  <theme>
+    <name>Clearlooks</name>
+    <titleLayout>LC</titleLayout>   <!-- label + close button; draggable label -->
+    <keepBorder>yes</keepBorder>
+    <animateIconify>no</animateIconify>
+    <font place="ActiveWindow">
+      <name>sans</name><size>9</size><weight>bold</weight><slant>normal</slant>
+    </font>
+    <font place="InactiveWindow">
+      <name>sans</name><size>9</size><weight>normal</weight><slant>normal</slant>
+    </font>
+  </theme>
+
+  <desktops>
+    <number>1</number>
+    <firstdesk>1</firstdesk>
+    <names><name>SOC</name></names>
+    <popupTime>0</popupTime>
+  </desktops>
+
+  <!-- No keyboard chrome we don't want; keep a safe close/recover shortcut. -->
+  <keyboard>
+    <!-- Alt+F4 closes focused window (useful if you need to interact). -->
+    <keybind key="A-F4"><action name="Close"/></keybind>
+    <!-- Super+Tab cycles windows in case one needs focus. -->
+    <keybind key="W-Tab"><action name="NextWindow"/></keybind>
+  </keyboard>
+
+  <mouse>
+    <dragThreshold>4</dragThreshold>
+    <doubleClickTime>200</doubleClickTime>
+    <screenEdgeWarpTime>0</screenEdgeWarpTime>
+
+    <!-- Drag a window by its titlebar. -->
+    <context name="Titlebar">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/><action name="Raise"/>
+      </mousebind>
+      <mousebind button="Left" action="Drag"><action name="Move"/></mousebind>
+      <mousebind button="Left" action="DoubleClick">
+        <action name="ToggleMaximize"/>
+      </mousebind>
+    </context>
+
+    <!-- Alt+Left drag moves a window from anywhere on it; Alt+Right resizes. -->
+    <context name="Frame">
+      <mousebind button="A-Left" action="Press">
+        <action name="Focus"/><action name="Raise"/>
+      </mousebind>
+      <mousebind button="A-Left" action="Drag"><action name="Move"/></mousebind>
+      <mousebind button="A-Right" action="Drag"><action name="Resize"/></mousebind>
+    </context>
+
+    <context name="Client">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/><action name="Raise"/>
+      </mousebind>
+    </context>
+
+    <!-- Edges/corners resize by dragging. -->
+    <context name="Top"><mousebind button="Left" action="Drag"><action name="Resize"><edge>top</edge></action></mousebind></context>
+    <context name="Bottom"><mousebind button="Left" action="Drag"><action name="Resize"><edge>bottom</edge></action></mousebind></context>
+    <context name="Left"><mousebind button="Left" action="Drag"><action name="Resize"><edge>left</edge></action></mousebind></context>
+    <context name="Right"><mousebind button="Left" action="Drag"><action name="Resize"><edge>right</edge></action></mousebind></context>
+    <context name="TLCorner"><mousebind button="Left" action="Drag"><action name="Resize"/></mousebind></context>
+    <context name="TRCorner"><mousebind button="Left" action="Drag"><action name="Resize"/></mousebind></context>
+    <context name="BLCorner"><mousebind button="Left" action="Drag"><action name="Resize"/></mousebind></context>
+    <context name="BRCorner"><mousebind button="Left" action="Drag"><action name="Resize"/></mousebind></context>
+
+    <!-- Desktop: NO root menu (right-click does nothing). -->
+    <context name="Desktop"></context>
+  </mouse>
+
+  <applications>
+    <!-- SOC_APPS -->
+  </applications>
+
+</openbox_config>
