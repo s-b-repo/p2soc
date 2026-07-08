@@ -2,29 +2,8 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-dist/
-.build/
-.venv/
-venv/
-*.egg
-
-# Dev / CI
-dev/run/
-*.log
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
 
 # Secrets
 *.env
 !*.env.example
-/dev-*.json
 secret/
