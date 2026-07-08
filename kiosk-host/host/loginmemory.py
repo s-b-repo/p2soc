@@ -72,10 +72,19 @@ def remember(url: str, vault_item: str):
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".dl-")
         try:
             os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            # os.fdopen takes ownership of fd and closes it on exit; once it
+            # returns, fd must not be closed again, so drop our reference.
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+            fd = -1
+            with fh:
                 json.dump(d, fh, indent=2, sort_keys=True)
             os.replace(tmp, path)
         except OSError:
+            if fd >= 0:  # fchmod/fdopen failed before fdopen took the fd
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 os.unlink(tmp)
             except OSError:

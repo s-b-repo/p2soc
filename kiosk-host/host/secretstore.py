@@ -200,3 +200,66 @@ def gen_pin(digits: int = 8) -> str:
     """A fresh, uniformly-random numeric PIN (no modulo bias)."""
     import secrets
     return "".join(secrets.choice("0123456789") for _ in range(max(4, digits)))
+
+
+# --------------------------------------------------------------------------- #
+# CLI — a pkexec helper so the GUI/TTY wizard can RE-SEAL the master into a
+# root-owned secret dir (e.g. /etc/soc-display/secret on a deployed box) without
+# being root itself. The master + PIN arrive over STDIN — NEVER argv — so the
+# master never appears on the process table, and nothing plaintext is ever written
+# (it goes straight into the AES-GCM seal). The PIN actually used is printed to
+# stdout so the caller can show the operator their one-time PIN.
+#
+#     printf '%s' "---MASTER---\n<master>\n---PIN---\n<pin>" \
+#         | pkexec python3 -m host.secretstore --seal --dir /etc/soc-display/secret
+#
+# (<pin> may be empty -> a fresh PIN is generated.)
+# --------------------------------------------------------------------------- #
+_SEAL_MARK = "---MASTER---\n"
+_PIN_MARK = "\n---PIN---\n"
+
+
+def _seal_from_stdin(secret_dir: str) -> int:
+    import sys
+    data = sys.stdin.read()
+    if not data.startswith(_SEAL_MARK) or _PIN_MARK not in data:
+        sys.stderr.write("secretstore --seal: malformed STDIN "
+                         "(want ---MASTER---/---PIN--- markers)\n")
+        return 2
+    body = data[len(_SEAL_MARK):]
+    master, pin = body.split(_PIN_MARK, 1)
+    if not master:
+        sys.stderr.write("secretstore --seal: empty master — nothing sealed\n")
+        return 2
+    pin = pin or gen_pin()
+    try:
+        seal(master, pin, secret_dir)
+        # Verify it round-trips on THIS host before we report success, so the
+        # caller never trusts a seal the wall can't later unseal.
+        if unseal(secret_dir) != master:
+            raise SecretStoreError("seal did not unseal to the same value")
+    except SecretStoreError as e:
+        sys.stderr.write(f"secretstore --seal: {e}\n")
+        return 1
+    sys.stdout.write(pin + "\n")   # the one-time PIN, for the caller to surface
+    return 0
+
+
+def _main(argv: "list[str]") -> int:
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="host.secretstore",
+        description="Seal the vault master host-bound (pkexec helper for the wizard).")
+    ap.add_argument("--seal", action="store_true",
+                    help="read ---MASTER---/---PIN--- from STDIN and seal into --dir")
+    ap.add_argument("--dir", help="secret dir to seal into (default $SOC_SECRET_DIR)")
+    args = ap.parse_args(argv)
+    if args.seal:
+        return _seal_from_stdin(secret_dir(args.dir))
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_main(sys.argv[1:]))

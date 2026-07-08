@@ -134,7 +134,8 @@ class DevFileBackend:
 
 
 def _make_backend():
-    name = os.environ.get("SOC_VAULT_BACKEND", "litebw").lower()
+    from . import config
+    name = os.environ.get("SOC_VAULT_BACKEND", config.DEFAULT_VAULT_BACKEND).lower()
     if name == "dev":
         return DevFileBackend()
     if name in ("litebw", "native"):
@@ -168,6 +169,19 @@ class Vault:
     def open(self):
         """Unlock + initial sync. Call once at startup."""
         self.backend.unlock()
+        self.backend.sync()
+        self._ready = True
+
+    def unlock_with(self, master: str):
+        """Open the session with an operator-supplied master (from the host's
+        themed Unlock dialog), then sync. The master stays in RAM only — never
+        written to a file. Raises VaultError on bad password / unreachable server
+        so the dialog can report which and re-prompt. Only the interactive
+        backend (litebw) implements unlock_with."""
+        fn = getattr(self.backend, "unlock_with", None)
+        if fn is None:
+            raise VaultError("this vault backend cannot be unlocked interactively")
+        fn(master)
         self.backend.sync()
         self._ready = True
 
@@ -230,7 +244,7 @@ class Vault:
     def prewarm(self, items, log=None) -> int:
         """Fetch creds for many items in parallel (off the GTK thread) so each
         panel's first login is served from cache instead of blocking the UI on
-        an rbw call. Per-item failures are logged, not raised."""
+        a vault call. Per-item failures are logged, not raised."""
         from concurrent.futures import ThreadPoolExecutor
         uniq = [i for i in dict.fromkeys(items) if i]
         if not uniq:
@@ -243,6 +257,15 @@ class Vault:
             except VaultError as e:
                 if log:
                     log(f"prewarm '{it}': {e}")
+                return False
+            except Exception as e:
+                # An unexpected (non-VaultError) backend exception — e.g. a bare
+                # ValueError/KeyError from a decrypt edge — must NOT escape
+                # ex.map and abort the whole prewarm. Log it (matching the
+                # VaultError branch) and skip just this one item; the docstring
+                # contract is "per-item failures are logged, not raised".
+                if log:
+                    log(f"prewarm '{it}': unexpected {type(e).__name__}: {e}")
                 return False
         with ThreadPoolExecutor(max_workers=min(4, len(uniq))) as ex:
             return sum(1 for r in ex.map(one, uniq) if r)
