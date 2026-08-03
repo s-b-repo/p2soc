@@ -1,0 +1,19 @@
+# Optional: configures the `pre-commit` framework (pip install pre-commit)
+# so contributors who prefer the framework get the same secrets-scrub as
+# the native .githooks/pre-commit hook.
+#
+# Setup:
+#     pip install pre-commit
+#     pre-commit install
+#
+# (Or skip the framework entirely and use the native hook:
+#     git config core.hooksPath .githooks)
+repos:
+  - repo: local
+    hooks:
+      - id: soc-secrets-scrub
+        name: SOC secrets-scrub
+        language: system
+        entry: .githooks/pre-commit
+        always_run: true
+        pass_filenames: false

@@ -1,0 +1,50 @@
+# Test panel config for the window-manager rule generators (gen-labwc-rc.py /
+# gen-openbox-rc.py). 4 panels in a 2x2 grid; display.auto: true exercises the
+# --if-auto override path. Geometry only — these URLs are never fetched.
+display:
+  auto: true
+  width: 1920
+  height: 1080
+  cols: 2
+  rows: 2
+  gap: 0
+
+panels:
+  - id: p1
+    engine: webkit
+    grid: [0, 0]
+    mode: direct
+    url: "http://127.0.0.1:9001/login"
+    vault_item: "Test Panel 1"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+
+  - id: p2
+    engine: webkit
+    grid: [1, 0]
+    mode: direct
+    url: "http://127.0.0.1:9002/login"
+    vault_item: "Test Panel 2"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+
+  - id: p3
+    engine: webkit
+    grid: [0, 1]
+    mode: direct
+    url: "http://127.0.0.1:9003/login"
+    vault_item: "Test Panel 3"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+
+  - id: p4
+    engine: webkit
+    grid: [1, 1]
+    mode: direct
+    url: "http://127.0.0.1:9004/login"
+    vault_item: "Test Panel 4"
+    selectors: { user: "#username", pass: "#password", submit: "button[type=submit]" }
+    login_marker: "#password"
+
+vpn:
+  enabled: false
