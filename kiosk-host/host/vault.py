@@ -34,6 +34,37 @@ class VaultError(Exception):
     pass
 
 
+def _tcp_reachable(url: str, timeout: float = 1.5) -> bool:
+    """Cheap pre-flight: is something listening at `url`'s host:port? Lets unlock
+    say 'Vaultwarden is not listening' instead of letting rbw produce an opaque
+    'connection refused' that obscures the cause."""
+    import socket
+    import urllib.parse
+    try:
+        u = urllib.parse.urlparse(url)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 8222)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def require_notes(notes: str, item: str, purpose: str = "") -> str:
+    """Return `notes`, or raise if it is blank — for callers that depend on the
+    Notes field actually carrying content (e.g. an openvpn/wireguard config from
+    the vault), where an empty config would otherwise fail downstream with a
+    parser error that never mentions the vault. `purpose` tells the operator which
+    feature is broken."""
+    if not (notes or "").strip():
+        what = f" for {purpose}" if purpose else ""
+        raise VaultError(
+            f"vault item '{item}' has an empty Notes field{what} — paste the "
+            f".ovpn / .conf content into the Notes section of that item in "
+            f"Vaultwarden (web UI or the Credentials tab).")
+    return notes
+
+
 # --------------------------------------------------------------------------- #
 # Backends
 # --------------------------------------------------------------------------- #
@@ -69,6 +100,21 @@ class RbwBackend:
             self._rbw("config", "set", "pinentry", self.pinentry, check=False)
 
     def unlock(self):
+        # Bail early with an actionable error instead of letting rbw fail with
+        # "invalid email" (when SOC_VAULT_EMAIL is empty) or "connection refused"
+        # (when Vaultwarden is not listening).
+        if not self.email:
+            raise VaultError(
+                "SOC_VAULT_EMAIL is empty — the wall cannot unlock the vault. "
+                "Run 'sudo python3 setup.py wizard' (sets the email) followed "
+                "by 'sudo python3 setup.py first-run' (seals the master + "
+                "registers the Vaultwarden account).")
+        if self.url and not _tcp_reachable(self.url):
+            raise VaultError(
+                f"Vaultwarden at {self.url} is not reachable — check "
+                f"'systemctl status vaultwarden' (the wall needs the vault to "
+                f"start, even with blank tiles, so the GUI can read/write "
+                f"credentials at the glass).")
         self.configure()
         if self.interactive:
             # operator unlocks manually after boot; just make sure agent is up.
@@ -95,6 +141,32 @@ class RbwBackend:
             return out
         # secure-note items return the note as the main value
         return self._rbw("get", item, check=False)
+
+    def notes_required(self, item: str, purpose: str = "") -> str:
+        return require_notes(self.notes(item), item, purpose)
+
+    def delete(self, item: str) -> bool:
+        """Delete a vault item via `rbw remove`. True on success; False otherwise,
+        including when the item is already gone."""
+        try:
+            self._rbw("remove", item)
+        except VaultError:
+            return False
+        return True
+
+    def list_by_folder(self, folder: str) -> list:
+        """Names of every item in the named folder. [] if it is empty, does not
+        exist, or rbw fails. Uncached on purpose: the GUI calls it on demand."""
+        try:
+            out = self._rbw("list", "--fields", "name,folder")
+        except VaultError:
+            return []
+        names = []
+        for line in out.splitlines():
+            name, _, in_folder = line.partition("\t")
+            if in_folder.strip() == folder and name.strip():
+                names.append(name.strip())
+        return names
 
 
 class DevFileBackend:
@@ -131,6 +203,23 @@ class DevFileBackend:
     def notes(self, item: str) -> str:
         rec = self._load().get(item) or {}
         return rec.get("notes", "")
+
+    def notes_required(self, item: str, purpose: str = "") -> str:
+        return require_notes(self.notes(item), item, purpose)
+
+    def delete(self, item: str) -> bool:
+        data = self._load()
+        if data.pop(item, None) is None:
+            return False
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, self.path)
+        return True
+
+    def list_by_folder(self, folder: str) -> list:
+        return [name for name, rec in self._load().items()
+                if (rec or {}).get("folder") == folder]
 
 
 def _make_backend():
@@ -284,3 +373,28 @@ class Vault:
                 self._cache.clear()
                 self._lastgood.clear()
                 self._stale_logged.clear()
+
+    def delete(self, item: str) -> bool:
+        """Delete a vault item and drop every cached copy of it. Returns True on
+        success; logs + returns False if the backend reports failure or raises (so
+        callers can show a single 'delete failed' toast rather than a stack trace
+        at the glass)."""
+        try:
+            ok = bool(self.backend.delete(item))
+        except Exception as e:  # noqa: BLE001 — never crash the GUI on delete
+            import logging
+            logging.warning("vault.delete(%r) failed: %s", item, e)
+            return False
+        if ok:
+            self.invalidate(item)
+        return ok
+
+    def list_by_folder(self, folder: str) -> list:
+        """Names of every item in the named folder. Empty list on failure /
+        unknown folder so the GUI can render an empty group."""
+        try:
+            return list(self.backend.list_by_folder(folder))
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.warning("vault.list_by_folder(%r) failed: %s", folder, e)
+            return []

@@ -59,6 +59,8 @@ DEFAULT_KEEPALIVE_MAX_MISS = 5    # offline after N unanswered heartbeats
 MAX_HEADER_BYTES = 64 * 1024          # response header block cap
 MAX_BODY_BYTES = 16 * 1024 * 1024     # Content-Length / total body cap
 MAX_CHUNKS = 100_000                  # chunk-count cap for chunked decoding
+MAX_EARLY_BYTES = 4 * 1024 * 1024     # cap on early frames retained before netconfig (DoS guard)
+MAX_TRAILER_LINES = 100               # trailer-line cap after final 0-size chunk
 
 # Frame types (uint8 ``type`` / ``subtype``)
 FRAME_DATA = 1            # sub 0 : raw IP packet payload  -> TUN

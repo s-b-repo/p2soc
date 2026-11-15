@@ -34,7 +34,17 @@
 set -u
 # Don't `set -e` — we want graceful fallbacks on every probe.
 
-SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locate: parent of this scripts/ dir (works from any checkout).
+# SOC_ROOT overrides; /opt/soc-display is the deployed default.
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+CHECKOUT="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
+if [ -d "$CHECKOUT/kiosk-host" ]; then
+  SOC_ROOT="$CHECKOUT"
+else
+  SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
+fi
+[ -d "$SOC_ROOT/kiosk-host" ] || { echo "wall-windowed.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
+
 SOC_ETC="${SOC_ETC:-/etc/soc-display}"
 SOC_ENV_FILE="${SOC_ENV_FILE:-$SOC_ETC/soc.env}"
 

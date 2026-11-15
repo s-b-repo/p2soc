@@ -31,7 +31,16 @@ import sys
 
 from host import branding
 
-ROOT = os.environ.get("SOC_ROOT", "/opt/soc-display")
+def _resolve_root() -> str:
+    """Self-locate the install root.  $SOC_ROOT wins; else parent of kiosk-host/."""
+    r = os.environ.get("SOC_ROOT")
+    if r:
+        return os.path.abspath(r)
+    # Self-locate from this file: …/kiosk-host/host/launchermenu.py -> root is 3 dirs up
+    here = os.path.abspath(os.path.dirname(__file__))
+    return os.path.abspath(os.path.join(here, "..", ".."))
+
+ROOT = _resolve_root()
 
 
 def _script(name: str) -> str:
@@ -335,7 +344,16 @@ def _css(colors=None) -> bytes:
 
     `colors` (an explicit palette dict) lets the in-launcher Appearance editor preview
     an UNSAVED palette WITHOUT mutating branding's process-wide cache; default-None
-    keeps every other caller reading the persisted theme."""
+    keeps every other caller reading the persisted theme.
+
+    Cross-process detection: checks branding._marker_mtime() against last seen; if the
+    setup wizard saved a new theme, the cache is refreshed so the control center
+    repaints WITHOUT a restart."""
+    # Check for cross-process theme changes (setup wizard saves -> marker touched)
+    mt = branding._marker_mtime()
+    if mt > branding._marker_mtime_val:
+        branding._marker_mtime_val = mt
+        branding.load(refresh=True)
     c = colors if colors is not None else branding.load().get("colors", {})
 
     def col(k, d):

@@ -9,7 +9,7 @@ password is incorrect'`` that an absent account produces at login.
 It REUSES ``vaultseed``'s crypto primitives (``_enc`` / ``_hkdf_expand`` /
 ``_b64`` and the same master-key / master-hash KDF flow) so there is no second
 crypto implementation to drift. The only pieces unique to registration are the
-RSA-2048 keypair and the ``/api/accounts/register`` POST.
+RSA-2048 keypair and the registration POST (see REGISTER_ENDPOINTS).
 
 The master password is an in-memory argument only — it is NEVER written to a
 file, never placed in argv, never logged.
@@ -27,7 +27,9 @@ Error model (so the GUI can give an actionable message instead of a guess):
 """
 from __future__ import annotations
 
+import json
 import urllib.error
+import urllib.request
 
 from host import vaultseed
 from host.vaultseed import VaultSeedError, _b64, _enc, _hkdf_expand, _req
@@ -44,6 +46,33 @@ class SignupsDisabledError(VaultSeedError):
 
 class WrongMasterError(VaultSeedError):
     """The account exists but the supplied master password does not unlock it."""
+
+
+# Newest first. Current Vaultwarden registers in two steps: ask for a token, then
+# finish with it. The other two endpoints are for servers that predate that. A 404
+# means "not this version", so try the next.
+VERIFY_ENDPOINT = "/identity/accounts/register/send-verification-email"
+REGISTER_ENDPOINTS = ("/identity/accounts/register/finish",
+                      "/api/accounts/register",
+                      "/identity/accounts/register")
+
+
+def _verification_token(base: str, email: str, name: str) -> str:
+    """Step one of a modern registration. With no mail server configured, the token
+    comes straight back, as raw text rather than JSON. Returns '' on a server too
+    old to have this step, which then registers with the older endpoints."""
+    req = urllib.request.Request(
+        base + VERIFY_ENDPOINT, method="POST",
+        data=json.dumps({"email": email, "name": name}).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:  # noqa: S310 - operator's vault URL
+            return r.read(4096).decode("utf-8", "replace").strip().strip('"')
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return ""
+        raise VaultSeedError(f"POST {base + VERIFY_ENDPOINT} -> HTTP {e.code}: "
+                             f"{e.read(512).decode('utf-8', 'replace')}")
 
 
 def _rsa_keypair(sym_key: bytes):
@@ -78,7 +107,8 @@ def _looks_like(body: str, *needles: str) -> bool:
 
 
 def register_account(url: str, email: str, master: str,
-                     name: str = "SOC Kiosk") -> str:
+                     name: str = "SOC Kiosk",
+                     kdf_iterations: int = KDF_ITERS) -> str:
     """Register a Bitwarden/Vaultwarden account. Returns ``'created'`` on success
     or ``'exists'`` if the server reports the account already exists.
 
@@ -103,7 +133,8 @@ def register_account(url: str, email: str, master: str,
 
     # Same KDF flow as vaultseed.Session.__init__ (PBKDF2-SHA256), registering at
     # Vaultwarden's default iteration count.
-    master_key = hashlib.pbkdf2_hmac("sha256", pw, email.encode(), KDF_ITERS, 32)
+    master_key = hashlib.pbkdf2_hmac("sha256", pw, email.encode(),
+                                     kdf_iterations, 32)
     master_hash = _b64(hashlib.pbkdf2_hmac("sha256", master_key, pw, 1, 32))
     senc = _hkdf_expand(master_key, b"enc")
     smac = _hkdf_expand(master_key, b"mac")
@@ -119,42 +150,56 @@ def register_account(url: str, email: str, master: str,
         "masterPasswordHint": None,
         "key": protected_key,
         "kdf": 0,                                  # 0 = PBKDF2_SHA256
-        "kdfIterations": KDF_ITERS,
+        "kdfIterations": kdf_iterations,
         "keys": {"publicKey": pub_b64, "encryptedPrivateKey": enc_priv},
     }
 
     last_err = None
-    for ep in ("/api/accounts/register", "/identity/accounts/register"):
-        try:
-            _req(base + ep, data=body, method="POST")
-            return "created"
-        except VaultSeedError as e:
-            # _req flattens HTTPError into a VaultSeedError whose message carries
-            # the status + body. Classify on that text (no second request).
-            msg = str(e)
-            if _looks_like(msg, "already", "exists", "in use"):
-                return "exists"
-            if _looks_like(msg, "signups", "registration", "not allowed",
-                           "disabled", "whitelist", "blacklisted"):
-                raise SignupsDisabledError(
-                    "Vaultwarden is refusing signups — enable SIGNUPS_ALLOWED "
-                    "(or whitelist this email domain) on the server, or create "
-                    f"the account in the web vault. Server said: {msg}")
-            last_err = e
-        except urllib.error.URLError as e:  # pragma: no cover - transport
-            raise VaultSeedError(f"could not reach Vaultwarden at {base}: {e}")
+    try:
+        token = _verification_token(base, email, name)
+        if token:
+            body["emailVerificationToken"] = token
+        for ep in (REGISTER_ENDPOINTS[:1] if token else REGISTER_ENDPOINTS[1:]):
+            try:
+                _req(base + ep, data=body, method="POST")
+                return "created"
+            except VaultSeedError as e:
+                if "HTTP 404" not in str(e):
+                    raise
+                last_err = e
+    except VaultSeedError as e:
+        # _req flattens HTTPError into a VaultSeedError whose message carries the
+        # status + body. Classify on that text (no second request).
+        msg = str(e)
+        # Vaultwarden gives one answer for two cases: "Registration not allowed or
+        # user already exists". So "not allowed" must be checked first, and
+        # ensure_account() tells the two apart by trying a login.
+        if _looks_like(msg, "signups", "not allowed", "disabled", "whitelist",
+                       "blacklisted"):
+            raise SignupsDisabledError(
+                "Vaultwarden is refusing this registration: signups are off (enable "
+                "SIGNUPS_ALLOWED, or whitelist this email domain), or the account "
+                f"already exists. Server said: {msg}")
+        if _looks_like(msg, "already", "exists", "in use"):
+            return "exists"
+        raise
+    except urllib.error.URLError as e:  # pragma: no cover - transport
+        raise VaultSeedError(f"could not reach Vaultwarden at {base}: {e}")
     raise last_err or VaultSeedError(f"registration failed at {base}")
 
 
-def account_exists(url: str, email: str) -> bool:
+def account_exists(url: str, email: str, master: str = "") -> bool:
     """Best-effort probe: does an account for ``email`` exist?
 
-    Vaultwarden's ``/identity/accounts/prelogin`` returns KDF parameters for any
+    Given ``master`` this is a real login attempt (vaultseed.account_exists).
+    Without it, Vaultwarden's ``/identity/accounts/prelogin`` returns KDF parameters for any
     email (defaults for unknown ones), so it can't authoritatively answer. The
     authoritative check is a register attempt (``'exists'`` vs ``'created'``);
     callers that must not create should prefer ``ensure_account``. This helper
     exists for the GUI's failure-branch heuristic only and returns False when it
     cannot tell."""
+    if master:
+        return vaultseed.account_exists(url, email, master)
     base = url.rstrip("/")
     try:
         _req(base + "/identity/accounts/prelogin",
@@ -176,20 +221,20 @@ def ensure_account(url: str, email: str, master: str,
     or ``SignupsDisabledError`` / ``VaultSeedError`` per ``register_account``.
 
     The master is an in-memory argument; nothing is written to disk."""
-    result = register_account(url, email, master, name=name)
-    if result == "created":
-        return "created"
-    # 'exists' — verify the supplied master actually unlocks it. A successful
-    # ReadSession login (prelogin -> token -> decrypt) is the authoritative check.
+    # A login first: it is the one thing that proves the account exists AND that
+    # this master opens it. Registration can't tell us, since the server refuses
+    # "signups off" and "already exists" with the same message.
     from host import litebw  # lazy: avoids importing litebw on the register path
     try:
         litebw.ReadSession(url, email, master).list_ciphers()
-    except VaultSeedError as e:
-        raise WrongMasterError(
-            f"an account for {email} already exists but the master password is "
-            f"incorrect — enter the existing master (or reset it in the web "
-            f"vault). Vault said: {e}")
-    return "exists"
+        return "exists"
+    except VaultSeedError:
+        pass
+    if register_account(url, email, master, name=name) == "created":
+        return "created"
+    raise WrongMasterError(
+        f"an account for {email} already exists but the master password is "
+        f"incorrect — enter the existing master (or reset it in the web vault).")
 
 
 def available() -> bool:

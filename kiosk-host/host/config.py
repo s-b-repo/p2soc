@@ -84,9 +84,13 @@ VALID_ENGINES = {"webkit", "chromium"}
 VALID_MODES = {"direct", "tunnel"}
 VALID_LAYOUTS = {"auto", "windows", "single"}
 VALID_KEEPALIVE = {"reload", "click", "xhr", "none"}
-VALID_SCHEMES = {"http", "https"}
+VALID_URL_SCHEMES = ("http", "https")
+VALID_SCHEMES = set(VALID_URL_SCHEMES)
 VALID_PROXY_SCHEMES = {"http", "https", "socks", "socks4", "socks5"}
 VALID_VPN_TYPES = {"fortinet", "openvpn", "wireguard", "inode"}
+# ssh StrictHostKeyChecking values an operator may select (SEC-6). 'no' is
+# deliberately absent; see host_key_checking().
+VALID_HOST_KEY_CHECKING = ("yes", "accept-new")
 
 # An upper bound on concurrently-supervised VPNs. N supervisors = N vault
 # unseals + HTTPS syncs at boot on a 1 GB Pi; 8 is a generous-but-sane cap that
@@ -98,11 +102,23 @@ MAX_VPNS = 8
 # instance / journald grep cannot be tripped by spaces/slashes/control chars.
 _VPN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+# A panel id is substituted verbatim into Openbox/labwc rc.xml (as a window
+# wm-class / title) by the WM-config generators, so keep it to characters that
+# cannot break out of an XML attribute. \Z, not $: '$' also matches before a
+# trailing newline, which would let "p1\n" through.
+_PANEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
+
+# Same bound the on-screen config has always applied to the field.
+MAX_TENANT_LEN = 100
+
 _TOP_KEYS = {"display", "panels", "tunnel", "vpn", "vpns", "proxy", "security"}
-_DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout"}
+_DISPLAY_KEYS = {"auto", "width", "height", "cols", "rows", "gap", "layout",
+                 "fullscreen"}
+_LOGIN_ZONE_KEYS = {"x_pct", "y_pct"}
+_LOGIN_ZONES_KEYS = {"user", "pass", "submit"}
 _PANEL_KEYS = {"id", "engine", "grid", "mode", "url", "tunnel", "path", "scheme",
                "vault_item", "selectors", "login_marker", "keepalive", "proxy",
-               "title", "allow_insecure", "allow_media",
+               "title", "allow_insecure", "allow_media", "tenant", "login_zones",
                # renderer security/compat knobs (all optional, safe defaults):
                "persist", "user_agent", "allow", "block_trackers", "unblock",
                "insecure_tls"}
@@ -110,7 +126,8 @@ _SECURITY_KEYS = {"nav_allowlist", "allow", "block_trackers", "sso_allow"}
 _PROXY_KEYS = {"enabled", "url", "vault_item", "ignore_hosts"}
 _TUNNEL_PANEL_KEYS = {"local_port", "remote_host", "remote_port"}
 _KEEPALIVE_KEYS = {"strategy", "intervalSec", "url", "target"}
-_TUNNEL_KEYS = {"enabled", "jump_host", "identity", "extra_forwards"}
+_TUNNEL_KEYS = {"enabled", "jump_host", "identity", "extra_forwards",
+                "host_key_checking", "known_hosts"}
 _VPN_KEYS = {"name", "default_route",
              "enabled", "type", "config", "config_from_vault", "gateway", "port",
              "vault_item", "trusted_cert", "ca_file", "realm", "set_routes",
@@ -121,6 +138,229 @@ _VPN_KEYS = {"name", "default_route",
              "ead", "spa_key", "spa_aid", "spa_ports", "spa_knock_port",
              "split_tunnel", "client_cert", "client_key",
              "captcha_retries", "mac", "language"}
+
+# Free-text VPN values that end up as their own argv token (or flag value), and
+# so get the _safe_word treatment both at load and at connect time.
+_VPN_ARGV_WORDS = ("realm", "domain", "trusted_cert", "ca_file", "client_cert",
+                   "client_key", "mac", "language", "spa_key", "spa_aid",
+                   "spa_ports")
+
+
+# --------------------------------------------------------------------------- #
+# Input guards. These are the single implementation shared by load-time
+# validation, the VPN/tunnel argv builders and scripts/tunnel-args.py. The
+# _safe_* family raises ValueError; the argv builders must re-check because a
+# config_from_vault overlay can change a VPN entry after validation has run.
+# --------------------------------------------------------------------------- #
+def _has_ctrl(s: str) -> bool:
+    """True if s holds a control char (incl. \\n / \\r / \\t / NUL / DEL)."""
+    return any(ord(c) < 0x20 or ord(c) == 0x7f for c in s)
+
+
+def _has_ctrl_or_space(s: str) -> bool:
+    """True if s holds a control char or any whitespace. These enable argv
+    smuggling, request splitting and log injection."""
+    return _has_ctrl(s) or any(c.isspace() for c in s)
+
+
+def valid_http_url(url, *, allow_empty: bool = True) -> bool:
+    """RFC 3986-aware check for a panel URL. Stricter than a `startswith` scheme
+    test: it parses the URL, requires an http/https scheme, a real host and a
+    well-formed port, and rejects embedded credentials (`user:pass@host`, a
+    confusion/leak vector) and any control or whitespace character (RFC 3986
+    forbids them; they enable scheme-smuggling like `http://x\\njavascript:...`
+    and request splitting). Empty is accepted only when `allow_empty` (an
+    unconfigured tile)."""
+    if url is None:
+        return allow_empty
+    s = str(url).strip()
+    if s == "":
+        return allow_empty
+    if _has_ctrl_or_space(s):
+        return False
+    try:
+        parts = urlsplit(s)
+        parts.port                  # raises ValueError on a bad/out-of-range port
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in VALID_URL_SCHEMES or not parts.hostname:
+        return False
+    return "@" not in parts.netloc  # no userinfo (user:pass@host)
+
+
+def _url_for_msg(url) -> str:
+    """repr(url) with any userinfo masked. ConfigError text reaches the journal
+    and the on-screen error card, so a rejected `user:pass@host` URL must not
+    leak the password it was rejected for."""
+    return repr(re.sub(r"[^/?#]*@", "***@", str(url), count=1))
+
+
+def _safe_host(v, what: str = "host") -> str:
+    """Validate a hostname/IP destined for a VPN/tunnel argv slot and return it
+    stripped. Rejects values that are empty, carry whitespace/control chars, or
+    begin with '-' (which a downstream binary would parse as an OPTION, not a
+    host: classic argv option-injection). Raises ValueError on bad input."""
+    s = str(v if v is not None else "").strip()
+    if not s:
+        raise ValueError(f"{what} is empty")
+    if _has_ctrl_or_space(s):
+        raise ValueError(f"{what} {s!r} contains whitespace/control characters")
+    if s.startswith("-"):
+        raise ValueError(f"{what} {s!r} may not begin with '-' (option injection)")
+    return s
+
+
+def _safe_port(v, what: str = "port") -> int:
+    """Validate an int (or digit-string) port in 1..65535. Raises ValueError."""
+    if isinstance(v, (bool, float)):        # int() would silently coerce these
+        raise ValueError(f"{what} {v!r} is not an integer")
+    try:
+        p = int(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what} {v!r} is not an integer")
+    if not (0 < p < 65536):
+        raise ValueError(f"{what} {p} is out of range 1..65535")
+    return p
+
+
+def _safe_word(v, what: str) -> str:
+    """Validate a free-text argv token (realm / path / key). Rejects newlines
+    (log/arg injection) and a leading '-' (option injection). Returns it
+    stripped. The value is not echoed: some of these (spa_key) are sensitive.
+    Raises ValueError on bad input."""
+    s = str(v if v is not None else "")
+    if "\n" in s or "\r" in s:
+        raise ValueError(f"{what} must not contain newlines")
+    s = s.strip()
+    if s.startswith("-"):
+        raise ValueError(f"{what} may not begin with '-' (option injection)")
+    return s
+
+
+def _safe_extra_args(v) -> list:
+    """Validate the pass-through `extra_args` list. extra_args is operator-trusted
+    (it lives in the same config file as the gateway), so a leading '-' is NOT
+    rejected: those are legitimate flags ('-v', '--trace'). Items carrying
+    newlines/NUL/control characters can never be a valid single argv token and
+    would smuggle extra lines into logs, so they raise ValueError, as does a
+    non-list (a bare string would otherwise be split into characters)."""
+    if v is None or v == "":
+        return []
+    if not isinstance(v, (list, tuple)):
+        raise ValueError(f"extra_args must be a list, got {type(v).__name__}")
+    out = []
+    for i, a in enumerate(v):
+        s = str(a)
+        if _has_ctrl(s):
+            raise ValueError(f"extra_args item #{i + 1} contains control characters")
+        out.append(s)
+    return out
+
+
+def _host_port(host: str, port: int) -> str:
+    """Format 'host:port', bracketing a bare IPv6 literal per RFC 3986 so that
+    'fd00::1' becomes '[fd00::1]:443' rather than an ambiguous 'fd00::1:443'.
+    Already-bracketed hosts are left as-is.
+
+    IPv6 is detected by >= 2 colons, which every literal has. A single colon
+    means 'hostname:port', which must NOT be bracketed; _split_host_port removes
+    such a port before a value ever gets here."""
+    if host.startswith("["):
+        return f"{host}:{port}"
+    if host.count(":") >= 2:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+def _split_host_port(value: str, default_port: int):
+    """Accept the operator-natural gateway shapes and return (host, port):
+       'gw.example'        -> ('gw.example', default_port)
+       'gw.example:443'    -> ('gw.example', 443)
+       'fd00::1'           -> ('fd00::1', default_port)      # bare IPv6
+       '[fd00::1]'         -> ('fd00::1', default_port)
+       '[fd00::1]:443'     -> ('fd00::1', 443)
+       'fd00::1:443'       -> ('fd00::1:443', default_port)  # ambiguous: IPv6
+    An embedded port wins over default_port. Raises ValueError on malformed
+    input ('host:', '[::1', '[::1]x') or a bad port."""
+    s = str(value if value is not None else "").strip()
+    if not s:
+        raise ValueError("host is empty")
+    if s.startswith("["):
+        host, sep, rest = s[1:].partition("]")
+        if not sep or (rest and not rest.startswith(":")):
+            raise ValueError(f"malformed bracketed host {s!r}")
+        has_port, port = bool(rest), rest[1:]
+    elif s.count(":") == 1:             # 'host:port': a single colon is never IPv6
+        host, _, port = s.partition(":")
+        has_port = True
+    else:                               # bare IPv6 (>= 2 colons) or a plain name
+        host, port, has_port = s, "", False
+    if not has_port:
+        return host, _safe_port(default_port, "default port")
+    if not port:
+        raise ValueError(f"{s!r} has a ':' but no port")
+    return host, _safe_port(port, "embedded port")
+
+
+def _gateway_hostport(vpn: dict) -> str:
+    """The canonical, bracketed 'host:port' for vpn.gateway + vpn.port (default
+    443). Shared by the Fortinet and iNode argv builders."""
+    host, port = _split_host_port(vpn.get("gateway"), vpn.get("port", 443) or 443)
+    return _host_port(_safe_host(host, "vpn.gateway"), port)
+
+
+def _safe_remote_host(v) -> str:
+    """Validate a panel's tunnel.remote_host. On top of _safe_host, a single ':'
+    means the operator wrote 'host:port' here instead of using remote_port; that
+    builds a forward ssh rejects, which autossh would then retry forever."""
+    s = _safe_host(v, "tunnel.remote_host")
+    if s.count(":") == 1:
+        raise ValueError(f"tunnel.remote_host {s!r} has an embedded ':port' "
+                         f"(use a separate remote_port)")
+    return s
+
+
+def panel_forward(tn: dict) -> str:
+    """The `ssh -L` spec for one mode: tunnel panel. Raises ValueError on a
+    missing or malformed field."""
+    tn = tn or {}
+    lp = _safe_port(tn.get("local_port"), "tunnel.local_port")
+    rp = _safe_port(tn.get("remote_port"), "tunnel.remote_port")
+    return f"127.0.0.1:{lp}:{_host_port(_safe_remote_host(tn.get('remote_host')), rp)}"
+
+
+# One host field of an `ssh -L` spec: a bracketed IPv6 literal, or a name/IPv4.
+# ssh needs the brackets, so a bare IPv6 here is rejected rather than mis-split.
+_FWD_HOST = r"(?:\[[0-9A-Za-z:.%_-]+\]|[A-Za-z0-9_.][A-Za-z0-9_.-]*)"
+_FORWARD_RE = re.compile(rf"(?:{_FWD_HOST}:)?([0-9]+):{_FWD_HOST}:([0-9]+)")
+
+
+def _safe_forward(entry) -> str:
+    """Vet one tunnel.extra_forwards entry, returning it unchanged. It is spliced
+    straight into ssh's -L argument, so it MUST be a plain [bindaddr:]port:host:
+    port spec: never an option-looking token ('-D 1080') or anything with
+    whitespace, which could smuggle in a second option. Raises ValueError."""
+    s = str(entry if entry is not None else "")
+    if _has_ctrl_or_space(s):
+        raise ValueError(f"extra_forward contains whitespace/control characters: "
+                         f"{entry!r}")
+    m = _FORWARD_RE.fullmatch(s)
+    if not m:
+        raise ValueError(f"extra_forward must be [bindaddr:]port:host:port, "
+                         f"got {entry!r}")
+    for port in m.groups():
+        _safe_port(port, "extra_forward port")
+    return s
+
+
+def host_key_checking(tunnel: dict) -> str:
+    """The effective ssh StrictHostKeyChecking mode for the `tunnel:` section
+    (SEC-6). Default is strict 'yes': a MITM at first connect must not be able
+    to intercept the tunnel carrying the SOC dashboards and their logins.
+    'accept-new' (TOFU) is an explicit opt-in. Anything else, including a typo,
+    'no', or an unquoted YAML boolean, fails closed to 'yes'."""
+    v = str((tunnel or {}).get("host_key_checking", "yes")).strip().lower()
+    return v if v in VALID_HOST_KEY_CHECKING else "yes"
 
 
 @dataclass
@@ -160,6 +400,7 @@ class Panel:
                                     # `insecure_tls:` in YAML is an accepted alias.
     allow_media: bool = False       # keep WebGL/WebAudio/<video> (off by default
                                     # to save RAM/GPU on 1 GB boards)
+    tenant: str = ""                # optional tenant tag (multi-tenant grouping)
     # --- renderer security / compat knobs (consumed by webkit_panel/chromium_panel) ---
     persist: bool = True            # persist cookies + web storage on disk so a
                                     # session survives reload + wall restart
@@ -169,6 +410,12 @@ class Panel:
                                     # (wildcard '*.example.com' ok)
     block_trackers: bool = True     # apply the analytics/tracker blocklist
     unblock: tuple = ()             # tracker hosts this panel may load anyway
+    # Click-zone fallback for auto-login: when the CSS selectors and the
+    # text-pattern heuristic both fail, the injected JS falls back to
+    # document.elementFromPoint(x_pct * vw, y_pct * vh). Captured by the on-screen
+    # Calibrate mode; ratios survive a wall resize. Schema: optional "user",
+    # "pass", "submit" keys, each {"x_pct": 0.0..1.0, "y_pct": 0.0..1.0}.
+    login_zones: dict = field(default_factory=dict)
     geometry: Optional[Geometry] = None
 
     @property
@@ -240,6 +487,8 @@ class DisplayCfg:
     rows: int = 2
     gap: int = 0
     layout: str = "auto"            # auto | windows | single
+    fullscreen: bool = True         # false -> windowed (lives on the desktop);
+                                    # env SOC_WINDOWED=1 also forces windowed
 
 
 @dataclass
@@ -295,13 +544,13 @@ def openfortivpn_args(vpn: dict) -> list:
     gateway = vpn.get("gateway")
     if not gateway:
         return []
-    args = [f"{gateway}:{int(vpn.get('port', 443))}"]
+    args = [_gateway_hostport(vpn)]
     if vpn.get("trusted_cert"):
         args.append(f"--trusted-cert={vpn['trusted_cert']}")
     if vpn.get("ca_file"):
         args.append(f"--ca-file={vpn['ca_file']}")
     if vpn.get("realm"):
-        args.append(f"--realm={vpn['realm']}")
+        args.append(f"--realm={_safe_word(vpn['realm'], 'vpn.realm')}")
     # Routing / DNS: emit explicit 0/1 so the gateway can't silently change them.
     if "set_routes" in vpn:
         args.append(f"--set-routes={1 if vpn['set_routes'] else 0}")
@@ -316,7 +565,7 @@ def openfortivpn_args(vpn: dict) -> list:
     persistent = int(vpn.get("persistent", 0) or 0)
     if persistent > 0:
         args.append(f"--persistent={persistent}")
-    args += [str(a) for a in (vpn.get("extra_args") or [])]
+    args += _safe_extra_args(vpn.get("extra_args"))
     return args
 
 
@@ -349,7 +598,7 @@ def openvpn_args(vpn: dict) -> list:
     # routing/DNS hints map onto OpenVPN where they have an equivalent
     if vpn.get("set_routes") is False:
         args += ["--route-nopull"]            # ignore server-pushed routes
-    args += [str(a) for a in (vpn.get("extra_args") or [])]
+    args += _safe_extra_args(vpn.get("extra_args"))
     return args
 
 
@@ -360,11 +609,13 @@ def wireguard_target(vpn: dict) -> str:
 
 
 def inode_gateway(vpn: dict) -> str:
-    """'host:port' for the H3C iNode SSL-VPN gateway (default port 443). '' when
-    no gateway is configured."""
+    """'host:port' for the H3C iNode SSL-VPN gateway (default port 443), with an
+    IPv6 host bracketed. '' when no gateway is configured. vpn.gateway may carry
+    its own port ('gw.example:8443', '[fd00::1]:3000'), which wins over vpn.port."""
     vpn = vpn or {}
-    host = str(vpn.get("gateway", "") or "").strip()
-    return f"{host}:{int(vpn.get('port', 443) or 443)}" if host else ""
+    if not str(vpn.get("gateway", "") or "").strip():
+        return ""
+    return _gateway_hostport(vpn)
 
 
 def _bundled_inode_dir() -> str:
@@ -390,27 +641,31 @@ def inode_extra_args(vpn: dict) -> list:
     (the username + gateway are positional; the password travels via the child
     env $H3C_SVPN_PASSWORD, never argv)."""
     vpn = vpn or {}
+
+    def word(key):
+        return _safe_word(vpn.get(key) or "", f"vpn.{key}")
+
     tail = []
-    pin = str(vpn.get("trusted_cert", "") or "").strip()
+    pin = word("trusted_cert")
     if pin:
         tail += ["--pin-sha256", pin]
     elif vpn.get("insecure"):
         tail += ["--insecure"]
 
-    cafile = str(vpn.get("ca_file", "") or "").strip()
+    cafile = word("ca_file")
     if cafile:
         tail += ["--cafile", cafile]
-    cert = str(vpn.get("client_cert", "") or "").strip()
-    key = str(vpn.get("client_key", "") or "").strip()
+    cert = word("client_cert")
+    key = word("client_key")
     if cert:
         tail += ["--client-cert", cert]
     if key:
         tail += ["--client-key", key]
 
-    mac = str(vpn.get("mac", "") or "").strip()
+    mac = word("mac")
     if mac:
         tail += ["--mac", mac]
-    language = str(vpn.get("language", "") or "").strip()
+    language = word("language")
     if language:
         tail += ["--language", language]
 
@@ -423,29 +678,37 @@ def inode_extra_args(vpn: dict) -> list:
     if vpn.get("split_tunnel", True):
         tail += ["--split-tunnel"]
 
-    spa_key = str(vpn.get("spa_key", "") or "").strip()
+    spa_key = word("spa_key")
     if spa_key:
         tail += ["--spa-key", spa_key]
-        aid = str(vpn.get("spa_aid", "") or "").strip()
+        aid = word("spa_aid")
         if aid:
             tail += ["--spa-aid", aid]
-        ports = str(vpn.get("spa_ports", "") or "").strip()
+        ports = word("spa_ports")
         if ports:
             tail += ["--spa-ports", ports]
         knock = int(vpn.get("spa_knock_port", 0) or 0)
         if knock > 0:
             tail += ["--spa-knock-port", str(knock)]
 
-    tail += [str(a) for a in (vpn.get("extra_args") or [])]
+    tail += _safe_extra_args(vpn.get("extra_args"))
     return ["--"] + tail if tail else []
 
 
 def compute_geometry(disp: DisplayCfg, grid) -> Geometry:
     """Map a (col,row) grid cell to an on-screen rectangle."""
     col, row = grid
-    gap = disp.gap
-    cell_w = (disp.width - gap * (disp.cols - 1)) // disp.cols
-    cell_h = (disp.height - gap * (disp.rows - 1)) // disp.rows
+    # Cap the gap so the grid always fits: an unbounded gap from a config file or
+    # vault note could otherwise drive the cell size to zero/negative, and a
+    # non-positive window size crashes the WM/compositor. Leave >= 1px per cell.
+    gap = max(0, disp.gap)
+    if disp.cols > 1:
+        gap = min(gap, (disp.width - disp.cols) // (disp.cols - 1))
+    if disp.rows > 1:
+        gap = min(gap, (disp.height - disp.rows) // (disp.rows - 1))
+    gap = max(0, gap)
+    cell_w = max(1, (disp.width - gap * (disp.cols - 1)) // disp.cols)
+    cell_h = max(1, (disp.height - gap * (disp.rows - 1)) // disp.rows)
     x = col * (cell_w + gap)
     y = row * (cell_h + gap)
     return Geometry(x=x, y=y, w=cell_w, h=cell_h)
@@ -506,7 +769,7 @@ def _is_gateway_host(host: str) -> bool:
         h = h[1:-1]
     if _IPV4_RE.match(h) or _HOSTNAME_RE.match(h):
         return True
-    return bool(":" in h and _IPV6_RE.match(h))      # IPv6 needs >=1 colon
+    return bool(h.count(":") >= 2 and _IPV6_RE.match(h))  # IPv6 has >= 2 colons
 
 
 def _probe_ok(probe: str) -> bool:
@@ -549,6 +812,38 @@ def _validate_display(d: dict, errs: list, warns: list):
     layout = d.get("layout", "auto")
     if layout not in VALID_LAYOUTS:
         errs.append(f"display.layout: must be one of {sorted(VALID_LAYOUTS)}, got {layout!r}")
+    if "fullscreen" in d and not isinstance(d["fullscreen"], bool):
+        errs.append(f"display.fullscreen: must be true or false, got {d['fullscreen']!r}")
+
+
+def _validate_login_zones(lz, where: str, errs: list, warns: list):
+    """login_zones is a mapping of optional user/pass/submit click targets, each
+    with x_pct + y_pct ratios in 0.0..1.0."""
+    if not isinstance(lz, dict):
+        errs.append(f"{where}: login_zones must be a mapping with optional "
+                    f"'user', 'pass', 'submit' entries")
+        return
+    extra = set(lz) - _LOGIN_ZONES_KEYS
+    if extra:
+        errs.append(f"{where}: unknown login_zones key(s) "
+                    f"{sorted(str(k) for k in extra)}; "
+                    f"valid: {sorted(_LOGIN_ZONES_KEYS)}")
+    for k, z in lz.items():
+        if not isinstance(z, dict):
+            errs.append(f"{where}: login_zones.{k} must be a mapping with "
+                        f"x_pct + y_pct, got {z!r}")
+            continue
+        _unknown_keys(z, _LOGIN_ZONE_KEYS, f"{where}.login_zones.{k}", warns)
+        missing = _LOGIN_ZONE_KEYS - set(z)
+        if missing:
+            errs.append(f"{where}: login_zones.{k} missing {sorted(missing)}")
+            continue
+        for axis in sorted(_LOGIN_ZONE_KEYS):
+            v = z[axis]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not 0.0 <= float(v) <= 1.0:
+                errs.append(f"{where}: login_zones.{k}.{axis} must be a "
+                            f"0.0..1.0 ratio, got {v!r}")
 
 
 def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
@@ -561,6 +856,9 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
 
     if not p.get("id"):
         errs.append(f"panel #{i + 1}: missing required key 'id'")
+    elif not _PANEL_ID_RE.match(str(p["id"])):
+        errs.append(f"panel #{i + 1}: id {p['id']!r} must match [A-Za-z0-9_-]+ "
+                    f"(it is substituted into the WM rc.xml: no spaces/markup)")
 
     engine = p.get("engine", "webkit")
     if engine not in VALID_ENGINES:
@@ -585,8 +883,9 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
             # allowed: an unconfigured tile, set later from the on-screen config
             warns.append(f"{where}: no url yet — shows a 'not configured' card "
                          f"until you set it (on-screen config, or edit panels.yaml)")
-        elif not url.startswith(("http://", "https://")):
-            errs.append(f"{where}: url must start with http:// or https://, got {url!r}")
+        elif not valid_http_url(url, allow_empty=False):
+            errs.append(f"{where}: url must be a valid http:// or https:// URL with "
+                        f"a host and no embedded credentials, got {_url_for_msg(url)}")
     else:  # tunnel
         t = p.get("tunnel")
         if not isinstance(t, dict):
@@ -600,6 +899,16 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
                             f"(1-65535), got {lp!r}")
             if not t.get("remote_host"):
                 errs.append(f"{where}: tunnel.remote_host is required")
+            else:
+                try:
+                    _safe_remote_host(t["remote_host"])
+                except ValueError as e:
+                    errs.append(f"{where}: {e}")
+            if "remote_port" in t:
+                rp = t["remote_port"]
+                if not _is_int(rp) or not (0 < rp < 65536):
+                    errs.append(f"{where}: tunnel.remote_port must be a port number "
+                                f"(1-65535), got {rp!r}")
             # `path` is concatenated straight into effective_url for tunnel
             # panels (f"...127.0.0.1:{lp}{path}"); without a leading slash a value
             # like "@evil.com/dash" turns 127.0.0.1:lp into userinfo and
@@ -626,6 +935,15 @@ def _validate_panel(i: int, p: dict, disp: DisplayCfg, errs: list, warns: list):
     if "allow_media" in p and not isinstance(p["allow_media"], bool):
         errs.append(f"{where}: allow_media must be true or false, "
                     f"got {p['allow_media']!r}")
+
+    tenant = p.get("tenant")
+    if tenant is not None and (not isinstance(tenant, str) or _has_ctrl(tenant)
+                               or len(tenant.strip()) > MAX_TENANT_LEN):
+        errs.append(f"{where}: tenant must be a single-line string of at most "
+                    f"{MAX_TENANT_LEN} characters, got {tenant!r}")
+
+    if p.get("login_zones") is not None:
+        _validate_login_zones(p["login_zones"], where, errs, warns)
 
     # renderer security/compat knobs — all optional, validated mirroring the
     # allow_insecure/allow_media bool pattern (and list-of-str for domain lists).
@@ -724,8 +1042,46 @@ def _validate_cross(raw: dict, disp: DisplayCfg, panels_raw: list, errs: list, w
         if any_tunnel and not tun.get("enabled", True):
             warns.append("tunnel: panels use mode 'tunnel' but tunnel.enabled is false — "
                          "their local ports will never come up")
+        if tun.get("enabled", True):
+            _validate_tunnel_argv(tun, errs, warns)
     else:
         errs.append("tunnel: must be a mapping")
+
+
+def _validate_tunnel_argv(tun: dict, errs: list, warns: list):
+    """Everything scripts/tunnel-args.py emits, one arg per line, for autossh. A
+    bad extra_forward or host-key setting is a warning, not an error: tunnel-args
+    refuses it (or fails closed), so the tunnel stays safe and the wall itself
+    still comes up."""
+    try:
+        if tun.get("jump_host"):
+            _safe_host(tun["jump_host"], "tunnel.jump_host")
+    except ValueError as e:
+        errs.append(str(e))
+    for k in ("identity", "known_hosts"):
+        try:
+            _safe_word(tun.get(k), f"tunnel.{k}")
+        except ValueError as e:
+            errs.append(str(e))
+
+    forwards = tun.get("extra_forwards") or []
+    if not isinstance(forwards, list):
+        errs.append(f"tunnel.extra_forwards: must be a list, got {forwards!r}")
+        forwards = []
+    for entry in forwards:
+        try:
+            _safe_forward(entry)
+        except ValueError as e:
+            warns.append(f"tunnel: {e} (the tunnel will refuse to start)")
+
+    raw = tun.get("host_key_checking")
+    effective = host_key_checking(tun)
+    if raw is not None and str(raw).strip().lower() != effective:
+        warns.append(f"tunnel.host_key_checking: {raw!r} is not one of "
+                     f"{list(VALID_HOST_KEY_CHECKING)}; using strict 'yes'")
+    elif effective != "yes" and not str(tun.get("known_hosts") or "").strip():
+        warns.append(f"tunnel.host_key_checking: {effective!r} needs an explicit "
+                     f"tunnel.known_hosts (the tunnel will refuse to start)")
 
 
 def _validate_proxy(proxy: dict, errs: list, warns: list):
@@ -738,6 +1094,9 @@ def _validate_proxy(proxy: dict, errs: list, warns: list):
     url = (proxy.get("url") or "").strip()
     if not url:
         errs.append("proxy: enabled but 'url' is not set (want scheme://host:port)")
+    elif _has_ctrl_or_space(url):
+        # urlsplit silently drops \t \r \n, so check before parsing.
+        errs.append("proxy.url: must not contain whitespace or control characters")
     else:
         try:
             u = urlsplit(url)
@@ -746,11 +1105,12 @@ def _validate_proxy(proxy: dict, errs: list, warns: list):
             scheme = host = port = userinfo = None
         if scheme not in VALID_PROXY_SCHEMES:
             errs.append(f"proxy.url: scheme must be one of "
-                        f"{sorted(VALID_PROXY_SCHEMES)}, got {url!r}")
+                        f"{sorted(VALID_PROXY_SCHEMES)}, got {_url_for_msg(url)}")
         elif not host:
-            errs.append(f"proxy.url: missing host, got {url!r}")
+            errs.append(f"proxy.url: missing host, got {_url_for_msg(url)}")
         elif port is None:
-            errs.append(f"proxy.url: missing port — want scheme://host:port, got {url!r}")
+            errs.append(f"proxy.url: missing port — want scheme://host:port, "
+                        f"got {_url_for_msg(url)}")
         if userinfo is not None:
             errs.append("proxy.url: must not embed credentials (user:pass@...). "
                         "Put them in a vault login and set proxy.vault_item — "
@@ -806,10 +1166,11 @@ def _normalize_vpns(raw: dict, warns: list) -> list:
     return entries
 
 
-def _validate_vpns(vpns, errs: list, warns: list):
+def _validate_vpns(vpns, errs: list, warns: list, legacy: bool = False):
     """Collect-everything validation of the whole vpns[] list: the cap, unique
     non-empty names, at-most-one default-route owner, plus every per-entry
-    problem (never short-circuits)."""
+    problem (never short-circuits). `legacy` means the list came from a single
+    `vpn:` block, so messages say 'vpn.port', not "vpns[0] 'vpn'.port"."""
     if not isinstance(vpns, list):
         errs.append("vpns: must be a list of VPN mappings")
         return
@@ -821,10 +1182,10 @@ def _validate_vpns(vpns, errs: list, warns: list):
     dup_names: list = []
     route_owners: list = []
     for i, vpn in enumerate(vpns):
-        label = f"vpns[{i}]"
+        label = "vpn" if legacy else f"vpns[{i}]"
         if isinstance(vpn, dict):
             nm = str(vpn.get("name", "") or "").strip()
-            if nm:
+            if nm and not legacy:
                 label = f"vpns[{i}] {nm!r}"
             if not nm:
                 errs.append(f"{label}: 'name' is required and must be non-empty "
@@ -852,6 +1213,43 @@ def _validate_vpns(vpns, errs: list, warns: list):
         errs.append("vpns: at most one VPN may set 'default_route: true' (the "
                     "full-tunnel owner); these claim it: "
                     + ", ".join(str(n) for n in route_owners))
+
+
+def _validate_gateway(vpn: dict, errs: list, label: str, kind: str):
+    """Check vpn.gateway with the same parser the argv builders use, so load
+    accepts exactly what connect can format: 'host', 'host:port', IPv6 with or
+    without brackets. vpn.port has its own check, so only an embedded port is
+    judged here. config_from_vault may supply the gateway from the vault item's
+    Notes, in which case it is only checked (by _safe_host) at connect time."""
+    gw = vpn.get("gateway")
+    if not gw:
+        if not vpn.get("config_from_vault"):
+            errs.append(f"{label}: type '{kind}' but 'gateway' is not set (or set "
+                        "config_from_vault: true to load it from the vault item)")
+        return
+    try:
+        host, _ = _split_host_port(gw, 443)
+        _safe_host(host, "gateway host")
+    except ValueError as e:
+        errs.append(f"{label}.gateway: not a valid hostname or IP address ({e}), "
+                    f"got {gw!r}")
+        return
+    if not _is_gateway_host(host):
+        errs.append(f"{label}.gateway: not a valid hostname or IP address, got {gw!r}")
+
+
+def _validate_vpn_argv(vpn: dict, errs: list, label: str):
+    """Report at load what the argv builders would otherwise only refuse at
+    connect time, when the failure is a supervisor log line."""
+    for k in _VPN_ARGV_WORDS:
+        try:
+            _safe_word(vpn.get(k), f"{label}.{k}")
+        except ValueError as e:
+            errs.append(str(e))
+    try:
+        _safe_extra_args(vpn.get("extra_args"))
+    except ValueError as e:
+        errs.append(f"{label}: {e}")
 
 
 def _validate_vpn(vpn: dict, errs: list, warns: list, label: str = "vpn"):
@@ -886,13 +1284,10 @@ def _validate_vpn(vpn: dict, errs: list, warns: list, label: str = "vpn"):
     if vpn.get("health_check_interval") and not probe and kind != "wireguard":
         errs.append(f"{label}.health_check_interval is set but {label}.ready_probe "
                     f"is empty — the health check needs a host:port to probe")
+    _validate_vpn_argv(vpn, errs, label)
 
     if kind == "fortinet":
-        if not vpn.get("gateway"):
-            errs.append(f"{label}: type 'fortinet' but 'gateway' is not set")
-        elif not _is_gateway_host(vpn["gateway"]):
-            errs.append(f"{label}.gateway: not a valid hostname or IP address, "
-                        f"got {vpn['gateway']!r}")
+        _validate_gateway(vpn, errs, label, kind)
         if not vpn.get("vault_item"):
             errs.append(f"{label}: type 'fortinet' but 'vault_item' is not set "
                         "(the vault login holding the FortiGate credentials)")
@@ -931,12 +1326,7 @@ def _validate_vpn(vpn: dict, errs: list, warns: list, label: str = "vpn"):
             warns.append(f"{label}: wireguard ignores vault_item unless config_from_vault "
                          "is set — otherwise its keys live in the .conf file (0600)")
     elif kind == "inode":
-        if not vpn.get("gateway"):
-            errs.append(f"{label}: type 'inode' but 'gateway' is not set (the H3C "
-                        "SSL-VPN gateway host)")
-        elif not _is_gateway_host(vpn["gateway"]):
-            errs.append(f"{label}.gateway: not a valid hostname or IP address, "
-                        f"got {vpn['gateway']!r}")
+        _validate_gateway(vpn, errs, label, kind)
         if not vpn.get("vault_item"):
             errs.append(f"{label}: type 'inode' but 'vault_item' is not set (the vault "
                         "login holding the SSL-VPN username + password)")
@@ -1032,6 +1422,7 @@ def _parse(raw, path: str) -> Config:
         rows=int(d.get("rows", 2) or 2),
         gap=int(d.get("gap", 0) or 0),
         layout=str(d.get("layout", "auto")),
+        fullscreen=bool(d.get("fullscreen", True)),
     ) if not errs or all("display." not in e for e in errs) else DisplayCfg()
 
     panels_raw = raw.get("panels", []) or []
@@ -1042,7 +1433,7 @@ def _parse(raw, path: str) -> Config:
         _validate_panel(i, p if isinstance(p, dict) else {}, disp, errs, warns)
     _validate_cross(raw, disp, panels_raw, errs, warns)
     vpns_norm = _normalize_vpns(raw, warns)
-    _validate_vpns(vpns_norm, errs, warns)
+    _validate_vpns(vpns_norm, errs, warns, legacy=raw.get("vpns") is None)
     _validate_proxy(raw.get("proxy", {}) or {}, errs, warns)
     _validate_security(raw.get("security", {}) or {}, errs, warns)
 
@@ -1053,6 +1444,7 @@ def _parse(raw, path: str) -> Config:
     panels = []
     for p in panels_raw:
         sel = p.get("selectors") or {}
+        url = p.get("url")
         panel = Panel(
             id=p["id"],
             engine=p.get("engine", "webkit"),
@@ -1062,7 +1454,8 @@ def _parse(raw, path: str) -> Config:
             selectors=sel,
             login_marker=p.get("login_marker", sel.get("pass", "")),
             keepalive=_keepalive(p.get("keepalive")),
-            url=p.get("url"),
+            # valid_http_url judged the stripped form, so store that one.
+            url=url.strip() if isinstance(url, str) else url,
             tunnel=p.get("tunnel"),
             path=p.get("path", "/"),
             scheme=p.get("scheme", "http"),
@@ -1071,11 +1464,13 @@ def _parse(raw, path: str) -> Config:
             # insecure_tls is an alias of allow_insecure: either name opts in.
             allow_insecure=bool(p.get("allow_insecure", p.get("insecure_tls", False))),
             allow_media=bool(p.get("allow_media", False)),
+            tenant=str(p.get("tenant") or "").strip(),
             persist=bool(p.get("persist", True)),
             user_agent=(str(p["user_agent"]) if p.get("user_agent") else None),
             allow=tuple(p.get("allow") or ()),
             block_trackers=bool(p.get("block_trackers", True)),
             unblock=tuple(p.get("unblock") or ()),
+            login_zones=dict(p.get("login_zones") or {}),
         )
         panel.geometry = compute_geometry(disp, panel.grid)
         panels.append(panel)
@@ -1162,6 +1557,8 @@ def to_yaml(conf: "Config") -> str:
                     "cols": d.cols, "rows": d.rows, "gap": d.gap, "layout": d.layout},
         "panels": [],
     }
+    if not d.fullscreen:            # default stays implicit, like the other knobs
+        out["display"]["fullscreen"] = False
     for p in conf.panels:
         pd = {"id": p.id, "engine": p.engine, "grid": [p.grid[0], p.grid[1]],
               "mode": p.mode}
@@ -1194,6 +1591,10 @@ def to_yaml(conf: "Config") -> str:
             pd["allow_insecure"] = True
         if p.allow_media:
             pd["allow_media"] = True
+        if p.tenant:
+            pd["tenant"] = p.tenant
+        if p.login_zones:
+            pd["login_zones"] = {k: dict(v) for k, v in p.login_zones.items()}
         # renderer knobs — emit only when non-default (keeps round-tripped
         # configs minimal and backward-compatible).
         if not p.persist:

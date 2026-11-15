@@ -1,0 +1,26 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-gui"
+description = "p2soc standalone desktop tools (GTK3): launcher menu, setup wizard, credentials center, appearance editor, error dialog, tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+soc-core.workspace = true
+soc-brand.workspace = true
+soc-web.workspace = true
+soc-sys.workspace = true
+soc-seal.workspace = true
+soc-vault.workspace = true
+soc-state.workspace = true
+soc-setup.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+gtk = { version = "0.18" }
+gdk = { version = "0.18" }
+glib = { version = "0.18" }
+
+[lints]
+workspace = true

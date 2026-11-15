@@ -7,3 +7,12 @@ __pycache__/
 *.env
 !*.env.example
 secret/
+
+# Local runtime + build output
+.venv/
+dev/run/
+dist/
+.pytest_cache/
+
+# Site-specific config
+config/panels.local.yaml

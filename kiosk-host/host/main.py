@@ -14,6 +14,17 @@ Boot sequence:
 
 Runs natively on X11 and Wayland (GTK picks the backend; we only adapt layout).
 
+Liveness: from the moment GTK is up, a GLib timer on the main loop publishes a
+heartbeat (host/heartbeat.py). It keeps firing inside the nested loops of the
+unlock and fail-safe screens, and `state` says which of those is showing;
+only the real wall reports "running".
+
+With SOC_UNATTENDED=1 nobody is at the keyboard, so nothing here may wait for a
+person. A vault that is late, locked or unreachable becomes a status screen and a
+retry on a capped backoff, forever, and recovers with no restart; bad config shows
+the fail-safe screen and exits periodically to reload; the operator-action exit
+code (2) is never used. See _StatusBoard. Unset, none of this applies.
+
 Run:  SOC_PANELS_FILE=config/panels.dev.yaml python3 -m host.main
 """
 from __future__ import annotations
@@ -22,6 +33,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 
 import gi
@@ -31,8 +43,19 @@ from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
 from . import config as cfg  # noqa: E402
 from . import configpaths  # noqa: E402  (shared read/write-location resolver)
+from . import heartbeat  # noqa: E402
 from . import perf  # noqa: E402
 from .vault import Vault, VaultError  # noqa: E402
+
+BEAT_SEC = 15                  # heartbeat cadence; launcher.sh gives up at 120 s
+EXIT_OPERATOR = 2              # launcher.sh: stop supervising, back to the menu
+EXIT_RELOAD = 1                # launcher.sh: restart us (unattended uses this one)
+# Unattended vault retry: first wait, then doubling to the cap, forever.
+UNATTENDED_RETRY_INITIAL = 3.0
+UNATTENDED_RETRY_MAX = 60.0
+# One attempt that outlives this has wedged a thread we cannot kill; the only clean
+# recovery is a new process.
+UNATTENDED_ATTEMPT_TIMEOUT = 300
 
 
 def log(msg: str):
@@ -67,6 +90,78 @@ def _on_color(hexc: str) -> str:
     lum = 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
     # Contrast vs white = 1.05/(L+0.05); vs black = (L+0.05)/0.05. Pick the higher.
     return "#FFFFFF" if (1.05 / (lum + 0.05)) >= ((lum + 0.05) / 0.05) else "#0B1F14"
+
+
+class _Beat:
+    """The heartbeat: one GLib timer on the main loop, so if the loop hangs the
+    beats stop, and that absence is the signal launcher.sh and soc-update act on.
+    Never write it from a worker thread: a beat from anywhere else proves nothing.
+    GLib runs this timer inside Gtk.main(), Gtk.Dialog.run() and a bare
+    GLib.MainLoop alike, since all of them iterate the default context, so the
+    unlock and fail-safe screens beat too. The boot stretches that block the main
+    thread between loops call set() directly."""
+
+    def __init__(self):
+        self.state = "starting"
+        self._views = list            # callable() -> the live panel views
+        self._src = 0
+
+    def start(self, state: str = "starting"):
+        self.state = state
+        if not self._src:
+            self._src = GLib.timeout_add_seconds(BEAT_SEC, self._tick)
+        self._write()
+
+    def set(self, state: str, views=None):
+        """Change what the next beats say, and say it now. `views` is a callable
+        returning the panel views, handed over once the wall exists."""
+        self.state = state
+        if views is not None:
+            self._views = views
+        self._write()
+
+    def stop(self, state: str = "stopping"):
+        """Last beat + remove the timer. No-op unless start() ran."""
+        if not self._src:
+            return
+        GLib.source_remove(self._src)
+        self._src = 0
+        self.state = state
+        self._write()
+
+    def _write(self):
+        views = list(self._views())
+        heartbeat.write(len(views), sum(1 for v in views if _loaded_ok(v)),
+                        state=self.state)
+
+    def _tick(self):
+        try:
+            self._write()
+        except Exception as e:        # noqa: BLE001 — must return True: a raise
+            log(f"heartbeat failed: {e}")   # here would remove the timer for good
+        return True
+
+
+_beat = _Beat()
+
+
+def _signal_add(sig, fn) -> int:
+    """A main-loop signal handler. The API moved to GLibUnix in PyGObject 3.46;
+    older builds only have the GLib spelling."""
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        return GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, fn)
+    except (ValueError, ImportError):
+        return GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, fn)
+
+
+def _loaded_ok(view) -> bool:
+    """Did this panel's page finish loading without error? Never raises."""
+    try:
+        return bool(view.loaded_ok())
+    except Exception:                  # noqa: BLE001
+        return False
 
 
 def _resolved_panels() -> str:
@@ -106,21 +201,23 @@ def _port_open(host: str, port: int, timeout=1.0) -> bool:
 
 
 def wait_for_tunnels(panels, timeout: float):
-    tunneled = [p for p in panels if p.mode == "tunnel"]
-    for p in tunneled:
-        port = p.tunnel_local_port
-        if not port:                       # malformed/None tunnel — nothing to wait on
-            continue
-        log(f"[{p.id}] waiting for tunnel port 127.0.0.1:{port} ...")
-        deadline = time.time() + timeout   # per-tunnel budget — a slow first tunnel
-        while time.time() < deadline:      # must not starve the rest of the deadline
-            if _port_open("127.0.0.1", port):
+    """Report each tunnel as it comes up. One sweep over all of them, not one wait
+    after another: a dead first tunnel must not hide the rest for its whole budget.
+    These are loopback ports, so a sweep is instant and needs no thread per port."""
+    waiting = [p for p in panels if p.mode == "tunnel" and p.tunnel_local_port]
+    for p in waiting:
+        log(f"[{p.id}] waiting for tunnel port 127.0.0.1:{p.tunnel_local_port} ...")
+    deadline = time.time() + timeout
+    while waiting and time.time() < deadline:
+        for p in list(waiting):
+            if _port_open("127.0.0.1", p.tunnel_local_port):
                 log(f"[{p.id}] tunnel up")
-                break
+                waiting.remove(p)
+        if waiting:
             time.sleep(1)
-        else:
-            log(f"[{p.id}] WARNING tunnel port {port} never came up; "
-                f"window will show a connection error")
+    for p in waiting:
+        log(f"[{p.id}] WARNING tunnel port {p.tunnel_local_port} never came up; "
+            f"window will show a connection error")
 
 
 def heaviest_panel(views):
@@ -185,13 +282,18 @@ class KioskHost:
         self.wall = None               # WallWindow in single-window layout
         self._config_win = None        # the on-screen config window, when open
         self._vpn_log_viewer = None    # live VPN-log viewer window, when open
+        self._tray = None              # tray icon: windowed desktop runs only
+        self._timers = []              # GLib sources removed on shutdown
+        self._logged_in = set()        # panel ids whose current login is on record
+        self._restart_src = 0          # a pending restart_wall()
+        self._vpn_was_enabled = False  # last periodic poll saw an enabled VPN
         # Kiosk locker: PIN/TOTP-gated transparent overlay. State files live
-        # under configwin.state_dir(). Built lazily so a missing module never
-        # blocks boot.
+        # under configwin.state_dir(); the vault enables its vault-backed TOTP
+        # path. Built lazily so a missing module never blocks boot.
         try:
             from . import locker as _locker
             from . import configwin as _cw
-            self._locker = _locker.KioskLocker(_cw.state_dir())
+            self._locker = _locker.KioskLocker(_cw.state_dir(), vault=self.vault)
         except Exception as e:         # noqa: BLE001
             self._locker = None
             log(f"kiosk locker unavailable: {e}")
@@ -203,6 +305,7 @@ class KioskHost:
         from . import loginmemory
         item = panel.vault_item or loginmemory.vault_item_for(panel.effective_url)
         panel._resolved_vault = item
+        self._logged_in.discard(panel.id)
         if not item:
             return None                   # no creds known -> panel shows the popup
         # a panel with its own vault_item registers its domain immediately, so
@@ -218,9 +321,15 @@ class KioskHost:
 
     # called by a panel when a login succeeds — remember the domain -> vault item
     def login_success(self, panel):
+        # The page reports "logged in" on every document it loads, so a dashboard
+        # that reloads itself lands here all day. Once per login is enough: this is
+        # a disk read plus a journal line on the SD card.
+        if panel.id in self._logged_in:
+            return
         from . import loginmemory
         item = getattr(panel, "_resolved_vault", "") or panel.vault_item
         if item:
+            self._logged_in.add(panel.id)
             loginmemory.remember(panel.effective_url, item)
             log(f"[{panel.id}] login OK — remembered "
                 f"{loginmemory.domain_of(panel.effective_url)} -> '{item}'")
@@ -236,11 +345,34 @@ class KioskHost:
             log(f"[proxy] vault: {e}")
             return None
 
+    def open_vault(self):
+        """Unlock + re-sync the vault. Blocks on the network: worker threads only."""
+        backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND)
+        log(f"opening vault (backend={backend}) ...")
+        self.vault.open()
+        log("vault unlocked + synced")
+
+    def _start_vault_resync(self):
+        """Unattended: litebw serves logins from the RAM copy of the vault taken at
+        boot, so a password rotated in Vaultwarden would never reach this wall
+        without a restart, and nobody is here to do one. Re-sync hourly. A failed
+        sync keeps the copy we have."""
+        sec = cfg.env_int("SOC_VAULT_RESYNC_SEC", 3600, lo=60, hi=86400)
+        self._keep_timer(GLib.timeout_add_seconds(sec, self._resync_vault))
+
+    def _resync_vault(self):
+        def work():
+            try:
+                self.open_vault()
+            except Exception as e:     # noqa: BLE001 — the RAM copy still serves
+                log(f"vault re-sync failed; keeping the current copy: {e}")
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
     def prewarm_creds(self):
         """Fetch every panel/proxy/remembered login into the cache in the
         background, so the first login of each panel is served from cache and
         never blocks the GTK thread on a vault call."""
-        import threading
         from . import loginmemory
         items = [p.vault_item for p in self.conf.panels if p.vault_item]
         if self.conf.proxy.vault_item:
@@ -287,11 +419,20 @@ class KioskHost:
 
         if layout == "single":
             from .wall import WallWindow
+            # A tray needs a desktop to live on, and someone to bring the wall back
+            # from it: a hidden wall on an unattended box would stay hidden.
+            windowed = (os.environ.get("SOC_WINDOWED") == "1"
+                        or not getattr(self.conf.display, "fullscreen", True))
+            if windowed and not perf.unattended():
+                self._install_tray()
             self.wall = WallWindow(self.conf, log, on_destroy=self.shutdown,
                                    on_config=config_cb, on_vpn=self.vpn_action,
                                    on_lock=(self._lock_wall
                                             if self._locker is not None else None),
-                                   on_show_vpn_log=self.open_vpn_log_viewer)
+                                   on_show_vpn_log=self.open_vpn_log_viewer,
+                                   on_hide_to_tray=(self._hide_to_tray
+                                                    if self._tray is not None
+                                                    else None))
 
         stagger = cfg.env_float("SOC_LAUNCH_STAGGER", 1.5, lo=0.0, hi=60.0)
         cdp_base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
@@ -303,31 +444,13 @@ class KioskHost:
             # still paints, instead of one bad panel aborting build_and_show()
             # to the fatal screen. The happy path is unchanged.
             try:
-                if panel.engine == "chromium":
-                    from .chromium_panel import ChromiumPanel
-                    view = ChromiumPanel(panel, self.need_login, log,
-                                         cdp_port=cdp_base + idx,
-                                         proxy=self.conf.proxy,
-                                         proxy_creds=self.proxy_creds,
-                                         security=self.conf.security,
-                                         on_login_success=self.login_success)
-                else:
-                    from .webkit_panel import WebKitPanel
-                    view = WebKitPanel(panel, self.need_login, log,
-                                       embedded=self.wall is not None,
-                                       proxy=self.conf.proxy,
-                                       proxy_creds=self.proxy_creds,
-                                       security=self.conf.security,
-                                       on_config=config_cb,
-                                       on_login_success=self.login_success)
-                    if self.wall is not None:
-                        self.wall.attach(panel, view.widget)
+                view = self._make_view(panel, cdp_base + idx, config_cb)
             except Exception as e:  # noqa: BLE001 — skip one bad panel, keep the wall
                 log(f"[{getattr(panel, 'id', '?')}] panel construction failed; "
                     f"skipping this panel: {e}")
                 continue
             self.panels_view.append(view)
-            GLib.timeout_add(int(delay * 1000), self._show_one, view)
+            self._keep_timer(GLib.timeout_add(int(delay * 1000), self._show_one, view))
             delay += stagger
 
         if self.wall is not None:
@@ -337,6 +460,55 @@ class KioskHost:
             # deployed tree has drifted from the install-time manifest.
             self._check_deploy_drift()
         self._start_mem_watch()
+        # Theme sync: repaint on a theme saved by the setup wizard (15 s is plenty).
+        self._keep_timer(GLib.timeout_add_seconds(15, self._check_branding))
+        # The first Apply must not stall the GTK thread on a `sudo -n` probe:
+        # settle the cached answer now, off-thread.
+        threading.Thread(target=self._can_systemctl_restart, daemon=True).start()
+        if perf.unattended():
+            self._start_vault_resync()
+
+    def _make_view(self, panel, cdp_port: int, config_cb):
+        """Build one panel view and, in single layout, attach it to the wall."""
+        if panel.engine == "chromium":
+            from .chromium_panel import ChromiumPanel
+            return ChromiumPanel(panel, self.need_login, log,
+                                 cdp_port=cdp_port,
+                                 proxy=self.conf.proxy,
+                                 proxy_creds=self.proxy_creds,
+                                 security=self.conf.security,
+                                 on_login_success=self.login_success)
+        from .webkit_panel import WebKitPanel
+        view = WebKitPanel(panel, self.need_login, log,
+                           embedded=self.wall is not None,
+                           proxy=self.conf.proxy,
+                           proxy_creds=self.proxy_creds,
+                           security=self.conf.security,
+                           on_config=config_cb,
+                           on_login_success=self.login_success)
+        if self.wall is not None:
+            self.wall.attach(panel, view.widget)
+        return view
+
+    def _keep_timer(self, src: int) -> int:
+        """Remember a GLib source so shutdown() can remove it."""
+        self._timers.append(src)
+        return src
+
+    def _check_branding(self):
+        """Detect a theme saved by another process (the setup wizard touches a
+        marker) and repaint the running wall without a restart."""
+        try:
+            from . import branding, style
+            mt = branding._marker_mtime()
+            if mt > branding._marker_mtime_val:
+                branding._marker_mtime_val = mt
+                branding.load(refresh=True)
+                style.apply_css(refresh=True)
+                log("theme changed — wall repainted")
+        except Exception as e:         # noqa: BLE001 — a theme must not stop the wall
+            log(f"theme sync failed: {e}")
+        return True
 
     # ---- memory watchdog ---------------------------------------------------
     def _start_mem_watch(self):
@@ -346,7 +518,7 @@ class KioskHost:
         cooldown so it can't thrash."""
         if perf.mem_available_mb() is None:
             return                          # not Linux/proc — nothing to watch
-        self._mem_min_mb = cfg.env_int("SOC_MEM_MIN_AVAIL_MB", 96, lo=16, hi=8192)
+        self._mem_min_mb = cfg.env_int("SOC_MEM_MIN_AVAIL_MB", 150, lo=16, hi=8192)
         self._mem_check_sec = cfg.env_int("SOC_MEM_CHECK_SEC", 30, lo=5, hi=3600)
         self._mem_cooldown = cfg.env_int("SOC_MEM_RECYCLE_COOLDOWN", 120, lo=10)
         self._mem_low_streak = 0
@@ -354,7 +526,8 @@ class KioskHost:
         self._mem_rr = 0
         log(f"memory watchdog on: recycle a panel when MemAvailable < "
             f"{self._mem_min_mb} MB (every {self._mem_check_sec}s)")
-        GLib.timeout_add_seconds(self._mem_check_sec, self._check_memory)
+        self._keep_timer(GLib.timeout_add_seconds(self._mem_check_sec,
+                                                  self._check_memory))
 
     def _check_memory(self):
         avail = perf.mem_available_mb()
@@ -379,8 +552,7 @@ class KioskHost:
                 # streak — that would throttle the watchdog out of retrying for
                 # the full cooldown while the box stays under the floor and gets
                 # OOM-killed. Leave _mem_last_recycle untouched and clamp the
-                # streak to 1 so a single next low reading re-arms a retry; the
-                # round-robin target picker naturally tries a different panel.
+                # streak to 1 so a single next low reading re-arms a retry.
                 log(f"[mem] recycle of {view.panel.id} failed: {e}")
                 self._mem_low_streak = 1
             else:
@@ -390,8 +562,8 @@ class KioskHost:
         return True
 
     def _pick_recycle_target(self):
-        """The heaviest panel with a measurable RSS (Chromium); otherwise reload
-        WebKit panels round-robin (their RSS isn't separable)."""
+        """The heaviest panel by renderer RSS. Round-robin only when no panel can
+        be measured at all (no /proc), so the watchdog still does something."""
         heaviest = heaviest_panel(self.panels_view)
         if heaviest is not None:
             return heaviest
@@ -408,58 +580,68 @@ class KioskHost:
             return
         interval = cfg.env_int("SOC_VPN_STATUS_INTERVAL", 10, lo=1, hi=3600)
         self._poll_vpn()                              # immediate first reading
-        GLib.timeout_add_seconds(max(3, interval), self._poll_vpn_periodic)
+        self._keep_timer(GLib.timeout_add_seconds(max(3, interval),
+                                                  self._poll_vpn_periodic))
 
     def _poll_vpn_periodic(self):
-        self._poll_vpn()
+        # With no VPN enabled there is nothing to probe. One last pass after the
+        # list empties, so the pill doesn't stay on the state of a removed VPN.
+        enabled = any(isinstance(v, dict) and v.get("enabled")
+                      for v in (self.conf.vpns or []))
+        if enabled or self._vpn_was_enabled:
+            self._poll_vpn()
+        self._vpn_was_enabled = enabled
         return True                                   # keep the timeout alive
 
     def _poll_vpn(self):
         # each probe can block (TCP connect), so compute off the GTK thread
-        import threading
         from . import vpnstatus, vpnmanager
 
         # Skip this tick if the previous probe is still running, so a slow/hung
-        # connect near the poll interval can't pile up daemon threads.
+        # connect near the poll interval can't pile up daemon threads. A probe
+        # thread that dies without reporting back would otherwise freeze the pill
+        # forever, so a grossly overdue one is abandoned and we probe afresh.
+        interval = cfg.env_int("SOC_VPN_STATUS_INTERVAL", 10, lo=1, hi=3600)
         if getattr(self, "_vpn_poll_busy", False):
-            return False
+            if time.time() - getattr(self, "_vpn_poll_started", 0.0) < interval * 3:
+                return False
+            log("[vpn] previous status probe overdue — starting a fresh one")
         self._vpn_poll_busy = True
+        self._vpn_poll_started = time.time()
 
         def work():
             # Per-name states for EACH enabled VPN, plus one aggregate for the
-            # main pill label. The tooltip lists every VPN so a multi-VPN wall
-            # shows which one is down at a glance.
+            # single pill of a 0-or-1-VPN wall. The tooltip lists every VPN, so a
+            # multi-VPN wall shows which one is down at a glance.
             states = {}
             try:
-                for v in (self.conf.vpns or []):
-                    if isinstance(v, dict) and v.get("enabled"):
-                        nm = v.get("name") or "vpn"
-                        states[nm] = vpnstatus.vpn_state(v)
+                enabled = [v for v in (self.conf.vpns or [])
+                           if isinstance(v, dict) and v.get("enabled")]
+                for i, v in enumerate(enabled):
+                    states[vpnstatus.vpn_name(v, i)] = vpnstatus.vpn_state(v)
             except Exception:                          # never let the pill crash us
                 states = {}
             finally:
-                self._vpn_poll_busy = False
-            agg = vpnmanager.aggregate_state(states)
-            n = len(states)
-            if n <= 1:
-                label = vpnstatus.LABELS.get(agg, "VPN: ?")
-            else:
-                up = sum(1 for s in states.values()
-                         if s == vpnstatus.STATE_ONLINE)
-                label = f"VPN: {up}/{n} up"
-            css = {"not_configured": "unconfigured"}.get(agg, agg)
+                GLib.idle_add(self._clear_vpn_busy)
+
+            def css(state):
+                return {"not_configured": "unconfigured"}.get(state, state)
             # tooltip: per-name breakdown ("corp: online | lab: offline")
             tip = " | ".join(
                 f"{nm}: {st.replace('_', ' ')}" for nm, st in states.items()
             ) or "VPN: not configured"
-            GLib.idle_add(self._set_pill, css, label, tip)
+            if len(states) <= 1:
+                agg = vpnmanager.aggregate_state(states)
+                results = [("", css(agg), vpnstatus.LABELS.get(agg, "VPN: ?"), tip)]
+            else:
+                results = [(nm, css(st), f"{nm}: {st.replace('_', ' ')}", tip)
+                           for nm, st in states.items()]
+            GLib.idle_add(self._set_pills, results)
         # If thread start fails (RuntimeError 'can't start new thread' under
-        # thread exhaustion / OOM on the 1 GB board), work()'s finally never
-        # runs to reset _vpn_poll_busy — which would wedge every future tick at
-        # the early-return above and freeze the pill forever. Reset the flag and
-        # log here so the next tick can retry. Keep setting the flag on the GTK
-        # thread (do NOT move it into the worker — the early-return must already
-        # see it set before work() is scheduled).
+        # thread exhaustion / OOM on the 1 GB board), work() never runs to clear
+        # _vpn_poll_busy, so clear it here and let the next tick retry. Keep setting
+        # the flag on the GTK thread: the early-return must see it before work()
+        # is scheduled.
         try:
             threading.Thread(target=work, daemon=True).start()
         except RuntimeError as e:
@@ -467,12 +649,20 @@ class KioskHost:
             log(f"[vpn] could not start status-poll thread; will retry next tick: {e}")
         return False
 
-    def _set_pill(self, css, label, tip=None):
+    def _clear_vpn_busy(self):
+        self._vpn_poll_busy = False
+        return False
+
+    def _set_pills(self, results):
+        """Apply pill updates: results is a list of (name, css, label, tooltip);
+        name '' is the wall's single pill."""
         if self.wall is not None:
-            self.wall.set_vpn_status(css, label)
-            if tip and self.wall.vpn_pill is not None:
-                self.wall.vpn_pill.set_tooltip_text(
-                    f"{tip}\nClick to re-check / reconnect")
+            for name, css, label, tip in results:
+                self.wall.set_vpn_status(css, label, name=name)
+                for pill in self.wall.vpn_pills:
+                    if pill["name"] == name:
+                        pill["button"].set_tooltip_text(
+                            f"{tip}\nClick to re-check / reconnect")
         return False
 
     # ---- kiosk lock + VPN-log viewer --------------------------------------
@@ -483,10 +673,74 @@ class KioskHost:
         if self._locker is None:
             log("lock requested but the kiosk locker is unavailable")
             return
+        self._close_config()
         try:
             self._locker.lock(on_unlock=None)
         except Exception as e:  # noqa: BLE001
             log(f"lock failed: {e}")
+
+    def _close_config(self):
+        """Take the Settings window down. It is a top-level of its own, so left open
+        it would stay usable above the lock screen. A failure here must not stop
+        the lock that follows."""
+        win, self._config_win = getattr(self, "_config_win", None), None
+        if win is None:
+            return
+        try:
+            win.destroy()
+        except Exception as e:  # noqa: BLE001
+            log(f"could not close Settings before locking: {e}")
+
+    def _install_tray(self):
+        """Best-effort tray icon. If no backend is available the close button
+        simply quits, as it would without a tray."""
+        try:
+            from . import tray as _tray
+        except Exception as e:                          # noqa: BLE001
+            log(f"tray module import failed: {e}")
+            return
+        if not _tray.available():
+            log("no tray backend available — close button will quit")
+            return
+        t = _tray.Tray(app_id="soc-wall", icon_name="video-display", title="SOC wall")
+        ok = t.install([
+            ("Show wall",      lambda: self.wall and self.wall.window.present()),
+            ("Lock panel",     self._lock_wall),
+            None,
+            ("Open Settings",  self.open_config),
+            ("Show VPN log",   self.open_vpn_log_viewer),
+            ("Restart wall",   self.restart_wall),
+            None,
+            ("Reboot machine", self._tray_reboot),
+            None,
+            ("Quit",           self.shutdown),
+        ])
+        if ok:
+            self._tray = t
+            log(f"tray installed (backend={t.backend})")
+        else:
+            log("tray install failed")
+
+    def _hide_to_tray(self):
+        """delete-event with a tray: hide. The wall keeps running; the tray's
+        'Show wall' brings it back."""
+        if self.wall is not None and self.wall.window is not None:
+            self.wall.window.hide()
+
+    def _tray_reboot(self):
+        """`systemctl reboot`, off the GTK thread. Needs privilege; a refusal is
+        logged, not fatal."""
+        import subprocess
+
+        def work():
+            log("tray: reboot requested")
+            try:
+                subprocess.run(["systemctl", "reboot"], timeout=10, check=True,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as e:
+                log(f"tray: reboot not permitted ({e})")
+        threading.Thread(target=work, daemon=True).start()
 
     def open_vpn_log_viewer(self):
         """Open (or present) the live VPN log viewer — streams
@@ -577,7 +831,6 @@ class KioskHost:
         systemctl stderr is surfaced (no longer swallowed) so the operator
         knows why the reconnect didn't take. Schedules on_done(ok, info) if
         given so the caller can surface the outcome on-screen (not just log it)."""
-        import threading
 
         def work():
             try:
@@ -647,7 +900,7 @@ class KioskHost:
         no-arg call sites (the pill's on_vpn and the viewer's on_reconnect)
         working unchanged on the happy path."""
         if self.wall is not None:
-            self.wall.set_vpn_status("checking", "VPN: checking…")
+            self.wall.set_vpn_status("checking", "VPN: checking…", name=None)
         any_enabled = any(
             isinstance(v, dict) and v.get("enabled")
             for v in (self.conf.vpns or []))
@@ -676,7 +929,20 @@ class KioskHost:
                                on_close=self._config_closed,
                                display=self.conf.display,
                                vpn=self.conf.vpn,
-                               proxy_vault_item=self.conf.proxy.vault_item)
+                               vpns=self.conf.vpns,
+                               proxy=self.conf.proxy,
+                               tunnel=self.conf.tunnel,
+                               proxy_vault_item=self.conf.proxy.vault_item,
+                               login_stats=self.login_stats,
+                               vault=self.vault,
+                               actions={
+                                   "restart_wall": self.restart_wall,
+                                   "reload_panels": self.reload_all_panels,
+                                   "lock_wall": self._lock_wall,
+                                   "calibrate_panel": self.calibrate_panel,
+                                   "stop_vpn_unit": self._stop_vpn_unit,
+                                   "show_vpn_log": self.open_vpn_log_viewer,
+                               })
             self._config_win = win
             win.show_all()
             win.present()
@@ -700,8 +966,8 @@ class KioskHost:
         except Exception as e:                         # noqa: BLE001
             log(f"manifest check skipped: import failed ({e})")
             return
-        deploy_root = os.environ.get("SOC_DEPLOY_ROOT", "/opt/soc-display")
-        import threading
+        deploy_root = (os.environ.get("SOC_DEPLOY_ROOT")
+                       or os.environ.get("SOC_ROOT") or "/opt/soc-display")
 
         def work():
             try:
@@ -730,19 +996,248 @@ class KioskHost:
     def _config_closed(self):
         self._config_win = None
 
-    def apply_config(self, changes: dict):
-        """Live-apply URL/title/vault edits from the config window to the panels."""
+    def calibrate_panel(self, panel_id: str, on_done):
+        """Start click-zone calibration on a panel. on_done(zones or None) fires
+        when the operator finishes, cancels, or it times out. Captured zones are
+        saved to the overrides and go live on the panel straight away."""
+        view = next((v for v in self.panels_view
+                     if getattr(getattr(v, "panel", None), "id", None) == panel_id),
+                    None)
+        if view is None or not hasattr(view, "calibrate"):
+            log(f"calibrate_panel: no calibratable view for id={panel_id!r}")
+            on_done(None)
+            return
+
+        def _on_zones(zones):
+            if zones is not None:
+                try:
+                    view.panel.login_zones = dict(zones)
+                    self._save_login_zones_override(panel_id, zones)
+                    reinject = getattr(view, "reinject", None)
+                    if reinject is not None:
+                        reinject()
+                except Exception as e:                 # noqa: BLE001
+                    log(f"calibrate_panel: persist failed for {panel_id}: {e}")
+            try:
+                on_done(zones)
+            except Exception as e:                     # noqa: BLE001
+                log(f"calibrate_panel: on_done raised: {e}")
+
+        try:
+            view.calibrate(_on_zones)
+        except Exception as e:                         # noqa: BLE001
+            log(f"calibrate_panel: view.calibrate raised: {e}")
+            on_done(None)
+
+    def _save_login_zones_override(self, panel_id: str, zones: dict):
+        """Merge the zones into this panel's overrides, keeping its other fields,
+        so a calibration survives a restart."""
+        from . import configwin
+        ov = configwin.load_overrides()
+        per = dict(ov.get(panel_id) or {})
+        per["login_zones"] = {k: dict(v) for k, v in zones.items()}
+        ov[panel_id] = per
+        configwin.save_overrides(ov)
+        log(f"saved login_zones override for {panel_id} ({sorted(zones)})")
+
+    def reload_all_panels(self) -> int:
+        """Reload every panel in place, with no teardown and no exit. Returns how
+        many were refreshed."""
+        n = 0
+        for v in self.panels_view:
+            try:
+                v.set_url(v.panel.url or "")
+                n += 1
+            except Exception as e:                     # noqa: BLE001
+                log(f"[{getattr(v.panel, 'id', '?')}] reload failed: {e}")
+        log(f"reload_all_panels: refreshed {n}/{len(self.panels_view)} panel(s)")
+        return n
+
+    def restart_wall(self):
+        """Soft restart with the current config. After 500 ms, so the GUI can paint
+        its 'restarting' message first. Under systemd (which also covers
+        launcher.sh) we exit cleanly and get respawned; run bare, there is nobody
+        to do that, so we re-exec ourselves."""
+        if self._restart_src:
+            return
+        log("restart_wall: restarting in 0.5 s")
+        self._restart_src = GLib.timeout_add(500, self._do_restart)
+
+    def _do_restart(self):
+        self._restart_src = 0
+        if not os.environ.get("INVOCATION_ID"):
+            log("restart_wall: re-execing")
+            for v in self.panels_view:
+                try:
+                    v.stop()
+                except Exception as e:                 # noqa: BLE001
+                    log(f"restart_wall: stop failed: {e}")
+            try:
+                os.execv(sys.executable, [sys.executable, "-m", "host.main"])
+            except OSError as e:
+                log(f"restart_wall: execv failed ({e}); exiting instead")
+        self.shutdown()
+        return False
+
+    def _restart_wall_at_tail(self):
+        """apply_config's last act: everything else in the Apply has landed."""
+        self.restart_wall()
+
+    def login_stats(self) -> dict:
+        """Per-panel auto-login stats for the Status tab: {id: {attempts, stale}}. A
+        panel that burned half its budget without logging in probably has stale
+        selectors after a dashboard redesign."""
+        out = {}
+        for v in self.panels_view:
+            try:
+                attempts = int(getattr(v, "_login_attempts", 0))
+                out[v.panel.id] = {"attempts": attempts, "stale": attempts >= 2}
+            except Exception:                          # noqa: BLE001
+                continue
+        return out
+
+    def _apply_display_live(self, changes: dict, current: dict) -> bool:
+        """Apply width/height/fullscreen/cols/rows in place. Mutates conf.display
+        first, so other paths see the new values, then nudges the wall. False (never
+        a raise) tells the caller to fall back to a soft restart."""
+        try:
+            wall = self.wall
+            if wall is None or wall.window is None:
+                return False
+            d = self.conf.display
+            for key in ("width", "height", "cols", "rows"):
+                if key in changes:
+                    setattr(d, key, int(changes[key]))
+            if "fullscreen" in changes:
+                d.fullscreen = bool(changes["fullscreen"])
+
+            if "width" in changes or "height" in changes:
+                # In fullscreen the WM owns the size; the re-fit covers both cases.
+                wall.window.resize(d.width, d.height)
+                wall._fit_to_screen()
+            if "fullscreen" in changes and d.fullscreen != bool(
+                    getattr(wall, "_fullscreen", True)):
+                wall._toggle_fullscreen()
+            if "cols" in changes or "rows" in changes:
+                # Detach + re-attach so the homogeneous grid recomputes its layout.
+                # The widgets are the live webviews: no reload, no flicker.
+                for p in self.conf.panels:
+                    p.geometry = cfg.compute_geometry(d, p.grid)
+                grid = wall.grid
+                views = [v for v in self.panels_view
+                         if getattr(v, "widget", None) is not None]
+                for v in views:
+                    grid.remove(v.widget)
+                grid.set_row_homogeneous(True)
+                grid.set_column_homogeneous(True)
+                for v in views:
+                    wall.attach(v.panel, v.widget)
+                grid.show_all()
+            log(f"display: applied live {sorted(changes)} (now {d.cols}x{d.rows} @ "
+                f"{d.width}x{d.height}, fullscreen={getattr(d, 'fullscreen', True)})")
+            return True
+        except Exception as e:                         # noqa: BLE001
+            log(f"display: live apply failed ({e}); falling back to soft-restart")
+            return False
+
+    def _apply_display_changes(self, disp: dict, result: dict):
+        """Live-apply what can be; flag a soft restart for what can't: a layout
+        swap (a different windowing model), or a grid shrink that would orphan a
+        configured panel."""
+        d = self.conf.display
+        current = {"layout": d.layout, "cols": d.cols, "rows": d.rows,
+                   "width": d.width, "height": d.height,
+                   "fullscreen": getattr(d, "fullscreen", True)}
+        live = {k: disp[k] for k in ("width", "height", "fullscreen", "cols", "rows")
+                if k in disp and disp[k] != current[k]}
+        layout_change = "layout" in disp and disp["layout"] != current["layout"]
+        orphans = []
+        if "cols" in live or "rows" in live:
+            cols = int(live.get("cols", current["cols"]))
+            rows = int(live.get("rows", current["rows"]))
+            orphans = [p.id for p in self.conf.panels
+                       if p.grid[0] >= cols or p.grid[1] >= rows]
+        if layout_change or orphans:
+            result["self_restart"] = True
+            if orphans:
+                result["pending_restarts"].append(
+                    f"grid shrink would orphan {orphans} — restart to confirm")
+        elif live:
+            if self._apply_display_live(live, current):
+                result["applied_live"] = sorted(live)
+            else:
+                result["self_restart"] = True
+
+    def apply_config(self, changes: dict) -> dict:
+        """Live-apply edits from the config window: panels added/removed/edited,
+        display, VPNs, proxy, tunnel. Returns what actually happened, so Apply tells
+        the truth about what went live and what is queued:
+          {"pending_restarts": [...], "write_back": "ok"|"deferred:<reason>",
+           "self_restart": bool, "applied_live": [...]}"""
+        result = {"pending_restarts": [], "write_back": "ok", "self_restart": False}
+        added = changes.pop("_add_panel", None)
+        if added:
+            if self.wall is None:
+                result["pending_restarts"].append(
+                    "soc-wall (new panels appear on next boot)")
+            else:
+                for pdict in added:
+                    try:
+                        self._add_panel_live(pdict)
+                    except Exception as e:             # noqa: BLE001
+                        log(f"[{pdict.get('id', '?')}] add panel failed: {e}")
+        for pid in changes.pop("_remove_panel", None) or ():
+            self._remove_panel_live(pid)
+
         disp = changes.pop("_display", None)
-        if disp and self.wall is not None and "gap" in disp:
-            try:                                        # gap applies live
-                self.wall.grid.set_row_spacing(disp["gap"])
-                self.wall.grid.set_column_spacing(disp["gap"])
-            except Exception:  # noqa: BLE001
-                pass
+        if disp and self.wall is not None:
+            if "gap" in disp:                           # gap applies live
+                try:
+                    self.wall.grid.set_row_spacing(disp["gap"])
+                    self.wall.grid.set_column_spacing(disp["gap"])
+                except Exception:  # noqa: BLE001
+                    pass
+            self._apply_display_changes(disp, result)
+        elif disp:
+            result["pending_restarts"].append(
+                "soc-wall (display changes apply on next boot)")
+
+        # _vpns is the canonical list; _vpn is the legacy single-VPN edit. One
+        # supervisor unit runs them all, so either way one restart picks it up.
+        vpns_ch = changes.pop("_vpns", None)
         vpn_ch = changes.pop("_vpn", None)
-        if vpn_ch is not None:
+        if vpns_ch is not None:
+            self.conf.vpns = list(vpns_ch)
+            self.conf.vpn = self.conf.vpns[0] if self.conf.vpns else {}
+        elif vpn_ch is not None:
             self.conf.vpn = vpn_ch                      # persisted to the vault note
-            self._restart_vpn_async()                   # pick up the new config
+        if vpns_ch is not None or vpn_ch is not None:
+            if self._can_systemctl_restart():
+                self._restart_vpn_async()               # pick up the new config
+                result.setdefault("applied_live", []).append("forti-vpn")
+            else:
+                result["pending_restarts"].append("forti-vpn")
+
+        proxy_ch = changes.pop("_proxy", None)
+        if proxy_ch is not None:
+            # The browsers read the proxy at WebView creation, so this takes effect
+            # next boot; updating conf keeps the vault write-back current.
+            self.conf.proxy = cfg.ProxyCfg(
+                enabled=bool(proxy_ch.get("enabled")),
+                url=str(proxy_ch.get("url") or ""),
+                vault_item=str(proxy_ch.get("vault_item") or ""),
+                ignore_hosts=tuple(proxy_ch.get("ignore_hosts") or ()))
+            result["pending_restarts"].append("soc-wall (proxy applies on next boot)")
+
+        tunnel_ch = changes.pop("_tunnel", None)
+        if tunnel_ch is not None:
+            # A merge, so advanced keys the form doesn't show survive a glass edit.
+            self.conf.tunnel = {**(self.conf.tunnel or {}), **tunnel_ch}
+            if self._can_systemctl_restart():
+                self._restart_tunnel_async()
+            else:
+                result["pending_restarts"].append("autossh-tunnel")
+
         by_id = {v.panel.id: v for v in self.panels_view}
         for pid, ch in changes.items():
             view = by_id.get(pid)
@@ -760,7 +1255,72 @@ class KioskHost:
             elif vault_changed and hasattr(view, "set_url"):
                 # vault item changed but URL didn't — reload to re-trigger login
                 view.set_url(view.panel.url or "")
-        self._push_config_to_vault()
+        result["write_back"] = self._push_config_to_vault()
+        if result["self_restart"]:
+            self._restart_wall_at_tail()
+        return result
+
+    def _free_cell(self) -> tuple:
+        """The first empty (col, row) in reading order; a full grid grows a row."""
+        used = {tuple(p.grid) for p in self.conf.panels}
+        cols = max(1, self.conf.display.cols)
+        n = 0
+        while (n % cols, n // cols) in used:
+            n += 1
+        return (n % cols, n // cols)
+
+    def _add_panel_live(self, pdict: dict):
+        """Create and attach a new panel at runtime, without a restart."""
+        pid = pdict["id"]
+        if any(p.id == pid for p in self.conf.panels):
+            raise ValueError(f"panel id {pid!r} already exists")
+        url = pdict.get("url") or None
+        if not cfg.valid_http_url(url):
+            raise ValueError(f"not a valid http(s) URL: {cfg._url_for_msg(url)}")
+        engine = pdict.get("engine", "webkit")
+        if engine == "chromium" and self.wall is not None:
+            raise ValueError("layout 'single' cannot host chromium panels")
+        panel = cfg.Panel(
+            id=pid, engine=engine, url=url,
+            grid=tuple(pdict.get("grid") or self._free_cell()),
+            mode=pdict.get("mode", "direct"),
+            vault_item=pdict.get("vault_item", ""),
+            selectors=pdict.get("selectors", {}),
+            login_marker=pdict.get("login_marker", ""),
+            keepalive=cfg.KeepAlive(strategy="none"),
+            title=pdict.get("title", ""),
+            allow_insecure=pdict.get("allow_insecure", False))
+        panel.geometry = cfg.compute_geometry(self.conf.display, panel.grid)
+        config_cb = (self.open_config
+                     if os.environ.get("SOC_ONSCREEN_CONFIG", "1") != "0" else None)
+        # Ports stay with their views, so a removal can leave a hole: take the first
+        # free one, never one derived from the list length.
+        base = cfg.env_int("SOC_CDP_BASE_PORT", 9222, lo=1024, hi=65535)
+        used = {getattr(v, "cdp_port", None) for v in self.panels_view}
+        port = next(p for p in range(base, 65536) if p not in used)
+        view = self._make_view(panel, port, config_cb)
+        self.conf.panels.append(panel)
+        self.panels_view.append(view)
+        self._show_one(view)
+        if self.wall is not None:
+            self.wall.grid.show_all()
+        log(f"[{pid}] panel added live")
+
+    def _remove_panel_live(self, pid: str):
+        """Stop a panel and take it off the wall at runtime."""
+        view = next((v for v in self.panels_view if v.panel.id == pid), None)
+        if view is None:
+            log(f"[{pid}] panel not found for removal")
+            return
+        try:
+            view.stop()
+        except Exception as e:                         # noqa: BLE001
+            log(f"[{pid}] stop failed: {e}")
+        self.panels_view.remove(view)
+        self.conf.panels = [p for p in self.conf.panels if p.id != pid]
+        if self.wall is not None:
+            self.wall.detach(pid)
+        log(f"[{pid}] panel removed live")
 
     def _restart_vpn_async(self):
         """A VPN-tab change — restart the VPN service so it re-reads the config
@@ -769,29 +1329,58 @@ class KioskHost:
             "VPN config changed — restarted forti-vpn",
             "VPN restart not permitted from the wall")
 
-    def _push_config_to_vault(self):
+    def _stop_vpn_unit(self, name: str):
+        """Settings' Remove-VPN action, called from a worker before the entry leaves
+        the config. One forti-vpn.service supervises every VPN (no per-VPN units, and
+        sudoers allows only this one), so a restart now would drop the healthy
+        tunnels and bring this one straight back. Apply restarts the supervisor on
+        the new list; what can go wrong is that it isn't allowed to, so raise now
+        and let Settings warn the operator while they are still there."""
+        if not self._can_systemctl_restart():
+            raise RuntimeError("no NOPASSWD sudo for systemctl, so forti-vpn must be "
+                               "restarted by hand after Apply")
+        log(f"VPN '{name}' removed — forti-vpn restarts on Apply")
+
+    def _restart_tunnel_async(self):
+        """A Tunnel-tab change — restart autossh-tunnel so the new jump host /
+        identity / forwards come up. Same caveats as _restart_vpn_async."""
+        def work():
+            ok, info = self._privileged_systemctl("restart", "autossh-tunnel.service")
+            log("tunnel config changed — restarted autossh-tunnel" if ok
+                else f"tunnel restart not permitted from the wall ({info})")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _push_config_to_vault(self) -> str:
         """After an on-screen edit, write the merged config back to the vault note
         (the source of truth) so it does not drift. Off the GTK thread, best-effort
-        — the local overrides remain the durable record if this fails."""
+        — the local overrides remain the durable record if this fails.
+
+        Returns at once: 'ok' (the prerequisites are met and the upload is running,
+        though it may still fail) or 'deferred:<reason>', meaning overrides.json is
+        the only record and the stale vault note wins at next boot. The unseal is
+        slow, so only the cheap checks happen here."""
         if os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND) not in ("rbw", "litebw", "native"):
-            return
+            return "deferred:this vault backend has no config note"
         item = os.environ.get("SOC_CONFIG_VAULT_ITEM", "SOC Wall Config")
         if not item:
-            return
-        import threading
+            return "deferred:SOC_CONFIG_VAULT_ITEM is empty"
+        from . import secretstore
+        sd = os.environ.get("SOC_SECRET_DIR")
+        url = os.environ.get("SOC_VAULT_URL", "")
+        email = os.environ.get("SOC_VAULT_EMAIL", "")
+        if not url:
+            return "deferred:SOC_VAULT_URL is empty"
+        if not email:
+            return "deferred:SOC_VAULT_EMAIL is empty"
+        if not secretstore.is_sealed(sd):
+            return "deferred:master password is not host-sealed"
 
         def work():
             try:
-                from . import secretstore, vaultseed
-                sd = os.environ.get("SOC_SECRET_DIR")
-                url = os.environ.get("SOC_VAULT_URL", "")
-                email = os.environ.get("SOC_VAULT_EMAIL", "")
+                from . import vaultseed
                 # Master comes ONLY from the host-bound sealed store — never from
                 # a plaintext SOC_VAULT_PASSWORD in soc.env.
-                master = secretstore.unseal(sd) if secretstore.is_sealed(sd) else ""
-                if not (url and email and master):
-                    log("config write-back skipped (need url/email + sealed master)")
-                    return
+                master = secretstore.unseal(sd)
                 yaml_text = cfg.to_yaml(self.conf)
                 vaultseed.upsert_login(url, email, master, item, "", "",
                                        notes=yaml_text)
@@ -800,6 +1389,7 @@ class KioskHost:
             except Exception as e:  # noqa: BLE001
                 log(f"config write-back failed (local overrides kept): {e}")
         threading.Thread(target=work, daemon=True).start()
+        return "ok"
 
     def _show_one(self, view):
         try:
@@ -816,6 +1406,13 @@ class KioskHost:
         # chromium children whose _reap never runs).
         try:
             log("shutting down ...")
+            _beat.stop()
+            ctx = GLib.main_context_default()
+            for src in (*getattr(self, "_timers", ()),
+                        getattr(self, "_restart_src", 0)):
+                if src and ctx.find_source_by_id(src) is not None:
+                    GLib.source_remove(src)
+            self._timers, self._restart_src = [], 0
             for v in self.panels_view:
                 if hasattr(v, "stop"):
                     try:
@@ -877,9 +1474,10 @@ def load_config(vault: Vault) -> cfg.Config:
             log(f"config note '{item}' unreadable ({e}); falling back to the file")
             text = ""
         if text and text.strip():
-            _cache_config(text)                  # remember last-known-good
+            conf = cfg.load_str(text, f"vault:{item}")
+            _cache_config(text)                  # only validated text is "good"
             log(f"config source: vault note '{item}'")
-            return cfg.load_str(text, f"vault:{item}")
+            return conf
         cached = _read_cached_config()
         if cached.strip():
             try:
@@ -974,6 +1572,9 @@ def _unlock_attempt_loop(verify, ui):
         # loop: the SAME dialog stays up for another attempt — no re-pop
 
 
+_MASTER_REJECTED = "Master password rejected — check it and try again."
+
+
 def _classify_unlock_error(msg: str, url: str) -> str:
     """Turn a raw VaultError string into a short, operator-actionable reason for the
     Unlock dialog. A reachability fault (DNS/connect/timeout) and a credential
@@ -1001,7 +1602,10 @@ def _classify_unlock_error(msg: str, url: str) -> str:
         return ("No vault account email is configured — the wall's env (soc.env) "
                 "was not loaded. Check that /etc/soc-display/soc.env is readable "
                 "and SOC_VAULT_EMAIL is set, then relaunch.")
-    return "Master password rejected — check it and try again."
+    if "no vault master" in low or "vault is locked" in low:
+        return ("This host has no sealed vault master password — provision it "
+                "with Setup (the master is sealed host-bound).")
+    return _MASTER_REJECTED
 
 
 def _unlock_dialog(email: str, url: str, verify=None, timeout: float = 180.0):
@@ -1023,6 +1627,8 @@ def _unlock_dialog(email: str, url: str, verify=None, timeout: float = 180.0):
     check defaults ON for unattended use, but the master is only ever sealed via
     secretstore (AES-GCM, host-bound) — the plaintext never touches soc.env or any
     file, preserving no-plaintext-master."""
+    if perf.unattended():
+        return (None, False)  # nobody to ask; the boot retries by itself instead
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return (None, False)  # headless: can't prompt; let the fatal path log it
     try:
@@ -1180,79 +1786,97 @@ def _try_seal_master(master: str):
         return False
 
 
+def _title_markup(title: str) -> str:
+    esc = str(title).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<span size='xx-large' weight='bold'>{esc}</span>"
+
+
+def _failsafe_window(title: str, detail: str, hint: str = "", window_title: str =
+                     "SOC Video Wall — cannot start", buttons=()):
+    """The themed full-screen status window behind every fail-safe screen. Returns
+    (window, title label, detail label, hint label); the caller shows it and runs
+    a loop."""
+    try:
+        from . import branding
+        c = branding.load().get("colors", {})
+    except Exception:  # noqa: BLE001 — theming is best-effort
+        c = {}
+    bg, text = c.get("background", "#FFFFFF"), c.get("text", "#0B1F14")
+    dim, bad = c.get("text_dim", "#5B7567"), c.get("bad", "#C0341D")
+    border = c.get("border", "#CFE0D4")
+    s_bot = c.get("surface_bottom", "#EAF1EC")
+    accent_strong = c.get("accent_strong", "#157A49")
+    prov = Gtk.CssProvider()
+    prov.load_from_data((f"window {{ background-color: {bg}; color: {text}; }}"
+                         f".e-title {{ color: {bad}; }} .e-detail {{ color: {text}; }}"
+                         f".e-hint {{ color: {dim}; }}"
+                         # buttons as branding ghosts (not stock-light on dark).
+                         f"button.soc-ghost {{ background-image: none;"
+                         f" background-color: transparent; color: {accent_strong};"
+                         f" border: 1px solid {border}; border-radius: 6px;"
+                         f" padding: 6px 16px; }}"
+                         f"button.soc-ghost:hover {{ background-color: {s_bot};"
+                         f" border-color: {accent_strong}; }}").encode())
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win = Gtk.Window(title=window_title)
+    if os.environ.get("SOC_WINDOW_MODE") == "window":
+        win.set_default_size(660, 440)
+    else:
+        win.fullscreen()
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+    box.set_halign(Gtk.Align.CENTER)
+    box.set_valign(Gtk.Align.CENTER)
+    box.set_margin_top(40)
+    box.set_margin_bottom(40)
+    box.set_margin_start(60)
+    box.set_margin_end(60)
+    win.add(box)
+    t = Gtk.Label(xalign=0.5)
+    t.get_style_context().add_class("e-title")
+    t.set_markup(_title_markup(title))
+    box.pack_start(t, False, False, 0)
+    d = Gtk.Label(label=detail.strip())
+    d.get_style_context().add_class("e-detail")
+    d.set_line_wrap(True)
+    d.set_max_width_chars(74)
+    d.set_selectable(True)
+    box.pack_start(d, False, False, 0)
+    h = Gtk.Label(label=hint)
+    h.get_style_context().add_class("e-hint")
+    h.set_line_wrap(True)
+    h.set_max_width_chars(74)
+    h.set_no_show_all(not hint)
+    box.pack_start(h, False, False, 0)
+    if buttons:
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        btns.set_halign(Gtk.Align.CENTER)
+        for b in buttons:
+            btns.pack_start(b, False, False, 0)
+        box.pack_start(btns, False, False, 0)
+    return win, t, d, h
+
+
 def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
     """Fail-safe: instead of exiting silently (which launcher.sh would just restart
     into a black screen, so the operator sees *nothing*), show a visible, themed
     error window explaining WHY the wall could not start, with an 'Open Setup'
     button to fix it. It runs its own GTK loop so it STAYS on screen (the launcher
     won't busy-restart while it's up). Returns 2 after the operator dismisses it;
-    falls back to a log-only exit when there is no display (headless / pre-session)."""
-    log(f"FATAL: {title}: {detail}")
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return 2  # nothing to render on; the journal line above is the diagnostic
-    try:
-        import gi
-        gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk, Gdk
-        try:
-            from . import branding
-            c = branding.load().get("colors", {})
-        except Exception:  # noqa: BLE001 — theming is best-effort
-            c = {}
-        bg, text = c.get("background", "#FFFFFF"), c.get("text", "#0B1F14")
-        dim, bad = c.get("text_dim", "#5B7567"), c.get("bad", "#C0341D")
-        border = c.get("border", "#CFE0D4")
-        s_bot = c.get("surface_bottom", "#EAF1EC")
-        accent_strong = c.get("accent_strong", "#157A49")
-        prov = Gtk.CssProvider()
-        prov.load_from_data((f"window {{ background-color: {bg}; color: {text}; }}"
-                             f".e-title {{ color: {bad}; }} .e-detail {{ color: {text}; }}"
-                             f".e-hint {{ color: {dim}; }}"
-                             # buttons as branding ghosts (not stock-light on dark).
-                             f"button.soc-ghost {{ background-image: none;"
-                             f" background-color: transparent; color: {accent_strong};"
-                             f" border: 1px solid {border}; border-radius: 6px;"
-                             f" padding: 6px 16px; }}"
-                             f"button.soc-ghost:hover {{ background-color: {s_bot};"
-                             f" border-color: {accent_strong}; }}").encode())
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        win = Gtk.Window(title="SOC Video Wall — cannot start")
-        if os.environ.get("SOC_WINDOW_MODE") == "window":
-            win.set_default_size(660, 440)
-        else:
-            win.fullscreen()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        box.set_halign(Gtk.Align.CENTER)
-        box.set_valign(Gtk.Align.CENTER)
-        box.set_margin_top(40)
-        box.set_margin_bottom(40)
-        box.set_margin_start(60)
-        box.set_margin_end(60)
-        win.add(box)
-        esc = (lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-        t = Gtk.Label(xalign=0.5)
-        t.get_style_context().add_class("e-title")
-        t.set_markup(f"<span size='xx-large' weight='bold'>{esc(title)}</span>")
-        box.pack_start(t, False, False, 0)
-        d = Gtk.Label(label=detail.strip())
-        d.get_style_context().add_class("e-detail")
-        d.set_line_wrap(True)
-        d.set_max_width_chars(74)
-        d.set_selectable(True)
-        box.pack_start(d, False, False, 0)
-        if hint:
-            h = Gtk.Label(label=hint)
-            h.get_style_context().add_class("e-hint")
-            h.set_line_wrap(True)
-            h.set_max_width_chars(74)
-            box.pack_start(h, False, False, 0)
-        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        btns.set_halign(Gtk.Align.CENTER)
+    falls back to a log-only exit when there is no display (headless / pre-session).
 
+    Unattended there is nobody to dismiss it: see _fatal_unattended."""
+    log(f"FATAL: {title}: {detail}")
+    _beat.set("fatal")
+    if perf.unattended():
+        return _fatal_unattended(title, detail)
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return EXIT_OPERATOR  # nothing to render on; the journal line is the diagnostic
+    try:
         def _open_setup(_b):
             import subprocess  # local: subprocess isn't a module-level import
-            root = os.environ.get("SOC_ROOT", "/opt/soc-display")
+            root = os.environ.get("SOC_ROOT") or os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", ".."))
             sh = os.path.join(root, "scripts", "soc-wall-setup-gui.sh")
             argv = (["bash", sh] if os.path.exists(sh)
                     else [sys.executable, "-m", "host.setupgui"])
@@ -1266,18 +1890,197 @@ def _fatal_screen(title: str, detail: str, hint: str = "") -> int:
         quit_btn = Gtk.Button(label="Quit")
         quit_btn.get_style_context().add_class("soc-ghost")
         quit_btn.connect("clicked", lambda _b: Gtk.main_quit())
-        btns.pack_start(setup_btn, False, False, 0)
-        btns.pack_start(quit_btn, False, False, 0)
-        box.pack_start(btns, False, False, 0)
+        win = _failsafe_window(title, detail, hint,
+                               buttons=(setup_btn, quit_btn))[0]
         win.connect("destroy", lambda _w: Gtk.main_quit())
         win.show_all()
         Gtk.main()
     except Exception as e:  # noqa: BLE001 — never let the diagnostic mask the real error
         log(f"(could not show the fail-safe error screen: {e})")
-    return 2
+    return EXIT_OPERATOR
+
+
+class _AttemptHung(Exception):
+    """A boot step outlived UNATTENDED_ATTEMPT_TIMEOUT."""
+
+
+class _StatusBoard:
+    """What an unattended wall shows while it cannot show the wall, and the main
+    loop that keeps the process alive meanwhile. No buttons and no prompt: nothing
+    here waits for a person. Without a usable display the screen is skipped and the
+    loop still runs, so the retry and the heartbeat don't depend on one."""
+
+    def __init__(self):
+        self.stopped = False           # SIGTERM/SIGINT arrived: wind down
+        self._loop = None
+        self._win = self._title = self._detail = self._hint = None
+        self._no_display = not (os.environ.get("DISPLAY")
+                                or os.environ.get("WAYLAND_DISPLAY"))
+        self._sigs = [_signal_add(sig, self._on_signal)
+                      for sig in (signal.SIGINT, signal.SIGTERM)]
+
+    def _on_signal(self):
+        self.stopped = True
+        if self._loop is not None:
+            self._loop.quit()
+        return True
+
+    def show(self, title: str, detail: str, hint: str = ""):
+        """Put this on screen, updating the window in place if it is already up."""
+        if self._no_display:
+            return
+        try:
+            if self._win is None:
+                self._win, self._title, self._detail, self._hint = _failsafe_window(
+                    title, detail, hint, window_title="SOC Video Wall")
+                self._win.connect("delete-event", lambda *_: True)
+                self._hint.set_no_show_all(False)
+                self._detail.set_selectable(False)     # no caret: nobody types here
+                res = detect_resolution()
+                if res and os.environ.get("SOC_WINDOW_MODE") != "window":
+                    self._win.set_default_size(*res)   # for a bare X with no WM
+                self._win.show_all()
+            else:
+                self._title.set_markup(_title_markup(title))
+                self._detail.set_text(detail.strip())
+                self._hint.set_text(hint)
+        except Exception as e:         # noqa: BLE001 — status is a nicety, boot isn't
+            log(f"(no status screen, continuing without one: {e})")
+            self._no_display = True
+
+    def sleep(self, seconds: float):
+        """Wait, with the main loop turning."""
+        if self.stopped:
+            return
+        self._loop = GLib.MainLoop()
+        src = GLib.timeout_add(int(seconds * 1000), self._wake, self._loop)
+        self._loop.run()
+        if self._loop.get_context().find_source_by_id(src) is not None:
+            GLib.source_remove(src)    # woken early by a signal
+        self._loop = None
+
+    @staticmethod
+    def _wake(loop):
+        loop.quit()
+        return False
+
+    def run(self, fn, *args):
+        """fn(*args) on a worker thread, with the main loop turning until it
+        returns; hands back its result or re-raises its exception. Raises
+        _AttemptHung if it outlives UNATTENDED_ATTEMPT_TIMEOUT."""
+        loop = self._loop = GLib.MainLoop()
+        done = {}
+
+        def work():
+            try:
+                done["value"] = fn(*args)
+            except BaseException as e:  # noqa: BLE001 — carried to the main thread
+                done["error"] = e
+            GLib.idle_add(loop.quit)
+
+        threading.Thread(target=work, daemon=True).start()
+        src = GLib.timeout_add_seconds(UNATTENDED_ATTEMPT_TIMEOUT, self._wake, loop)
+        loop.run()
+        if loop.get_context().find_source_by_id(src) is not None:
+            GLib.source_remove(src)
+        self._loop = None
+        if "error" in done:
+            raise done["error"]
+        if "value" not in done:
+            if self.stopped:
+                return None
+            raise _AttemptHung(getattr(fn, "__name__", "boot step"))
+        return done["value"]
+
+    def close(self):
+        """Take the screen down and hand the signals back."""
+        for src in self._sigs:
+            GLib.source_remove(src)
+        self._sigs = []
+        if self._win is not None:
+            self._win.destroy()
+            self._win = None
+            while Gtk.events_pending():  # so the next window starts clean
+                Gtk.main_iteration()
+
+
+def _fatal_unattended(title: str, detail: str) -> int:
+    """The fail-safe screen with nobody to read it: stay up, keep beating with
+    state 'fatal', then exit so launcher.sh restarts us and everything is re-read
+    from scratch. Whatever fixes this (a redeploy, an edited vault note) reaches the
+    wall on its own. Never EXIT_OPERATOR, which would strand it on the menu."""
+    sec = cfg.env_int("SOC_UNATTENDED_RELOAD_SEC", 300, lo=1, hi=86400)
+    board = _StatusBoard()
+    try:
+        board.show(title, detail,
+                   f"This wall needs nothing pressed. It checks again every "
+                   f"{sec} s and recovers by itself once the problem is fixed.")
+        board.sleep(sec)
+        return 0 if board.stopped else EXIT_RELOAD
+    finally:
+        board.close()
+
+
+def _retry_delay(attempt: int) -> float:
+    """Capped exponential backoff for the unattended vault retry; attempt >= 1."""
+    return min(UNATTENDED_RETRY_INITIAL * 2 ** min(attempt - 1, 16),
+               UNATTENDED_RETRY_MAX)
+
+
+def _open_vault_unattended(vault, board: _StatusBoard) -> "int | None":
+    """Open the vault with nobody here: on a worker, with the status screen up,
+    retrying on a capped backoff for as long as it takes. A vault that is late
+    (network not up, Vaultwarden starting after the wall), locked, or misconfigured
+    all land here, and each attempt re-reads the sealed master and the server, so a
+    fix takes effect without a restart. Returns None when open, or an exit code."""
+    url = getattr(vault.backend, "url", "") or os.environ.get("SOC_VAULT_URL", "")
+    attempt = 0
+    board.show("Waiting for the vault", "Opening the secrets vault…",
+               "This wall needs nothing pressed. It keeps trying by itself.")
+    while not board.stopped:
+        attempt += 1
+        try:
+            board.run(vault.open)
+            return 0 if board.stopped else None
+        except _AttemptHung:
+            log("vault open wedged; exiting so the launcher starts a clean process")
+            return EXIT_RELOAD
+        except Exception as e:         # noqa: BLE001 — whatever it is, we retry
+            # "Rejected" is only the classifier's catch-all, right when someone has
+            # just typed a password. Here nobody has: show the real reason.
+            reason = _classify_unlock_error(str(e), url)
+            if reason == _MASTER_REJECTED:
+                reason = f"The vault did not open: {e}"
+            delay = _retry_delay(attempt)
+            log(f"vault not ready (attempt {attempt}): {e}; retrying in {delay:.0f}s")
+            board.show("Waiting for the vault", reason,
+                       f"This wall needs nothing pressed. Attempt {attempt}; "
+                       f"trying again in {delay:.0f} s.")
+            board.sleep(delay)
+    return 0
 
 
 def main():
+    try:
+        return _main()
+    finally:
+        _beat.stop()                   # no-op unless the heartbeat ever started
+
+
+def _merge_vpn_overrides(conf: cfg.Config, ov: dict):
+    """Lay the on-screen VPN edits over the loaded config. conf.vpn is the first of
+    conf.vpns, so it follows the merged list: a removed or reordered first VPN must
+    not stay behind in it (apply_config keeps the same rule at runtime)."""
+    from .configwin import apply_vpn_override, apply_vpns_override
+    if "_vpns" in ov:
+        conf.vpns = apply_vpns_override(conf.vpns, ov)
+        conf.vpn = conf.vpns[0] if conf.vpns else {}
+    else:
+        apply_vpn_override(conf.vpn, ov)
+
+
+def _main():
+    unattended = perf.unattended()
     # Geometry preview (no display, no vault needed) — read the local file.
     if os.environ.get("SOC_DRY_RUN") == "1":
         panels_file = os.environ.get("SOC_PANELS_FILE") or _resolved_panels()
@@ -1285,7 +2088,7 @@ def main():
             conf = cfg.load(panels_file)
         except cfg.ConfigError as e:
             log(f"FATAL config error:\n{e}")
-            return 2
+            return EXIT_RELOAD if unattended else EXIT_OPERATOR
         for p in conf.panels:
             g = p.geometry
             log(f"  {p.id:4s} {p.engine:8s} {p.mode:6s} -> {p.effective_url}  "
@@ -1299,9 +2102,21 @@ def main():
     # master (returns instead of raising) so the wall can pop the themed Unlock
     # dialog below, rather than dying with the cryptic 'no vault master password'.
     have_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    if have_display and "SOC_VAULT_INTERACTIVE" not in os.environ:
+    if unattended:
+        # Nobody can answer a prompt, so no backend may defer to one, whatever the
+        # environment says.
+        os.environ["SOC_VAULT_INTERACTIVE"] = "0"
+    elif have_display and "SOC_VAULT_INTERACTIVE" not in os.environ:
         os.environ["SOC_VAULT_INTERACTIVE"] = "1"
-    vault = Vault(ttl=cfg.env_float("SOC_CRED_TTL", 30.0, lo=1.0))
+    # The heartbeat starts here, before anything can block.
+    _beat.start("unlocking")
+    board = None
+    try:
+        vault = Vault(ttl=cfg.env_float("SOC_CRED_TTL", 30.0, lo=1.0))
+    except VaultError as e:
+        if not unattended:
+            raise
+        return _fatal_screen("Vault backend error", str(e))
     backend = os.environ.get("SOC_VAULT_BACKEND", cfg.DEFAULT_VAULT_BACKEND)
     log(f"opening vault (backend={backend}) ...")
     # VaultLockedError (litebw) is the catchable 'please unlock' signal — distinct
@@ -1321,7 +2136,13 @@ def main():
     # operator could blow the 120s deadline on the FIRST (legitimate) prompt —
     # so we count the relock cycles instead.
     unlock_relock_attempts = 0
-    while True:
+    if unattended:
+        board = _StatusBoard()
+        rc = _open_vault_unattended(vault, board)
+        if rc is not None:
+            board.close()
+            return rc
+    while not unattended:
         try:
             vault.open()
             break
@@ -1381,29 +2202,49 @@ def main():
                     "configured (sealed host-bound, or via the keyring). "
                     "Use Open Setup to configure the vault, then relaunch.")
             log(f"vault not ready ({e}); retrying ...")
+            _beat.set("unlocking")     # no loop is turning here: beat by hand
             time.sleep(3)
     log("vault unlocked + synced")
 
     # 2. config — from the vault note (rbw) or the local file
+    _beat.set("starting")
     try:
-        conf = load_config(vault)
+        if board is not None:
+            board.show("Starting the wall", "Reading the wall configuration…")
+            conf = board.run(load_config, vault)
+            board.close()
+            board = None
+        else:
+            conf = load_config(vault)
     except cfg.ConfigError as e:
+        if board is not None:
+            board.close()
         return _fatal_screen(
             "Configuration error",
             str(e),
             "The wall config (vault note or panels.yaml) is invalid. "
             "Use Open Setup to fix it, then relaunch.")
+    except Exception as e:             # noqa: BLE001
+        if board is None:
+            raise
+        board.close()
+        return _fatal_screen("Configuration error", str(e))
+    if conf is None:                   # SIGTERM during the read
+        return 0
     for w in conf.warnings:
         log(f"WARNING {w}")
 
     # apply any settings set previously from the on-screen config
     try:
         from .configwin import (load_overrides, apply_overrides_to_panels,
-                                 apply_display_override, apply_vpn_override)
+                                 apply_display_override, apply_proxy_override,
+                                 apply_tunnel_override)
         ov = load_overrides()
         if ov:
             apply_display_override(conf.display, ov)
-            apply_vpn_override(conf.vpn, ov)
+            _merge_vpn_overrides(conf, ov)
+            apply_proxy_override(conf.proxy, ov)
+            apply_tunnel_override(conf.tunnel, ov)
             apply_overrides_to_panels(conf.panels, ov)
             for p in conf.panels:                        # geometry may have moved
                 p.geometry = cfg.compute_geometry(conf.display, p.grid)
@@ -1452,8 +2293,6 @@ def main():
         #    socket.create_connection + log() (thread-safe); they touch GTK only
         #    via the VPN pill, which already hops through GLib.idle_add. daemon
         #    so the worker can never block host.shutdown.
-        import threading
-
         def _readiness_probes():
             wait_for_vpn(conf.vpns, timeout=ready_timeout)
             wait_for_tunnels(conf.panels, timeout=ready_timeout)
@@ -1461,7 +2300,14 @@ def main():
 
         # Unconfigured launch: open the on-screen Settings once the loop is running so the
         # operator configures panels live on an otherwise-empty wall (no relaunch).
-        if unconfigured:
+        # With nobody here to fill it in, keep the wall clear and look for a config
+        # (a redeploy, a vault note) by restarting periodically: an empty wall has
+        # nothing to lose.
+        if unconfigured and unattended:
+            host._keep_timer(GLib.timeout_add_seconds(
+                cfg.env_int("SOC_UNATTENDED_RELOAD_SEC", 300, lo=1, hi=86400),
+                host.shutdown))
+        elif unconfigured:
             GLib.idle_add(host.open_config)
 
         # all panel views, WebContexts and config objects are now built and live
@@ -1474,8 +2320,9 @@ def main():
 
         # 5. signals + main loop
         for sig in (signal.SIGINT, signal.SIGTERM):
-            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, host.shutdown)
+            host._keep_timer(_signal_add(sig, host.shutdown))
         log("entering GTK main loop")
+        _beat.set("running", views=lambda: host.panels_view)
     except KeyboardInterrupt:
         raise
     except Exception as e:  # noqa: BLE001 — a build/window crash must not go black

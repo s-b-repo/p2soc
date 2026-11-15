@@ -1,0 +1,21 @@
+{
+ "env": {
+  "SOC_CDP_BASE_PORT": "9222",
+  "SOC_CONFIG_VAULT_ITEM": "SOC Wall Config",
+  "SOC_CRED_TTL": "0",
+  "SOC_INJECT_TMPL": "/opt/soc-display/inject/login.js.tmpl",
+  "SOC_LAUNCH_STAGGER": "1.5",
+  "SOC_MEM_MIN_AVAIL_MB": "",
+  "SOC_PANELS_FILE": "/etc/soc-display/panels.yaml",
+  "SOC_READY_TIMEOUT": "120",
+  "SOC_ROOT": "/opt/soc-display",
+  "SOC_SECRET_DIR": "/etc/soc-display/secret",
+  "SOC_SESSION": "auto",
+  "SOC_VAULT_BACKEND": "",
+  "SOC_VAULT_EMAIL": "k@soc.local",
+  "SOC_VAULT_URL": "",
+  "SOC_VPN_DRY_RUN": "0"
+ },
+ "soc_root": "/opt/soc-display",
+ "user": "soc"
+}

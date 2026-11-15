@@ -15,6 +15,14 @@ import pytest  # noqa: E402
 from host import vault  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_webdata(tmp_path, monkeypatch):
+    """Point the private web-data dir (cookies/storage) at a per-test tmp dir, so a
+    panel build can neither scatter files into the repo nor try to create
+    /etc/soc-display/webdata on a box where /etc/soc-display exists."""
+    monkeypatch.setenv("SOC_WEBDATA_DIR", str(tmp_path / "webdata"))
+
+
 class FakeBackend:
     """In-memory stand-in for the rbw vault backend.
 

@@ -1,0 +1,7 @@
+{
+ "env": {
+  "SOC_VAULT_EMAIL": "a@b.c"
+ },
+ "soc_root": "/opt/soc-display",
+ "user": "soc"
+}

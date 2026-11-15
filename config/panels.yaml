@@ -29,6 +29,7 @@ display:
   #   single  -> always one fullscreen window holding the whole grid (webkit
   #              panels only — the most robust choice, works on any compositor)
   layout: auto
+  # fullscreen: false  # windowed, for a desktop session (SOC_WINDOWED=1 also forces it)
 
 panels:
   # --- Panel 1 -------------------------------------------------------------
@@ -48,6 +49,20 @@ panels:
     keepalive:
       strategy: reload          # reload | click | xhr | none
       intervalSec: 600
+    # tenant: "acme"            # optional tenant tag (multi-tenant grouping)
+    # Click-zone fallback for auto-login, captured by the on-screen Calibrate mode:
+    # login_zones:              # user / pass / submit, each a 0.0..1.0 screen ratio
+    #   user: { x_pct: 0.5, y_pct: 0.25 }
+    # --- Optional renderer security / compat knobs (all default to the SAFE value;
+    #     omit them for the default behaviour). See docs/CONFIGURATION.md. ---
+    # persist: true             # keep cookies + web storage on disk so a session
+    #                           # survives a reload AND a wall restart (false = ephemeral)
+    # user_agent: "Mozilla/5.0 (X11)"   # override the browser User-Agent
+    # allow: ["*.cdn.example.net"]      # extra ALLOWED top-level-nav domains
+    #                                   # (own origin + bundled SSO are allowed already)
+    # block_trackers: true      # apply the analytics/tracker blocklist (false = don't)
+    # unblock: ["segment.io"]   # tracker hosts THIS panel may load anyway
+    # allow_insecure: false     # accept a self-signed cert (alias: insecure_tls)
 
   # --- Panel 2 -------------------------------------------------------------
   - id: p2
@@ -110,8 +125,15 @@ tunnel:
   enabled: true
   jump_host: "tunneluser@jump.example.net"
   identity: "/etc/soc-display/keys/tunnel_ed25519"
-  # forwards are auto-derived from panels[].tunnel, but you can add extras here:
+  # forwards are auto-derived from panels[].tunnel, but you can add extras here,
+  # each as [bindaddr:]port:host:port (a bad entry stops the tunnel from starting):
   extra_forwards: []
+  # SEC-6: jump-host key verification. Default "yes" (strict): provision the key
+  # first:  ssh-keyscan -t ed25519 jump.example.net >> <known_hosts>  (verify the
+  # fingerprint out of band). "accept-new" (TOFU) is for first bring-up only and
+  # requires known_hosts. Keep the quotes; any other value falls back to "yes".
+  host_key_checking: "yes"
+  known_hosts: "/etc/soc-display/keys/known_hosts"
 
 # VPN — one supervised tunnel, run by forti-vpn.service as root, so panels on a
 # VPN-side network can use mode: direct with their real IPs. Pick the backend
@@ -177,3 +199,18 @@ proxy:
   url: "http://proxy.example.com:3128"   # http | https | socks5 ://host:port
   vault_item: ""                         # e.g. "SOC Proxy" (blank = no auth)
   ignore_hosts: []                       # e.g. ["*.corp.lan", "10.0.0.0/8"]
+
+# Renderer security defaults (OPTIONAL — omit this whole block for the default
+# behaviour; every key defaults to the safe/on value). These harden every panel:
+# top-level navigation is restricted to an allowlist (own origin + bundled cloud
+# SSO + the domains below) and the top-20 analytics/trackers are blocked. None of
+# this breaks a normal dashboard — only OFF-allowlist top-level nav and
+# third-party trackers are refused. See docs/CONFIGURATION.md + docs/SECURITY.md.
+# Override at boot with SOC_NAV_ALLOWLIST / SOC_BLOCK_TRACKERS (0/1) in soc.env.
+# security:
+#   nav_allowlist: true        # gate top-level navigation to the allowlist
+#   block_trackers: true       # global default for the per-panel block_trackers
+#   allow: []                  # extra allowed top-level-nav domains (every panel),
+#                              # e.g. ["*.dashboards.corp.lan"] for self-hosted apps
+#   sso_allow: []              # extra SSO/redirect domains on top of the bundled
+#                              # security/allowlist-sso.txt, e.g. ["*.keycloak.corp.lan"]

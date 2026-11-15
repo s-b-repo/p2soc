@@ -234,3 +234,41 @@ getty-autologin to this service is validated per-deployment on the target Pi.)
 - [ ] the master password is **sealed** (`setup.py first-run`), not in any
       `.env`; the one-time PIN is recorded off-device; you accept the host-bound
       unattended-unlock tradeoff
+
+## Auto-redeploy trust
+
+`soc-update` runs fetched code as root, so whoever can write to the tracked ref
+controls every wall. That is the most important trust boundary added by unattended
+operation. Controls in place:
+
+- `git` runs as the dedicated `socupdate` user, which has no access to keys or secrets,
+  so a parser bug in git doesn't reach the tunnel key.
+- Nothing from a fetched commit runs until the ref policy and the signature check pass.
+  One limit: the check reads a mirror that `socupdate` owns, so it protects against a
+  bad commit, not against an attacker already running code as that user.
+- A commit older than the deployed one is refused, so a force-push can't quietly walk a
+  wall back to code missing a security fix.
+- Commit signatures are enforced, failing closed, once `/etc/soc-display/update-signers`
+  exists. **They are not on by default**, because they need your key. Turn them on: see
+  [AUTO_UPDATE.md](AUTO_UPDATE.md).
+- With `HARDEN=1`, outbound HTTPS is allowed by uid for the updater only, so a
+  compromised renderer stays blocked.
+
+## Sealed master, at rest
+
+Sealing uses three factors: a random 0600 `host.key`, the machine-id, and the PIN,
+through scrypt (N=2^17). An existing older seal, keyed on the world-readable machine-id
+alone, is migrated in place at the first unseal. **Any copy of the secret directory taken
+before that migration, such as an SD-card image, still has the weaker protection**, so if
+that is a concern, rotate the vault master.
+
+A short-lived ticket on tmpfs spares the box from repeating the 128 MiB KDF on every
+vault access. It is encrypted under a key derived from `host.key`, so reading it gives
+nothing that reading the seal doesn't already give. It is bound to the boot and the exact
+sealed bytes, and is never written to disk. `SOC_UNSEAL_CACHE_TTL=0` disables it.
+
+## Jump-host keys
+
+The tunnel checks the jump host's key strictly. The key is pinned at the tunnel's first
+start (`scripts/pin-jump-host.py`), which is trust-on-first-use, once, during deployment.
+Put the key in `/etc/soc-display/keys/known_hosts` beforehand to remove even that window.

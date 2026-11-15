@@ -60,7 +60,8 @@ from typing import List, Optional
 # --------------------------------------------------------------------------- #
 # Constants — every path / service the installer creates.
 # --------------------------------------------------------------------------- #
-DEPLOY_ROOT = "/opt/soc-display"
+DEPLOY_ROOT = "/opt/soc-display"        # the live symlink
+RELEASES_ROOT = "/opt/soc-releases"     # one directory per deployed release
 ETC_ROOT = "/etc/soc-display"
 
 # /etc/soc-display children we always remove (operator artefacts that the
@@ -82,6 +83,8 @@ UNITS = [
     "soc-wall.service",
     "soc-tarpit.service",
     "soc-firstboot.service",
+    "soc-update.timer",
+    "soc-update.service",
     "autossh-tunnel.service",
     "forti-vpn.service",
     "forti-vpn@.service",       # template — `disable` no-ops, file removal works
@@ -230,6 +233,9 @@ def stop_services(runner: Runner) -> None:
     # Discover dynamic instances before issuing stop on them.
     instances = discover_vpn_instances(runner)
     order = [
+        # The updater first: a timer firing mid-reinstall would fight this script.
+        "soc-update.timer",
+        "soc-update.service",
         "soc-wall.service",
         "soc-tarpit.service",
         "autossh-tunnel.service",
@@ -310,6 +316,7 @@ def remove_deploy_tree(runner: Runner) -> None:
     is untouched (we ran from there)."""
     section(f"Removing {DEPLOY_ROOT}")
     runner.remove_path(DEPLOY_ROOT)
+    runner.remove_path(RELEASES_ROOT)
 
 
 def clean_etc(runner: Runner, purge_secret: bool) -> None:

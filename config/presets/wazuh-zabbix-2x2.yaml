@@ -1,0 +1,102 @@
+# name: Wazuh + Zabbix 2x2
+# desc: A 2x2 SOC starter — Wazuh, Zabbix and two placeholder dashboards. Edit the
+#       URLs, vault items and login selectors for your environment, then deploy.
+# =============================================================================
+# SOC video-wall preset — a complete, valid panels.yaml starting point.
+# Loaded by the graphical setup wizard (host.setupgui) and customizable by hand.
+# Replace the placeholder IPs / vault items / selectors with your real ones.
+# =============================================================================
+
+display:
+  auto: true
+  width: 1920
+  height: 1080
+  cols: 2
+  rows: 2
+  gap: 0
+  layout: auto
+
+panels:
+  # --- Wazuh (top-left) ----------------------------------------------------
+  - id: wazuh
+    engine: webkit
+    grid: [0, 0]
+    mode: direct
+    url: "https://192.168.1.50/app/login"
+    vault_item: "SOC Wazuh"
+    selectors:
+      user: "#username"
+      pass: "#password"
+      submit: "button[type=submit]"
+    login_marker: "#password"
+    keepalive:
+      strategy: reload
+      intervalSec: 600
+
+  # --- Zabbix (top-right) --------------------------------------------------
+  - id: zabbix
+    engine: webkit
+    grid: [1, 0]
+    mode: direct
+    url: "http://192.168.1.60/zabbix/index.php"
+    vault_item: "SOC Zabbix"
+    selectors:
+      user: "#name"
+      pass: "#password"
+      submit: "#enter"
+    login_marker: "#password"
+    keepalive:
+      strategy: reload
+      intervalSec: 600
+
+  # --- Placeholder panel 3 (bottom-left) -----------------------------------
+  - id: panel3
+    engine: webkit
+    grid: [0, 1]
+    mode: direct
+    url: "http://192.168.1.70:3000/login"
+    vault_item: "SOC Panel 3"
+    selectors:
+      user: "#username"
+      pass: "#password"
+      submit: "button[type=submit]"
+    login_marker: "#password"
+    keepalive:
+      strategy: reload
+      intervalSec: 600
+
+  # --- Placeholder panel 4 (bottom-right) ----------------------------------
+  - id: panel4
+    engine: webkit
+    grid: [1, 1]
+    mode: direct
+    url: "http://192.168.1.80:9000/login"
+    vault_item: "SOC Panel 4"
+    selectors:
+      user: "#username"
+      pass: "#password"
+      submit: "button[type=submit]"
+    login_marker: "#password"
+    keepalive:
+      strategy: reload
+      intervalSec: 600
+
+tunnel:
+  enabled: false
+  jump_host: ""
+  identity: ""
+  extra_forwards: []
+
+vpn:
+  enabled: false
+  type: fortinet
+  gateway: ""
+  port: 443
+  vault_item: ""
+  trusted_cert: ""
+
+proxy:
+  enabled: false
+  url: ""
+  vault_item: ""
+  ignore_hosts: []

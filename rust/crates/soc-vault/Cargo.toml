@@ -1,0 +1,50 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-vault"
+description = "p2soc vault layer: native Vaultwarden/Bitwarden client, credential cache, TOTP, account seeding and encrypted vault backup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["tls", "register", "backup"]
+# https:// vault URLs (rustls + ring, system trust store). About half of
+# this crate's code size; a wall whose vault is always http://127.0.0.1 can
+# build without it, and an https URL is then refused with a clear error.
+tls = ["dep:rustls", "ureq/rustls-no-provider"]
+# Account registration needs an RSA-2048 keypair; the `rsa` crate is the only
+# heavy dependency here, so a build that never registers can drop it.
+register = ["dep:rsa", "getrandom/sys_rng"]
+# Passphrase-encrypted backup/restore of the Vaultwarden data dir.
+backup = ["dep:aes-gcm", "dep:scrypt", "dep:tar", "dep:flate2"]
+
+[dependencies]
+soc-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+# Blocking HTTP, no async runtime. TLS is rustls+ring (no OpenSSL link) and the
+# trust roots come from the system store, so the bundled webpki root set is
+# deliberately left out.
+ureq = { version = "3.5", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+aes = { version = "0.9", default-features = false }
+cbc = { version = "0.2", default-features = false, features = ["block-padding"] }
+hmac = "0.13"
+sha1 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+# Same major as ureq pulls in, so only one copy is linked.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+subtle = "2"
+getrandom = "0.4"
+rsa = { version = "0.10", default-features = false, features = ["std", "encoding"], optional = true }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"], optional = true }
+scrypt = { version = "0.12", default-features = false, optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
+flate2 = { version = "1", optional = true }
+
+[lints]
+workspace = true

@@ -443,9 +443,10 @@ class ReadSession:
         return {"Authorization": f"Bearer {self.access_token}"}
 
     # -- ciphers ------------------------------------------------------------ #
-    def _raw_ciphers(self):
+    def _list_api(self, path: str) -> list:
+        """GET a Bitwarden list endpoint, refreshing the bearer once on a 401."""
         def fetch():
-            r = self._req("/api/ciphers", headers=self.auth)
+            r = self._req(path, headers=self.auth)
             return r.get("Data", r.get("data", []))
         try:
             return fetch()
@@ -453,6 +454,9 @@ class ReadSession:
             if e.code == 401 and self.refresh():
                 return fetch()
             raise
+
+    def _raw_ciphers(self):
+        return self._list_api("/api/ciphers")
 
     @staticmethod
     def _ci(cipher: dict, *names):
@@ -475,6 +479,7 @@ class ReadSession:
             "password": decrypt_field(pw, self.ek, self.mk),
             "notes": decrypt_field(notes, self.ek, self.mk),
             "totp": decrypt_field(totp, self.ek, self.mk),
+            "folder_id": self._ci(c, "FolderId", "folderId"),
         }
 
     def list_ciphers(self) -> list:
@@ -496,6 +501,21 @@ class ReadSession:
             if item["name"] == name:
                 return item
         return None
+
+    def names_in_folder(self, folder: str) -> list:
+        """Names of every cipher in the folder NAMED `folder` ([] if unknown).
+        Folder names are encrypted, so they are matched client-side."""
+        ids = set()
+        for f in self._list_api("/api/folders"):
+            try:
+                if decrypt_field(self._ci(f, "Name", "name"),
+                                 self.ek, self.mk) == folder:
+                    ids.add(self._ci(f, "Id", "id"))
+            except (VaultSeedError, ValueError):
+                continue
+        if not ids:
+            return []
+        return [c["name"] for c in self.list_ciphers() if c["folder_id"] in ids]
 
 
 class _HTTPStatusError(VaultSeedError):
@@ -687,6 +707,32 @@ class LitebwBackend:
     def notes(self, item: str) -> str:
         rec = self._lookup(item)
         return (rec or {}).get("notes", "") if rec else ""
+
+    def notes_required(self, item: str, purpose: str = "") -> str:
+        from host.vault import require_notes
+        return require_notes(self.notes(item), item, purpose)
+
+    def delete(self, item: str) -> bool:
+        """Delete a login or secure note, using this session's master (so it also
+        works after an operator-typed unlock)."""
+        session = self._ensure_session()
+        try:
+            ok = vaultseed.delete_login(session.base, session.email,
+                                        session._master, item)
+        except VaultSeedError as e:
+            raise self._vault_error(str(e))
+        if ok and self._ciphers is not None:
+            self._ciphers.pop(item, None)
+        return ok
+
+    def list_by_folder(self, folder: str) -> list:
+        """Uncached on purpose: the GUI calls it on demand."""
+        try:
+            return self._ensure_session().names_in_folder(folder)
+        except VaultLockedError:
+            raise
+        except VaultSeedError as e:
+            raise self._vault_error(str(e))
 
     def code(self, item: str) -> str:
         rec = self._lookup(item)

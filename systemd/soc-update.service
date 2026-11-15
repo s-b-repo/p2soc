@@ -1,0 +1,21 @@
+[Unit]
+Description=SOC wall zero-touch redeploy (check, deploy, verify, roll back)
+Documentation=file:///opt/soc-display/docs/AUTO_UPDATE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The system python, deliberately: a release that breaks the venv must not also
+# break the thing that recovers from it.
+ExecStart=/usr/bin/python3 /opt/soc-display/scripts/soc-update.py run
+# Long enough for a dependency change plus the health wait.
+TimeoutStartSec=45min
+# Stay out of the wall's way on a 1 GB board: it must never starve the panels.
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=25
+MemoryHigh=300M
+# It restarts other units and must survive doing so.
+KillMode=process
+StateDirectory=soc-update

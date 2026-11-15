@@ -4,14 +4,13 @@ Primary target: **Raspberry Pi 5 (1 GB+)**, Raspberry Pi OS (64-bit, Bookworm),
 HDMI monitor — but the installer runs on any mainstream Linux. It keeps your
 existing system intact.
 
-By default (`INSTALL_MODE=desktop`) it is **desktop-friendly**: it deploys
-everything (users, `/opt/soc-display`, `/etc/soc-display`, systemd units, the
-`litebw` client) and adds a **clickable "SOC Wall" launcher** to your apps menu,
-but it does **not** touch the systemd default target and does **not** enable tty1
-autologin — your existing desktop / login manager keeps working, and you start
-the wall on demand from the menu icon. Choose `INSTALL_MODE=kiosk` only when you
-want the dedicated appliance behavior, where the box **autologins on tty1 into
-its own kiosk session** at boot (reversible — see [Uninstall](#uninstall)).
+By default (`INSTALL_MODE=auto`) it picks the right behaviour for the box. With no
+desktop environment it installs as a **kiosk**: the box autologins on tty1 into its own
+session at boot. Where a display manager is in use it installs as **desktop**: it deploys
+everything and adds a clickable "SOC Wall" launcher, but leaves the default target and
+tty1 alone, so your existing desktop keeps working and you start the wall from the menu.
+Either way it is reversible (see [Uninstall](#uninstall)). Force one with
+`INSTALL_MODE=kiosk` or `INSTALL_MODE=desktop`.
 
 ## Supported distros
 
@@ -60,9 +59,9 @@ Knobs (env vars):
 
 | Var | Default | Meaning |
 |---|---|---|
-| `INSTALL_MODE` | `desktop` | `desktop`: deploy everything + add the "SOC Wall" menu launcher, but leave the systemd default target and tty1 untouched (your DE keeps working). `kiosk`: also take over tty1 (autologin into the kiosk session) and `set-default multi-user.target` — the dedicated-appliance path |
+| `INSTALL_MODE` | `auto` | `auto`: kiosk on a box with no desktop environment, else desktop. `desktop`: deploy everything + add the "SOC Wall" menu launcher, but leave the systemd default target and tty1 untouched (your DE keeps working). `kiosk`: also take over tty1 (autologin into the kiosk session) and `set-default multi-user.target` — the dedicated-appliance path |
 | `SESSION` | `auto` | display stack: `auto` (install both; at runtime try **Wayland → XWayland → XLibre → Xorg**), or force one of `wayland` / `xwayland` / `xlibre` / `xorg` / `x11` |
-| `VW_MODE` | `docker` | `docker` (official image) or `native` (binary at `/usr/local/bin/vaultwarden`) |
+| `VW_MODE` | `native` | `native`: hardened unit, with the official binary fetched and pinned by digest, no Docker daemon. `docker`: the same pinned image under the distro's Docker |
 | `HARDEN` | `0` | `1` also installs the nftables firewall + key-only sshd |
 | `KIOSK_USER` | `soc` | kiosk login user (autologin on tty1) |
 | `SVC_USER` | `socsvc` | service user that owns the autossh tunnel |
@@ -106,17 +105,13 @@ stop the wall; it leaves your desktop session as it was.
 
 ## 4. Create the vault + add logins
 
-```bash
-sudo systemctl start vaultwarden
-```
+`sudo python3 setup.py deploy` does this for you: it creates the account, then stores
+each panel's login under its `vault_item` name, and `vpn.vault_item` too if you enabled
+a VPN. To add or change a login later, run `python3 setup.py creds`.
 
-Open the Vaultwarden web vault (over an SSH tunnel for safety:
-`ssh -L 8222:127.0.0.1:8222 pi@<ip>` then browse `http://127.0.0.1:8222`), create
-the kiosk account (matching `SOC_VAULT_EMAIL`), then add one **login item per
-panel, named exactly to match its `vault_item`**, with the username/password the
-panel expects. If you enabled the Fortinet VPN, also add a login named to match
-**`vpn.vault_item`** holding the FortiGate username + password. Set
-`SIGNUPS_ALLOWED=false` again afterwards (it's a systemd drop-in now — no `.env`).
+Native Vaultwarden runs without its web interface: the binary is installed alone, and
+the kiosk has no use for that surface. Signups stay off except for the moment `deploy`
+creates the account.
 
 ## 4b. Seal the master password (no plaintext .env)
 
@@ -171,7 +166,10 @@ regenerates the Openbox grid from `xrandr` at every start, the Wayland session
 does the same for labwc, and the single-window layout tracks the real screen
 size directly. Just plug in any HDMI monitor.
 
-## 7. Reboot
+## 7. Start it
+
+`setup.py deploy` starts the wall when it finishes, so there is nothing to do here.
+To run the steps by hand instead, finish with a reboot:
 
 ```bash
 sudo systemctl reboot     # or: reboot  (non-systemd)

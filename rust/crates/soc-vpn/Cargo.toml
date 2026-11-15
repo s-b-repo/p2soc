@@ -1,0 +1,21 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-vpn"
+description = "p2soc VPN supervisor: classified reconnects, auth-lockout holds, sd_notify, multi-VPN routing policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+soc-core.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+libc.workspace = true
+# Safe syscall wrappers (process control, poll, pipe) so the crate needs no
+# `unsafe` of its own.
+rustix = { version = "1", features = ["process", "event", "pipe"] }
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+
+[lints]
+workspace = true

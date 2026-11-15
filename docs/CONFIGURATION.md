@@ -373,7 +373,7 @@ The host auto-profiles the hardware (no config needed) and exposes overrides in
 | `SOC_CHROMIUM_HWACCEL` | `auto` | `auto` \| `never`. Mirrors `SOC_WEBKIT_HWACCEL` for **Chromium** panels: auto adds V3D GPU flags (`--ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy --use-gl=egl`) on ARM boards with a render node so Chromium composites on the GPU instead of silently dropping to SwiftShader/llvmpipe software rendering. `never` opts a problematic Chromium build out. No effect on x86. |
 | `SOC_LAUNCH_STAGGER` | `1.5` | seconds between panel launches — spreads the boot RAM/CPU spike. |
 | `SOC_CHROMIUM_OZONE` | `auto` | `x11` \| `wayland`. Chromium panels default to X11/XWayland so WM_CLASS placement works under Openbox and labwc. |
-| `SOC_MEM_MIN_AVAIL_MB` | `96` | Memory-watchdog floor: when `MemAvailable` falls below this, the host recycles a panel (heaviest Chromium first, else a WebKit reload) to reclaim memory. |
+| `SOC_MEM_MIN_AVAIL_MB` | `150` | Memory-watchdog floor: when `MemAvailable` falls below this, the host recycles a panel (heaviest Chromium first, else a WebKit reload) to reclaim memory. |
 | `SOC_MEM_CHECK_SEC` | `30` | How often the memory watchdog samples `MemAvailable`. |
 | `SOC_MEM_RECYCLE_COOLDOWN` | `120` | Minimum seconds between watchdog recycles (anti-thrash; it also needs two consecutive low readings before acting). |
 

@@ -14,9 +14,9 @@
 #   ./launch.sh --help
 #
 # Dev uses the bundled dummy panels + the JSON "dev" vault backend, so it runs
-# with no Vaultwarden and no root. To use the real rbw -> Vaultwarden vault in
-# dev, run:  SOC_VAULT_BACKEND=rbw ./launch.sh   (rbw must be configured). For a
-# real install, use --pi.
+# with no Vaultwarden and no root. To use a real Vaultwarden vault in dev, run:
+# SOC_VAULT_BACKEND=litebw ./launch.sh   (litebw is pure-Python; the legacy rbw
+# also works if configured). For a real install, use --pi.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"

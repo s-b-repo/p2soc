@@ -1,0 +1,61 @@
+# cargo-deny policy: known-vulnerable or yanked crates fail CI, and only
+# GPL-3.0-compatible licenses may be linked into the binary.
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin attack): a timing sidechannel in RSA PKCS#1 v1.5
+    # *decryption* — a private-key operation. soc-inode only performs public-key
+    # *encryption* of the login password (the optional H3C_USER_RSAKEY firmware
+    # variant) and never decrypts, so the vulnerable path is unreachable here.
+    # No fixed `rsa` release exists; re-evaluate when one ships.
+    { id = "RUSTSEC-2023-0071", reason = "only RSA public-key encryption is used; the sidechannel affects private-key decryption, which this workspace never performs" },
+
+    # --- gtk-rs 0.18 ecosystem (GUI); irreducible without a major toolkit bump ---
+    # RUSTSEC-2024-0429: unsoundness in glib's `VariantStrIter` Iterator impls.
+    # The kiosk never constructs or iterates a `VariantStrIter` (it builds no
+    # GVariant string arrays); the unsound path is unreachable from this code.
+    { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter is never used by the kiosk; pinned by gtk-rs 0.18 with no fixed release in that line" },
+    # RUSTSEC-2024-0370: proc-macro-error is unmaintained. It is a BUILD-TIME
+    # proc-macro dependency of glib-macros only; nothing from it ships in the
+    # binary, so there is no runtime exposure.
+    { id = "RUSTSEC-2024-0370", reason = "build-time-only proc-macro dep of glib-macros (gtk-rs 0.18); not linked into the shipped binary" },
+
+    # RUSTSEC-2024-0449: unsafe-libyaml is unmaintained. Reached via serde_yaml_ng,
+    # which parses only the operator-authored, local config files (config/*.yaml) —
+    # trusted input, never attacker-controlled network data.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained; only parses local operator-authored YAML config, never untrusted input" },
+
+    # RUSTSEC-2026-0009: stack-exhaustion DoS in yasna when *parsing* deeply
+    # nested ASN.1. Reached only through rcgen, a DEV-dependency used to generate
+    # the http_mock test's self-signed localhost cert. rcgen only *encodes* ASN.1;
+    # it never parses untrusted input, and nothing dev-only ships in the binary.
+    { id = "RUSTSEC-2026-0009", reason = "dev-only (rcgen test-cert generation); yasna is used to encode, never to parse untrusted ASN.1" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "GPL-3.0-or-later",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

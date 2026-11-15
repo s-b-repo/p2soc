@@ -1,0 +1,3 @@
+[build]
+# Keep peak memory modest: this also builds on small boards and CI runners.
+jobs = 4

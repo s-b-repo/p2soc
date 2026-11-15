@@ -18,6 +18,12 @@ Env:
                       used by `make vpn-check` to verify wiring without a FortiGate
   SOC_VPN_AUTH_RETRY_DELAY / SOC_VPN_CERT_RETRY_DELAY   long backoffs (default 300)
   SOC_VPN_BACKOFF_INITIAL / SOC_VPN_BACKOFF_MAX         network backoff (5 / 60)
+  SOC_VPN_CONNECT_TIMEOUT   restart a child that shows no tunnel in this many
+                            seconds (default 300; 0 disables)
+  SOC_VPN_STALL_SECS        withhold the systemd watchdog once a supervisor makes
+                            no progress for this long (default 300)
+  SOC_VPN_STATUS_INTERVAL   seconds between STATUS= probes of each ready_probe (30)
+  SOC_VPN_NAME              run only this vpns[] entry (forti-vpn@<name>.service)
 """
 import os
 import sys

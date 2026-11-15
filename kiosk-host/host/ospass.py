@@ -34,20 +34,35 @@ verify the desktop operator's password:
      `pam.authenticate(user, pw)`        (older < 1.8)
 
 Every backend returns ONLY a bool. We never store / log / display the
-entered password; the variable goes out of scope at function return.
+entered password; the variable goes out of scope at function return. It travels
+on the backend's stdin, never argv.
+
+`su` only proves something when it actually asks. Two cases where it does not
+are refused rather than trusted: a root caller (pam_rootok lets root su to anyone
+with no password at all, so su is skipped and the PAM backends decide) and a
+target account with an empty password (su then succeeds whatever was typed, so
+a random wrong password is tried too, and an account that accepts it fails).
+
+The username reaches su/pamtester as its own argv slot and can be typed at the
+glass, so anything shaped like an option is rejected before a backend runs.
 """
 from __future__ import annotations
 
 import logging
 import os
 import pwd
+import re
+import secrets
 import shutil
 import subprocess
 import time
-from typing import Optional
 
 
 _log = logging.getLogger("soc.ospass")
+
+# A POSIX-ish account name. Rejects a leading '-': the name is an argv slot of a
+# setuid binary, and at the glass it is free text.
+_USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\$?\Z")
 
 
 def operator_user() -> str:
@@ -116,7 +131,7 @@ def verify_os_password(user: str, password: str,
     Never raises. Constant-time wall-clock: every backend takes at least
     `_MIN_LATENCY_SEC` seconds so wrong-vs-right can't be distinguished by
     response timing (PAM modules vary, su is fast)."""
-    if not user or not password:
+    if not user or not password or not _USERNAME_RE.match(user):
         return False
     start = time.monotonic()
     try:
@@ -128,8 +143,10 @@ def verify_os_password(user: str, password: str,
             try:
                 rv = backend(user, password, timeout=timeout)
             except Exception as e:                       # noqa: BLE001
-                _log.debug("ospass backend %s raised: %s",
-                           backend.__name__, e)
+                # Type only: an encode error's text quotes the input, which here
+                # is the password.
+                _log.debug("ospass backend %s raised %s",
+                           backend.__name__, type(e).__name__)
                 rv = None
             if rv is None:
                 continue                                 # backend unusable
@@ -186,11 +203,8 @@ def _verify_via_pamtester(user: str, password: str, *, timeout: float):
     return r.returncode == 0
 
 
-def _verify_via_su(user: str, password: str, *, timeout: float):
-    """su subprocess fallback. Returns True/False on a real attempt; None
-    if su itself can't be found (extremely unlikely on Linux)."""
-    if not shutil.which("su"):
-        return None
+def _su_accepts(user: str, password: str, timeout: float) -> bool:
+    """One `su` attempt. A timeout or OS error counts as a refusal."""
     # `su - <user> -c true` reads the password on stdin via PAM when no
     # tty is attached. Works on every Linux distro tested. Returns 0 on
     # success, non-zero on auth failure (and on other errors, which we
@@ -206,3 +220,17 @@ def _verify_via_su(user: str, password: str, *, timeout: float):
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0
+
+
+def _verify_via_su(user: str, password: str, *, timeout: float):
+    """su subprocess fallback. Returns True/False on a real attempt; None
+    if su can't vouch for anything here: the binary is missing (extremely
+    unlikely on Linux), or we run as root, where pam_rootok makes it succeed
+    with no password check at all."""
+    if not shutil.which("su") or os.geteuid() == 0:
+        return None
+    if not _su_accepts(user, password, timeout):
+        return False
+    # A password-less account lets su through whatever was typed, which would
+    # let anyone at the glass name that account and pass this gate.
+    return not _su_accepts(user, secrets.token_urlsafe(24), timeout)

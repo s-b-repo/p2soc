@@ -5,6 +5,97 @@ All notable changes to **p2soc** (the SOC video-wall kiosk). Format follows
 
 ## [Unreleased]
 
+### Zero-touch operation
+
+- **Automatic redeploy with rollback** (`scripts/soc-update.py`, `soc-update.timer`). A
+  wall checks the tracked ref every 15 minutes, builds a complete release beside the
+  live one, proves it, swaps with one atomic rename and watches the wall. A release
+  that doesn't come up is rolled back, retried once later, then blocked. See
+  `docs/AUTO_UPDATE.md`.
+- **Atomic releases.** `/opt/soc-display` is now a symlink into `/opt/soc-releases/<id>`,
+  so a power cut can't leave a half-copied tree. Venvs are shared between releases and
+  keyed by requirements. An existing in-place install is migrated by `install.sh`.
+- **Liveness heartbeat** from the GTK main loop to tmpfs. `launcher.sh` kills a host
+  whose main loop has hung (a frozen screen with a live process), and the updater
+  judges releases by it. It watches for the file changing, not its timestamp, because
+  a Pi has no battery-backed clock and NTP can jump the date.
+- **`SOC_UNATTENDED=1`** (set on kiosks): nothing can wait on a human. A locked or late
+  vault, a bad config or a parked panel becomes a status screen with automatic retry.
+- **Deploy finishes the job.** `setup.py deploy` now creates the vault account and
+  starts the wall, with no reboot or manual step afterwards.
+  `deploy --unattended --master-fd N --creds-fd N` does it with no prompts at all.
+- **`INSTALL_MODE=auto`** (the default): kiosk on a box with no desktop environment,
+  desktop where a display manager is in use.
+- **Self-repair** of damaged deployed files, the hardware watchdog (kiosk), reboot on
+  kernel panic, and a dead-man's switch (`SOC_HEALTHCHECK_URL`).
+- **`stable` channel.** CI fast-forwards `stable` only after every check has passed, so
+  a broken push never reaches a wall. CI workflows were restored.
+
+### Security
+
+The tree had lost hardening its own docs described as done. A restore commit put back
+older code while the docs stayed, and the tests that would have caught it weren't
+being run. All of the following are now real and tested:
+
+- Sealed master: was scrypt N=2^14 keyed on the world-readable machine-id. Now a 0600
+  `host.key`, scrypt N=2^17 and a PIN floor, with PBKDF2 for FIPS. Existing seals
+  migrate in place on first unseal, crash-safely, without a prompt. Copies of the secret
+  directory taken before migration keep the weaker protection, so rotate the master if
+  that matters.
+- `setup.py --defaults` could seal the literal string `CHANGE-ME` as the vault master.
+  It now refuses.
+- The login template had lost its origin gate, so credentials could be typed into a
+  page that had navigated off its configured origin.
+- `install.sh` piped `get.docker.com` into a root shell and ran Vaultwarden under Docker
+  by default. It is now native under a hardened unit, with the binary pinned by digest
+  (`security/vaultwarden.lock`) and no Docker daemon. Docker mode uses distro packages.
+- Sudoers wildcards let the kiosk user restart any unit or pass any flag to `journalctl`
+  as root (`*` matches spaces). Every entry is now an exact command.
+- `allowed_users=anybody` on the X wrapper is now `console`.
+- Tunnels default to strict host-key checking. The old `accept-new` could never persist
+  a key because `ProtectHome` hid `~/.ssh`, so every connection trusted whatever it saw.
+  The key is now pinned on first start and enforced afterwards.
+- URL, host, port and argv validation for panels, gateways and tunnels, against option
+  injection and control characters; OpenVPN management-socket CR/LF injection.
+- On-screen config: PIN/TOTP gate and re-auth for every destructive or secret-revealing
+  action.
+- Vaultwarden signups are opened only for the one registration, through a `/run`
+  drop-in, so even a power cut can't leave them open.
+- Restored `security/trackers-top20.json` and `allowlist-sso.txt`: without them the
+  tracker blocker silently blocked nothing and SSO redirects were refused.
+
+### Fixed
+
+- **Vault access against current Vaultwarden.** Found by testing against a real
+  server: registration had moved to a two-step flow, and every cipher write now needs
+  `encryptedFor`, so account creation and all vault writes failed with HTTP 404/422.
+- Native Vaultwarden couldn't start: it exits if the web vault is enabled but absent.
+- Re-running provisioning **blanked every stored login**, by upserting empty values.
+- `soc-wall.service` and `getty@tty1` were both enabled while they `Conflict`, so they
+  raced for tty1 at boot.
+- A re-run recorded `multi-user.target` as the "original" boot target, so uninstall
+  could never restore the desktop. It also overwrote `/etc/nftables.conf`.
+- `sudo ./install.sh` from a user-owned clone lost the source commit to git's ownership
+  check, and `SOC_SKIP_PACKAGES` didn't stop the X server install.
+- `python3 setup.py deploy` needed PyYAML and cryptography from a venv it had not
+  entered. It now moves itself into the venv once one exists.
+- A re-render of `soc.env` dropped every key it didn't know, including lockdown settings.
+- The deploy layer (`setup.py`, `install.sh`, session scripts, `provision.py`) was an old
+  snapshot, inconsistent with the host. Rebased onto v1.3.0, with the features the host
+  lost restored: live add/remove of panels, theme sync, screenshot, multi-VPN settings.
+- The iNode client regained bounds checks on gateway data and subprocess timeouts.
+- VPN supervisor: a closed pipe wedged it, restarts gave up after 3 attempts, the watchdog
+  fired while stalled, concurrent OpenVPNs shared key paths, keys survived a failed write.
+- `primary` in `branding/branding.yaml` was `#FF0000`, tinting the wall red.
+
+### Tests
+
+The suite didn't collect when this work began: 190 of 420 tests failed, plus one
+collection error. 26 test files for this line's own features, dropped earlier, are back.
+`test_soc_update.py` runs the updater against real git repositories and real symlink
+swaps, including power cuts, and `test_vault_wire.py` encodes behaviour observed from a
+live Vaultwarden 1.37.5.
+
 ### Release-readiness pass (Pi-5 / aarch64, pure-Python vault, packaged release)
 
 - **litebw replaces rbw as the default vault backend — pure Python, no Rust.**
@@ -52,7 +143,7 @@ proxy, on-screen configuration, self-healing panels, and hardware auto-tuning.
   `MemAvailable` and, under sustained pressure (two low readings, with a
   cooldown so it can't thrash), recycles one panel to reclaim memory — the
   heaviest measurable panel (Chromium RSS) first, otherwise WebKit panels
-  reloaded round-robin. Tunables: `SOC_MEM_MIN_AVAIL_MB` (default 96),
+  reloaded round-robin. Tunables: `SOC_MEM_MIN_AVAIL_MB` (default 150),
   `SOC_MEM_CHECK_SEC` (30), `SOC_MEM_RECYCLE_COOLDOWN` (120). The generated
   `soc-wall.service` also caps the session with `MemoryHigh=80%` / `MemoryMax=92%`
   so a leak throttles (or restarts the session) instead of OOM-killing the box.

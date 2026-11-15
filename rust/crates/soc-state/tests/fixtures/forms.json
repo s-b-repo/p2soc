@@ -1,0 +1,278 @@
+[
+  {
+    "args": [
+      {
+        "ca_file": "",
+        "captcha_retries": 0,
+        "client_cert": "",
+        "client_key": "",
+        "config": "",
+        "config_from_vault": false,
+        "domain": "",
+        "ead": false,
+        "enabled": true,
+        "gateway": "gw2.test",
+        "insecure": false,
+        "language": "",
+        "mac": "",
+        "name": "hq",
+        "port": 8443,
+        "ready_probe": "",
+        "realm": "",
+        "spa_aid": "",
+        "spa_key": "",
+        "spa_knock_port": 0,
+        "spa_ports": "",
+        "split_tunnel": false,
+        "trusted_cert": "",
+        "type": "inode",
+        "vault_item": "vpn-hq"
+      }
+    ],
+    "fn": "vpn_form_to_dict",
+    "out": {
+      "enabled": true,
+      "gateway": "gw2.test",
+      "name": "hq",
+      "port": 8443,
+      "split_tunnel": false,
+      "type": "inode",
+      "vault_item": "vpn-hq"
+    }
+  },
+  {
+    "args": [
+      {}
+    ],
+    "fn": "vpn_form_to_dict",
+    "out": {
+      "enabled": false,
+      "type": "fortinet"
+    }
+  },
+  {
+    "args": [
+      {
+        "captcha_retries": 2.9,
+        "ead": 1,
+        "enabled": "yes",
+        "gateway": "  gw  ",
+        "health_check_interval": -3,
+        "port": "443",
+        "spa_knock_port": "x",
+        "split_tunnel": false,
+        "type": ""
+      }
+    ],
+    "fn": "vpn_form_to_dict",
+    "out": {
+      "captcha_retries": 2,
+      "ead": true,
+      "enabled": true,
+      "gateway": "gw",
+      "port": 443,
+      "split_tunnel": false,
+      "type": "fortinet"
+    }
+  },
+  {
+    "args": [
+      {
+        "enabled": true,
+        "ignore_hosts": "x.test, y.test\nz.test",
+        "url": "http://new.test:8080",
+        "vault_item": ""
+      }
+    ],
+    "fn": "proxy_form_to_dict",
+    "out": {
+      "enabled": true,
+      "ignore_hosts": [
+        "x.test",
+        "y.test",
+        "z.test"
+      ],
+      "url": "http://new.test:8080"
+    }
+  },
+  {
+    "args": [
+      {
+        "enabled": 0,
+        "ignore_hosts": [
+          "a",
+          "",
+          "b"
+        ],
+        "url": "  "
+      }
+    ],
+    "fn": "proxy_form_to_dict",
+    "out": {
+      "enabled": false,
+      "ignore_hosts": [
+        "a",
+        "b"
+      ]
+    }
+  },
+  {
+    "args": [
+      {}
+    ],
+    "fn": "proxy_form_to_dict",
+    "out": {
+      "enabled": false
+    }
+  },
+  {
+    "args": [
+      {
+        "enabled": true,
+        "extra_forwards": "8080:web.test:80\n\n 9090:db.test:5432 ",
+        "host_key_checking": "accept-new",
+        "identity": "",
+        "jump_host": "ops@jump2.test",
+        "known_hosts": "/keys/kh"
+      }
+    ],
+    "fn": "tunnel_form_to_dict",
+    "out": {
+      "enabled": true,
+      "extra_forwards": [
+        "8080:web.test:80",
+        "9090:db.test:5432"
+      ],
+      "host_key_checking": "accept-new",
+      "jump_host": "ops@jump2.test",
+      "known_hosts": "/keys/kh"
+    }
+  },
+  {
+    "args": [
+      {
+        "host_key_checking": "no"
+      }
+    ],
+    "fn": "tunnel_form_to_dict",
+    "out": {
+      "enabled": true
+    }
+  },
+  {
+    "args": [
+      {
+        "enabled": false,
+        "extra_forwards": [
+          "1:a:2",
+          ""
+        ],
+        "host_key_checking": " YES "
+      }
+    ],
+    "fn": "tunnel_form_to_dict",
+    "out": {
+      "enabled": false,
+      "extra_forwards": [
+        "1:a:2"
+      ],
+      "host_key_checking": "yes"
+    }
+  },
+  {
+    "args": [
+      {}
+    ],
+    "fn": "tunnel_form_to_dict",
+    "out": {
+      "enabled": true
+    }
+  },
+  {
+    "args": [
+      {
+        "enabled": true,
+        "gateway": "gw2.test",
+        "name": "hq",
+        "port": 8443,
+        "split_tunnel": false,
+        "type": "inode",
+        "vault_item": "vpn-hq"
+      },
+      {
+        "ca_file": "",
+        "captcha_retries": 0,
+        "client_cert": "",
+        "client_key": "",
+        "config": "",
+        "config_from_vault": false,
+        "domain": "",
+        "ead": false,
+        "enabled": true,
+        "gateway": "gw2.test",
+        "insecure": false,
+        "language": "",
+        "mac": "",
+        "name": "hq",
+        "port": 8443,
+        "ready_probe": "",
+        "realm": "",
+        "spa_aid": "",
+        "spa_key": "",
+        "spa_knock_port": 0,
+        "spa_ports": "",
+        "split_tunnel": false,
+        "trusted_cert": "",
+        "type": "inode",
+        "vault_item": "vpn-hq"
+      },
+      {
+        "enabled": true,
+        "gateway": "gw.test",
+        "insecure": true,
+        "name": "hq",
+        "realm": "corp",
+        "set_routes": true,
+        "type": "inode",
+        "vault_item": "vpn-hq"
+      }
+    ],
+    "fn": "_mark_cleared",
+    "out": {
+      "enabled": true,
+      "gateway": "gw2.test",
+      "insecure": false,
+      "name": "hq",
+      "port": 8443,
+      "realm": null,
+      "split_tunnel": false,
+      "type": "inode",
+      "vault_item": "vpn-hq"
+    }
+  },
+  {
+    "args": [
+      {
+        "enabled": true
+      },
+      {
+        "ignore_hosts": "",
+        "url": "",
+        "vault_item": ""
+      },
+      {
+        "ignore_hosts": [
+          "a"
+        ],
+        "url": "http://x:1",
+        "vault_item": ""
+      }
+    ],
+    "fn": "_mark_cleared",
+    "out": {
+      "enabled": true,
+      "ignore_hosts": null,
+      "url": null
+    }
+  }
+]

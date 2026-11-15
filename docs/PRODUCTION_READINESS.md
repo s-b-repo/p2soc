@@ -2,10 +2,13 @@
 
 **Owner:** Claude (working goal) · **Status:** in progress · **Created:** 2026-06-23
 
-> **Progress (2026-06-23).** ✅ Done & tested (116 unit tests + headless verify green):
-> SEC-1, SEC-2, SEC-3, SEC-4 (P0); SEC-5, SEC-6, SEC-7 (P1); SEC-9, SEC-10, SEC-11,
-> SEC-12, SEC-DOC; PERF-1, PERF-2. ⏳ Remaining: SEC-8 (CDP→pipe rework — deferred,
-> needs live-Chromium validation), SEC-13, PERF-3…7, OPS-1…4, then the v1.0.0 gate.
+> **Status correction (2026-11).** An earlier version of this page marked SEC-1...SEC-4
+> and others as done. In this tree that was untrue for a while: a restore commit put back
+> older code, leaving the docs describing fixes that weren't there (for example, SEC-3's
+> seal was still machine-id only, and SEC-4's `curl | sh` was still the default). All of
+> these are now in place and covered by tests, and the 2026-11 work closes SEC-8's
+> exposure review, PERF-1...7 and OPS-2, OPS-4. Still open: SEC-8 (CDP over a pipe) and
+> the 24 h soak test, which needs real Pi hardware. See CHANGELOG.
 
 > **Mission.** Take p2soc from "code-complete and passing tests" to "safe to deploy
 > on an internet-adjacent Raspberry Pi 5 (1 GB) running 24/7 unattended in a SOC."

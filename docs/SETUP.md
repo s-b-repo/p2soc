@@ -151,7 +151,7 @@ sudo python3 setup.py            # menu → Configure (panels.yaml + soc.env)
 sudo ./install.sh                # deps, users, /opt/soc-display, systemd units, zram, autologin
 ```
 
-Installer knobs (env): `VW_MODE=docker|native`, `HARDEN=1` (nftables + key-only
+Installer knobs (env): `VW_MODE=native|docker`, `HARDEN=1` (nftables + key-only
 sshd), `KIOSK_USER=soc`, `SVC_USER=socsvc`. It is **idempotent**.
 
 The installer auto-enables `autossh-tunnel.service` only if a panel uses

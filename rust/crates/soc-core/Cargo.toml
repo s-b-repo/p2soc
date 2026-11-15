@@ -1,0 +1,16 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-core"
+description = "p2soc shared core: wall config model, validation, input guards, argv builders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

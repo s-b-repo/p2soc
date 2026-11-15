@@ -340,6 +340,8 @@ class SslVpnSession:
         if bytes(buf[:5]) != b"HTTP/":
             return bytes(buf), None  # raw frame stream
         while b"\r\n\r\n" not in buf and time.monotonic() - t0 < 15:
+            if len(buf) > C.MAX_HEADER_BYTES:
+                raise AuthError("tunnel preamble header block exceeds size cap")
             r, _, _ = select.select([sock], [], [], 10)
             if not r:
                 break
@@ -354,6 +356,9 @@ class SslVpnSession:
         if b"IPADDRESS" in head:
             netcfg = parse_netconfig(head)
         elif cl:
+            if cl > C.MAX_BODY_BYTES:
+                raise AuthError(f"tunnel preamble Content-Length {cl} exceeds "
+                                f"cap {C.MAX_BODY_BYTES}")
             while len(buf) < cl and time.monotonic() - t0 < 20:
                 r, _, _ = select.select([sock], [], [], 10)
                 if not r:

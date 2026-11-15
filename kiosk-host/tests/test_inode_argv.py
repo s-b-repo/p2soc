@@ -156,7 +156,8 @@ def test_openfortivpn_args_canonical_split():
 
 def test_build_cmd_no_extras_emits_no_separator():
     d = vpndrivers.INodeDriver()
-    cmd = d.build_cmd({"type": "inode", "gateway": "gw.example:443"}, "alice")
+    cmd = d.build_cmd({"type": "inode", "gateway": "gw.example:443",
+                        "split_tunnel": False}, "alice")
     # script + gw + user, no domain, no extras → no '--' separator
     assert cmd[-1] == "alice"
     assert "--" not in cmd
@@ -167,6 +168,7 @@ def test_build_cmd_pin_no_domain_emits_separator():
     arg ('--pin-sha256') as DOMAIN, silently dropping the cert pin."""
     d = vpndrivers.INodeDriver()
     cmd = d.build_cmd({"type": "inode", "gateway": "gw.example:443",
+                        "split_tunnel": False,
                         "trusted_cert": "AA:BB:CC:DD"}, "alice")
     assert "--" in cmd
     sep = cmd.index("--")
@@ -176,7 +178,7 @@ def test_build_cmd_pin_no_domain_emits_separator():
 def test_build_cmd_pin_with_domain_keeps_separator():
     d = vpndrivers.INodeDriver()
     cmd = d.build_cmd({"type": "inode", "gateway": "gw.example:443",
-                        "domain": "corp",
+                        "domain": "corp", "split_tunnel": False,
                         "trusted_cert": "AA:BB:CC:DD"}, "alice")
     # ... gw user corp -- --pin-sha256 hash
     assert cmd[3] == "corp"
@@ -187,7 +189,7 @@ def test_build_cmd_pin_with_domain_keeps_separator():
 def test_build_cmd_insecure_no_domain_emits_separator():
     d = vpndrivers.INodeDriver()
     cmd = d.build_cmd({"type": "inode", "gateway": "gw.example:443",
-                        "insecure": True}, "alice")
+                        "split_tunnel": False, "insecure": True}, "alice")
     sep = cmd.index("--")
     assert cmd[sep:] == ["--", "--insecure"]
 
@@ -206,11 +208,19 @@ def test_build_cmd_pin_wins_over_insecure():
 def test_build_cmd_extras_appended_after_pin():
     d = vpndrivers.INodeDriver()
     cmd = d.build_cmd({"type": "inode", "gateway": "gw.example:443",
-                        "trusted_cert": "AA",
+                        "trusted_cert": "AA", "split_tunnel": False,
                         "extra_args": ["--min-tls", "1.2", "--ead"]}, "alice")
     sep = cmd.index("--")
     # Pin comes first, then extras
     assert cmd[sep:] == ["--", "--pin-sha256", "AA", "--min-tls", "1.2", "--ead"]
+
+
+def test_build_cmd_splits_the_tunnel_by_default():
+    """On purpose: without it, a gateway's redirect-all takes over the default route
+    and DNS, and the wall loses everything that isn't behind the VPN."""
+    d = vpndrivers.INodeDriver()
+    assert "--split-tunnel" in d.build_cmd(
+        {"type": "inode", "gateway": "gw.example:443"}, "alice")
 
 
 # --- INodeDriver dispatch + log-pattern classifier ----------------------

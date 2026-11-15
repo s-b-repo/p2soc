@@ -1,0 +1,22 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-state"
+description = "p2soc on-screen settings state: overrides, the PIN/TOTP gates, the kiosk lock and the apply plan (no GUI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+soc-core.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+libc.workspace = true
+hmac = "0.13"
+sha1 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+getrandom = "0.4"
+
+[lints]
+workspace = true

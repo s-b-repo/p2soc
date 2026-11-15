@@ -1,0 +1,72 @@
+# p2soc — Rust remake of the SOC video-wall kiosk.
+# One workspace, one shipped binary (`soc-wall`); the library crates below are
+# statically linked into it. Every crate except soc-wall builds without GTK, so
+# the logic is testable on any CI runner.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+soc-core = { path = "crates/soc-core" }
+soc-brand = { path = "crates/soc-brand" }
+soc-seal = { path = "crates/soc-seal" }
+soc-setup = { path = "crates/soc-setup" }
+soc-gui = { path = "crates/soc-gui" }
+soc-inode = { path = "crates/soc-inode" }
+soc-state = { path = "crates/soc-state" }
+soc-vault = { path = "crates/soc-vault" }
+soc-vpn = { path = "crates/soc-vpn" }
+soc-web = { path = "crates/soc-web" }
+soc-sys = { path = "crates/soc-sys" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+zeroize = "1"
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Nested `if`s read better than long let-chains in the validators.
+collapsible_if = "allow"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Size-first release: the web engine dominates runtime cost, so the host itself
+# is optimised to be small and to start fast on a 1 GB Pi.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Key-derivation functions are deliberately expensive; unoptimised they make
+# the test suite crawl (scrypt at production cost: ~30 s debug vs ~1 s).
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

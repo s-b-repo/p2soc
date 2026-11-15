@@ -1,0 +1,3 @@
+SOC_VAULT_PASSWORD=fake
+SOC_MASTER_SOURCE=auto
+SOC_PINENTRY=/x/pinentry-soc.sh

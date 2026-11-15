@@ -11,10 +11,8 @@ Group=vaultwarden
 # localhost, signups off, websockets off. The /admin page is DISABLED (no
 # ADMIN_TOKEN) because the kiosk does not need it.
 #
-# First account: temporarily allow signups with a root-only drop-in, then revert:
-#   sudo systemctl edit vaultwarden   ->   [Service]
-#                                          Environment=SIGNUPS_ALLOWED=true
-#   sudo systemctl restart vaultwarden ; create the account ; remove the drop-in.
+# The first account is created by `setup.py deploy`, which opens signups through a
+# transient drop-in for the length of that one call. They are otherwise always off.
 # Enable /admin later the same way:  Environment=ADMIN_TOKEN=<vaultwarden hash>
 Environment=DATA_FOLDER=/var/lib/vaultwarden
 Environment=ROCKET_ADDRESS=127.0.0.1
@@ -22,6 +20,15 @@ Environment=ROCKET_PORT=8222
 Environment=SIGNUPS_ALLOWED=false
 Environment=SIGNUPS_VERIFY=false
 Environment=WEBSOCKET_ENABLED=false
+# Only the binary is installed (scripts/fetch-vaultwarden.py), so this must be off:
+# with the web vault enabled and absent, Vaultwarden refuses to start. It also
+# removes a whole web surface the kiosk never uses; accounts are created over the API.
+Environment=WEB_VAULT_ENABLED=false
+# A single local client: the defaults (10 workers, 10 connections) waste RAM here.
+Environment=ROCKET_WORKERS=2
+Environment=DATABASE_MAX_CONNS=2
+Environment=LOG_LEVEL=warn
+Environment=DISABLE_ICON_DOWNLOAD=true
 ExecStart=/usr/local/bin/vaultwarden
 WorkingDirectory=/var/lib/vaultwarden
 StateDirectory=vaultwarden

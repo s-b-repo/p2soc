@@ -1,0 +1,16 @@
+[Unit]
+Description=Check for a new SOC wall release every 15 minutes
+
+[Timer]
+# Calendar-based, not OnUnitActiveSec: this keeps firing after a failed run, and a
+# fleet spreads out over the random delay instead of hitting the remote at once.
+OnCalendar=*:0/15
+# Soon after boot too: a release that took the box down has to be dealt with promptly.
+OnBootSec=3min
+RandomizedDelaySec=5min
+AccuracySec=1min
+# Don't catch up on missed runs at boot: the wall gets to settle first.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

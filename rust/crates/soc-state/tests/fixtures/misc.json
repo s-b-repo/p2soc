@@ -1,0 +1,37 @@
+{
+  "inventory": [
+    {
+      "name": "item-a",
+      "origin": "panel:p1"
+    },
+    {
+      "name": "item-b",
+      "origin": "panel:p2"
+    },
+    {
+      "name": "vpn-hq",
+      "origin": "vpn:hq"
+    },
+    {
+      "name": "pxy",
+      "origin": "proxy"
+    },
+    {
+      "name": "tun",
+      "origin": "tunnel"
+    },
+    {
+      "name": "SOC Settings TOTP",
+      "origin": "SOC Wall Auth folder"
+    }
+  ],
+  "status_all": [
+    "⚠ Vaultwarden at http://127.0.0.1:8222 is NOT reachable — auto-login and the Credentials tab will fail. Check 'systemctl status vaultwarden'.",
+    "⚠ Master password is NOT host-sealed — the wall cannot self-unlock the vault at boot, so auto-login is dead until you run 'sudo python3 setup.py first-run'.",
+    "⚠ 3 panel(s) have a URL but NO vault item — those panels will show the login page without auto-filling. Set a vault item on the Panels tab and store the login on Credentials.",
+    "⚠ selectors may be stale on 2 panel(s): p1, p2. The dashboard probably changed; update the user/pass/submit selectors and login_marker on the Panels tab > Advanced."
+  ],
+  "status_email": [
+    "⚠ SOC_VAULT_EMAIL is empty in soc.env — register an account and set the email via setup.py wizard, then re-run first-run."
+  ]
+}

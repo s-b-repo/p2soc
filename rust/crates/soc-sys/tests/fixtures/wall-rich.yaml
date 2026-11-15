@@ -1,0 +1,21 @@
+# Fixture B: 3x2 with a gap, fixed resolution, IPv6 + extra forwards, TOFU with
+# a pinned known_hosts, and ~-relative key paths.
+display: {auto: false, width: 2560, height: 1440, cols: 3, rows: 2, gap: 8, layout: auto}
+panels:
+  - id: alpha
+    grid: [0, 0]
+    mode: tunnel
+    tunnel: {local_port: 19101, remote_host: "fd00::7", remote_port: 443}
+    scheme: https
+  - id: beta_2
+    grid: [1, 0]
+    mode: tunnel
+    tunnel: {local_port: 19102, remote_host: grafana.internal, remote_port: 3000}
+  - {id: gamma-3, grid: [2, 1], mode: direct, url: "https://10.0.0.3/"}
+tunnel:
+  enabled: true
+  jump_host: "soc@jump.example.net"
+  identity: "~/keys/id_ed25519"
+  known_hosts: "~/kh"
+  host_key_checking: "accept-new"
+  extra_forwards: ["127.0.0.1:19200:10.0.0.9:443", "[::1]:19201:[fd00::9]:8443"]

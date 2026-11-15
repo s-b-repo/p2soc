@@ -26,8 +26,15 @@ from .tunnel import NetworkConfig
 
 def _ip(*args: str, check: bool = True) -> int:
     cmd = ["ip", *args]
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.PIPE)
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, timeout=15)
+    except subprocess.TimeoutExpired:
+        # A hung `ip` (stuck netlink) must not block the VPN supervisor
+        # forever; treat it as a command failure so cleanup/retry can proceed.
+        if check:
+            raise RuntimeError(f"`{' '.join(cmd)}` timed out")
+        return 1
     if check and res.returncode != 0:
         raise RuntimeError(f"`{' '.join(cmd)}` failed: "
                            f"{res.stderr.decode(errors='replace').strip()}")
@@ -169,8 +176,9 @@ class VirtualNIC:
                 try:
                     subprocess.run(["resolvectl", "dns", self.ifname, *servers],
                                    stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, check=False)
-                except OSError:
+                                   stderr=subprocess.DEVNULL, check=False,
+                                   timeout=15)
+                except (OSError, subprocess.TimeoutExpired):
                     pass
             return
         # Idempotent + crash-safe: if a previous run left our marker / a backup,
@@ -246,8 +254,11 @@ def _normalize_cidr(route: str) -> str:
 def _original_default_gw() -> str:
     """The IPv4 default gateway BEFORE we touch routing (so the tunnel's own
     traffic and excluded networks keep using the physical path)."""
-    res = subprocess.run(["ip", "route", "show", "default"],
-                         capture_output=True, text=True)
+    try:
+        res = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return ""
     for tok in res.stdout.split():
         if tok == "via":
             idx = res.stdout.split().index("via")

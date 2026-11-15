@@ -44,8 +44,15 @@ PANELS_BASENAME = "panels.yaml"
 ENV_BASENAME = "soc.env"
 SECRET_BASENAME = "secret"
 WEBDATA_BASENAME = "webdata"
-ETC_DIR = "/etc/soc-display"
+ETC_DIR_DEFAULT = "/etc/soc-display"
 MARKER_BASENAME = "active"  # presence in user_dir() => the user config tier wins
+
+def etc_dir():
+    """The system config directory.  $SOC_ETC_DIR overrides for local installs."""
+    d = os.environ.get("SOC_ETC_DIR")
+    if d:
+        return os.path.abspath(d)
+    return ETC_DIR_DEFAULT
 
 _BASENAME = {"panels": PANELS_BASENAME, "env": ENV_BASENAME}
 _ENV_OVERRIDE = {"panels": "SOC_PANELS_FILE", "env": "SOC_ENV_FILE"}
@@ -111,7 +118,7 @@ def candidates(kind: str) -> "list[tuple[str, str]]":
     user_path = os.path.join(user_dir(), base)
     label = "user config (active)" if marked else "user config (inactive: no marker)"
     out.append((user_path, label))
-    out.append((os.path.join(ETC_DIR, base), "/etc/soc-display"))
+    out.append((os.path.join(etc_dir(), base), "/etc/soc-display"))
     for rp in _repo_candidates(kind):
         out.append((rp, "repo fallback"))
     return out
@@ -149,8 +156,8 @@ def resolve_secret_dir() -> str:
     if os.path.exists(active_marker()):
         return os.path.join(user_dir(), SECRET_BASENAME)
     # /etc when deployed, else repo dev location
-    if os.path.isdir(ETC_DIR):
-        return os.path.join(ETC_DIR, SECRET_BASENAME)
+    if os.path.isdir(etc_dir()):
+        return os.path.join(etc_dir(), SECRET_BASENAME)
     return os.path.join(repo_root(), "dev", "run", SECRET_BASENAME)
 
 
@@ -169,8 +176,8 @@ def resolve_webdata_dir() -> str:
         return os.path.abspath(wd)
     if os.path.exists(active_marker()):
         return os.path.join(user_dir(), WEBDATA_BASENAME)
-    if os.path.isdir(ETC_DIR):
-        return os.path.join(ETC_DIR, WEBDATA_BASENAME)
+    if os.path.isdir(etc_dir()):
+        return os.path.join(etc_dir(), WEBDATA_BASENAME)
     return os.path.join(repo_root(), "dev", "run", WEBDATA_BASENAME)
 
 
@@ -228,13 +235,13 @@ def resolve_write(kind: str, *, want_etc: bool = True,
 
     # B/C. /etc — canonical deployed. Writable directly, or via pkexec escalation.
     if want_etc:
-        etc_path = os.path.join(ETC_DIR, base)
-        if _dir_writable(ETC_DIR):
-            return dict(path=etc_path, dir=ETC_DIR,
+        etc_path = os.path.join(etc_dir(), base)
+        if _dir_writable(etc_dir()):
+            return dict(path=etc_path, dir=etc_dir(),
                         mode=(panels_mode if kind == "panels" else 0o644),
                         needs_privilege=False, via="etc", marker=None)
         if can_escalate:
-            return dict(path=etc_path, dir=ETC_DIR,
+            return dict(path=etc_path, dir=etc_dir(),
                         mode=(panels_mode if kind == "panels" else 0o644),
                         needs_privilege=True, via="etc", marker=None)
 
@@ -364,8 +371,8 @@ def _install_etc() -> int:
         return 2
     body = data[len(PMARK):]
     panels_text, env_text = body.split(EMARK, 1)
-    pf = os.path.join(ETC_DIR, PANELS_BASENAME)
-    ef = os.path.join(ETC_DIR, ENV_BASENAME)
+    pf = os.path.join(etc_dir(), PANELS_BASENAME)
+    ef = os.path.join(etc_dir(), ENV_BASENAME)
     # Writing /etc requires root; this helper is only ever invoked via pkexec (as
     # root). If it's run directly by a non-root user the os.makedirs/open raise
     # PermissionError — catch it and emit the same clean, actionable error the
@@ -373,8 +380,8 @@ def _install_etc() -> int:
     # swallowed into success either: it surfaces via the same OSError arm.
     p_tmp = e_tmp = None
     try:
-        os.makedirs(ETC_DIR, exist_ok=True)
-        os.chmod(ETC_DIR, 0o755)
+        os.makedirs(etc_dir(), exist_ok=True)
+        os.chmod(etc_dir(), 0o755)
         # Stage BOTH temps fully (written + fsync'd, final mode baked in) before
         # swapping either — so the swap step can't be interrupted half-way.
         p_tmp = _write_atomic(pf, panels_text, 0o644)
