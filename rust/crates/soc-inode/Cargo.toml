@@ -17,7 +17,6 @@ rustix = { version = "1", features = ["fs", "event", "process", "std"] }
 # RAW TLS over std::net::TcpStream (same stack soc-vault uses). No HTTP library:
 # after the NET_EXTEND upgrade the same socket carries binary frames.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pki-types = { version = "1", features = ["std", "alloc"] }
 rustls-native-certs = "0.8"
 # Crypto for SPA (HOTP-SHA1), cert pinning and the private-blob base64.
 sha1 = { version = "0.11", default-features = false }

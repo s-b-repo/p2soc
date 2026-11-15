@@ -128,6 +128,7 @@ jobs:
           #     .env.example is an allowed template; everything else *.env is not.
           while IFS= read -r f; do
             case "$f" in
+              */tests/fixtures/*) ;;                 # documented fake test fixtures
               *.env.example) ;;                      # allowed template
               .env|*.env|vaultwarden.env)
                 echo "::error file=$f::forbidden secret file committed: $f"
@@ -135,9 +136,12 @@ jobs:
             esac
           done < <(git ls-files)
 
-          # (2) Tracked private-key material (PEM / OpenSSH / *.key).
+          # (2) Tracked private-key material (PEM / OpenSSH / *.key). Test
+          #     fixtures are exempt here (documented fake vectors); their content
+          #     is still scanned by gitleaks and the PEM-header grep in (3).
           while IFS= read -r f; do
             case "$f" in
+              */tests/fixtures/*) ;;                 # documented fake test fixtures
               *.key|*.pem|*id_rsa|*id_ed25519|*id_ecdsa|*id_dsa)
                 echo "::error file=$f::forbidden key file committed: $f"
                 fail=1 ;;

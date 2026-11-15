@@ -1850,7 +1850,6 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-native-certs",
- "rustls-pki-types",
  "sha1 0.11.0",
  "sha2",
  "signal-hook",
