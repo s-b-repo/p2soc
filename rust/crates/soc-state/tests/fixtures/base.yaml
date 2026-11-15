@@ -1,0 +1,15 @@
+display: {auto: false, width: 1920, height: 1080, cols: 2, rows: 2, gap: 0, layout: windows}
+panels:
+  - {id: p1, grid: [0, 0], url: 'http://a.test/', title: Alpha}
+  - id: p2
+    grid: [1, 0]
+    url: 'http://b.test/'
+    vault_item: item-b
+    selectors: {user: '#u', pass: '#p', submit: '#go'}
+    login_zones: {pass: {x_pct: 0.1, y_pct: 0.2}}
+  - {id: p3, grid: [0, 1], url: 'http://c.test/'}
+tunnel: {enabled: true, jump_host: ops@jump.test, identity: /keys/id, known_hosts: /keys/kh}
+vpns:
+  - {name: hq, enabled: true, type: inode, gateway: gw.test, vault_item: vpn-hq, insecure: true, realm: corp, set_routes: true}
+  - {name: dr, enabled: false, type: fortinet}
+proxy: {enabled: true, url: 'http://old.test:3128', vault_item: pxy, ignore_hosts: [a.test]}

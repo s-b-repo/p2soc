@@ -27,8 +27,9 @@ test: .venv  ## run unit tests (no display needed)
 lint: .venv  ## syntax-check shell + python
 	@bash -n install.sh && echo "install.sh: ok"
 	@bash -n launch.sh && echo "launch.sh: ok"
+	@bash -n uninstall.sh && echo "uninstall.sh: ok"
 	@for s in scripts/*.sh; do bash -n "$$s" && echo "$$s: ok"; done
-	@$(PY) -m py_compile setup.py kiosk-host/host/*.py scripts/*.py && echo "python: ok"
+	@$(PY) -m py_compile setup.py provision.py kiosk-host/host/*.py scripts/*.py && echo "python: ok"
 
 .PHONY: install
 install:  ## install on the Pi (run as root)
@@ -49,6 +50,16 @@ refresh-manifest:  ## re-hash /opt/soc-display so the boot drift warning clears
 	  fi
 	@PYTHONPATH=/opt/soc-display/kiosk-host sudo \
 	    /opt/soc-display/.venv/bin/python -m host.manifest 2>&1
+
+.PHONY: uninstall
+uninstall:  ## uninstall from the Pi (root; keeps operator data unless ARGS=--purge)
+	sudo bash uninstall.sh $(ARGS)
+
+.PHONY: package-clean
+package-clean:  ## remove build cruft so nfpm packages a clean tree (CI runs this)
+	find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+	find . -name '*.egg-info' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+	@echo "package tree clean"
 
 .PHONY: clean
 clean:  ## remove Python caches

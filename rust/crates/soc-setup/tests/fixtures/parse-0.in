@@ -1,0 +1,16 @@
+# c
+
+A=1
+B = two 
+C='quoted val'
+D="dq"
+E=a=b=c
+NOEQ
+  F=  spaced  
+G="mismatch'
+H="
+I=''
+J=
+export K=1
+#L=3
+=empty

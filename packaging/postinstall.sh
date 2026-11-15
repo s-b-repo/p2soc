@@ -47,12 +47,12 @@ fi
 # --------------------------------------------------------------------------- #
 # 1. Run the project installer with package management disabled (Depends did it).
 #    SESSION/VW_MODE are overridable via the package env; default to the same
-#    values install.sh itself defaults to (auto / docker).
+#    values install.sh itself defaults to (auto / native).
 # --------------------------------------------------------------------------- #
 log "Running install.sh (SOC_SKIP_PACKAGES=1 — OS deps came from package Depends)"
 SOC_SKIP_PACKAGES=1 \
 SESSION="${SESSION:-auto}" \
-VW_MODE="${VW_MODE:-docker}" \
+VW_MODE="${VW_MODE:-native}" \
 SOC_ROOT="$SOC_ROOT" \
   "$INSTALLER"
 

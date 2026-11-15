@@ -9,17 +9,21 @@ the box — never the machine-id.
 
 Crypto (reuses the vetted primitives in `secretstore`):
   * AES-256-GCM (AEAD) over a gzip tar of the data dir.
-  * scrypt (RFC 7914) KDF — the same single, memory-hard KDF `secretstore`
-    uses for the host-bound seal.
+  * scrypt (RFC 7914) KDF by default; PBKDF2-HMAC-SHA256 (NIST SP 800-132) when
+    `fips=True` or SOC_FIPS_KDF=1 — the same self-describing ALGO byte as the seal.
 
 On-disk format (single file):
-    MAGIC(4) | salt(16) | nonce(12) | AESGCM(gzip(tar(src_dir)))
+    MAGIC(4) | ALGO(1) | salt(16) | nonce(12) | AESGCM(gzip(tar(src_dir)))
+
+Backups written by earlier releases have no ALGO byte (MAGIC | salt | nonce | ct,
+scrypt N=2**14). They stay restorable: a backup is the disaster-recovery path, the
+one thing that must still open years later.
 
 The whole archive is built in memory: a kiosk vault is small (a handful of
 logins). For a large vault with attachments, back up out-of-band instead.
 
 CLI:
-    python -m host.backup backup  <src_dir> <out_file>
+    python -m host.backup backup  <src_dir> <out_file>   [--fips]
     python -m host.backup restore <in_file>  <dest_dir>
 The passphrase is read from $SOC_BACKUP_PASSPHRASE or prompted (never on argv).
 """
@@ -34,7 +38,8 @@ from . import secretstore as ss
 
 _MAGIC = b"PSBK"                       # p2soc backup, distinct from the seal's "PS"
 _MIN_PASSPHRASE = 8                    # NIST SP 800-63B: user-chosen secret floor
-_HEADER = len(_MAGIC) + 16 + 12       # magic + salt + nonce
+_HEADER = len(_MAGIC) + 1 + 16 + 12   # magic + algo + salt + nonce
+_LEGACY_HEADER = len(_MAGIC) + 16 + 12  # magic + salt + nonce (no ALGO byte)
 # Size caps so a giant/corrupt blob can't be slurped into RAM on the 1GB Pi before
 # the passphrase even matters. A kiosk vault is a handful of logins (tiny); these
 # are generous ceilings, not a tuning knob.
@@ -56,38 +61,49 @@ def _tar_gz(src_dir: str) -> bytes:
     return buf.getvalue()
 
 
-def make_backup(src_dir: str, passphrase: str) -> bytes:
-    """Return an encrypted backup blob of `src_dir`."""
+def make_backup(src_dir: str, passphrase: str, *, fips: bool = False) -> bytes:
+    """Return an encrypted backup blob of `src_dir`. `fips` selects PBKDF2 (a
+    SOC_FIPS_KDF=1 deployment gets it regardless)."""
     if not passphrase or len(passphrase) < _MIN_PASSPHRASE:
         raise BackupError(
             f"backup passphrase too short: need at least {_MIN_PASSPHRASE} "
             "characters (NIST SP 800-63B)")
     AESGCM = ss._aesgcm()
+    algo = ss._ALGO_PBKDF2 if fips else ss._active_algo()
     salt = os.urandom(16)
     nonce = os.urandom(12)
-    key = ss._kdf(passphrase.encode("utf-8"), salt)
+    key = ss._kdf(passphrase.encode("utf-8"), salt, algo)
     ct = AESGCM(key).encrypt(nonce, _tar_gz(src_dir), None)
-    return _MAGIC + salt + nonce + ct
+    return _MAGIC + bytes([algo]) + salt + nonce + ct
 
 
 def open_backup(blob: bytes, passphrase: str) -> bytes:
     """Decrypt a backup blob and return the inner gzip-tar bytes."""
-    if len(blob) < _HEADER or blob[:len(_MAGIC)] != _MAGIC:
+    if len(blob) < _LEGACY_HEADER or blob[:len(_MAGIC)] != _MAGIC:
         raise BackupError("not a p2soc backup file (bad magic) or truncated")
     off = len(_MAGIC)
-    salt, nonce, ct = blob[off:off + 16], blob[off + 16:off + 28], blob[off + 28:]
+    # A legacy backup has its random salt where the ALGO byte sits, so a plausible
+    # ALGO value proves nothing: try that reading, then the legacy one.
+    readings = []
+    if blob[off] in (ss._ALGO_SCRYPT, ss._ALGO_PBKDF2) and len(blob) >= _HEADER:
+        readings.append((blob[off], off + 1))
+    readings.append((ss._ALGO_LEGACY_SCRYPT, off))
     AESGCM = ss._aesgcm()
-    try:
-        key = ss._kdf(passphrase.encode("utf-8"), salt)
-        return AESGCM(key).decrypt(nonce, ct, None)
-    except Exception:                  # InvalidTag -> wrong passphrase / tampered
-        raise BackupError("could not decrypt backup — wrong passphrase or the "
-                          "file is corrupt/tampered")
+    for algo, at in readings:
+        salt, nonce, ct = blob[at:at + 16], blob[at + 16:at + 28], blob[at + 28:]
+        try:
+            key = ss._kdf(passphrase.encode("utf-8"), salt, algo)
+            return AESGCM(key).decrypt(nonce, ct, None)
+        except Exception:              # InvalidTag -> wrong passphrase / tampered
+            continue
+    raise BackupError("could not decrypt backup — wrong passphrase or the "
+                      "file is corrupt/tampered")
 
 
-def write_backup(src_dir: str, out_path: str, passphrase: str) -> None:
+def write_backup(src_dir: str, out_path: str, passphrase: str, *,
+                 fips: bool = False) -> None:
     """Write an encrypted backup to `out_path` (0600, atomic)."""
-    blob = make_backup(src_dir, passphrase)
+    blob = make_backup(src_dir, passphrase, fips=fips)
     tmp = out_path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -190,7 +206,8 @@ def _passphrase_from_env_or_prompt(confirm: bool = False) -> str:
 def _cli(argv) -> int:
     if len(argv) >= 4 and argv[1] == "backup":
         write_backup(argv[2], argv[3],
-                     _passphrase_from_env_or_prompt(confirm=True))
+                     _passphrase_from_env_or_prompt(confirm=True),
+                     fips="--fips" in argv)
         print(f"wrote encrypted backup -> {argv[3]}")
         return 0
     if len(argv) >= 4 and argv[1] == "restore":

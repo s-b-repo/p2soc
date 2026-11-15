@@ -1,0 +1,90 @@
+display:
+  auto: false
+  width: 2560
+  height: 1440
+  cols: 3
+  rows: 2
+  gap: 4
+  layout: windows
+  fullscreen: false
+panels:
+- id: p1
+  engine: webkit
+  grid:
+  - 1
+  - 0
+  mode: direct
+  url: https://a2.test/dash
+  vault_item: item-a
+  selectors:
+    pass: '#pass'
+    user: '#user'
+  login_marker: '#pass'
+  keepalive:
+    strategy: reload
+    intervalSec: 90
+  proxy: false
+  title: "Alpha \u2014 Ops \u2713"
+  allow_insecure: true
+  tenant: acme
+- id: p2
+  engine: webkit
+  grid:
+  - 0
+  - 0
+  mode: direct
+  url: http://b.test/
+  vault_item: item-b
+  selectors:
+    pass: '#p'
+    submit: '#go'
+    user: '#u'
+  login_marker: '#p'
+  keepalive:
+    strategy: none
+  login_zones:
+    submit:
+      x_pct: 1.0
+      y_pct: 0
+    user:
+      x_pct: 0.5
+      y_pct: 0.25
+- id: panel-4
+  engine: webkit
+  grid:
+  - 2
+  - 1
+  mode: direct
+  url: http://new.test/
+  keepalive:
+    strategy: none
+  title: New
+tunnel:
+  enabled: true
+  jump_host: ops@jump2.test
+  known_hosts: /keys/kh
+  extra_forwards:
+  - 8080:web.test:80
+  - 9090:db.test:5432
+  host_key_checking: accept-new
+vpns:
+- name: hq
+  enabled: true
+  type: inode
+  gateway: gw2.test
+  vault_item: vpn-hq
+  insecure: false
+  set_routes: true
+  port: 8443
+  split_tunnel: false
+- config: /etc/lab.ovpn
+  enabled: false
+  name: lab
+  type: openvpn
+proxy:
+  enabled: true
+  url: http://new.test:8080
+  ignore_hosts:
+  - x.test
+  - y.test
+  - z.test

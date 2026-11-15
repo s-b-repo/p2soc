@@ -1,0 +1,6 @@
+# Fixture C: tunnel disabled, single-layout-capable all-webkit wall.
+display: {auto: true, width: 1280, height: 720, cols: 2, rows: 1, gap: 0}
+panels:
+  - {id: left, grid: [0, 0], mode: direct, url: "http://10.0.0.1/"}
+  - {id: right, grid: [1, 0], mode: direct, url: "http://10.0.0.2/"}
+tunnel: {enabled: false, jump_host: "u@jump"}

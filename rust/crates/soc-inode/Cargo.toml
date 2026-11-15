@@ -1,0 +1,52 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-inode"
+description = "Native H3C iNode SSL-VPN (V7) client — clean-room port of vendor/iNode-VPN-Client/backends/h3csvpn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+zeroize.workspace = true
+libc.workspace = true
+# TUN ioctl / fd polling without pulling a shell: rustix for open/poll/geteuid,
+# one tagged libc::ioctl for TUNSETIFF (rustix's Ioctl trait is itself unsafe
+# to implement, so the confined libc call is the smaller audited surface).
+rustix = { version = "1", features = ["fs", "event", "process", "std"] }
+# RAW TLS over std::net::TcpStream (same stack soc-vault uses). No HTTP library:
+# after the NET_EXTEND upgrade the same socket carries binary frames.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+# Crypto for SPA (HOTP-SHA1), cert pinning and the private-blob base64.
+sha1 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+hmac = "0.13"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+subtle = "2"
+getrandom = "0.4"
+# RSA PKCS#1 v1.5 public-key encryption of the login password, used only when a
+# gateway advertises the H3C_USER_RSAKEY firmware variant (the `--rsa-pubkey`
+# backend flag). ENCRYPTION only: the Marvin-sidechannel advisory
+# RUSTSEC-2023-0071 affects private-key *decryption*, which this crate never
+# performs (documented ignore in deny.toml).
+rsa = { version = "0.9", features = ["pem"] }
+# `rand_core::OsRng` for the PKCS#1 v1.5 padding nonce (shares rsa's rand_core).
+rand_core = { version = "0.6", features = ["getrandom"] }
+# connect_main turns SIGINT/SIGTERM into a stop request (safe API; the crate's
+# own async-signal-safe handler is not unsafe code in THIS crate).
+signal-hook = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The HTTP mock's TLS cert/key is generated fresh at test runtime (no key
+# material is ever committed to the repo). Uses the `ring` backend already
+# pulled by rustls.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+# RSA keygen + private-key decrypt to round-trip the public-key password mode.
+rsa = { version = "0.9", features = ["pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

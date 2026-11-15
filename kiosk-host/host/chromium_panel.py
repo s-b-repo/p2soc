@@ -9,7 +9,13 @@ drives it over the Chrome DevTools Protocol from a background thread:
   * polls window.__SOC.needLogin and, when set, fetches creds from the vault and
     evaluates socLogin({user,pass}),
   * respawns Chromium (with backoff) if the process dies and re-attaches CDP,
-    so a crashed panel heals itself on a 24/7 wall.
+    so a crashed panel heals itself on a 24/7 wall. After MAX_RESPAWNS straight
+    spawn/attach failures the panel parks until reconfigured; on an unattended
+    wall (SOC_UNATTENDED=1) a park is only a long pause, never the end.
+
+The CDP websocket belongs to the control-loop thread alone. Other threads
+(the GTK main loop, above all) must never touch it: they set state, and the loop
+acts on it. See set_url(), recycle() and calibrate().
 
 Proxy: an enabled global `proxy:` becomes --proxy-server=scheme://host:port
 (+ --proxy-bypass-list) — host:port only, NEVER credentials. When the proxy
@@ -29,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -43,6 +50,7 @@ from . import configpaths
 from . import inject
 from . import perf
 from . import siteguard
+from .inject import bootstrap_with_origin, panel_origin  # noqa: F401 (shared)
 
 RESPAWN_INITIAL = 5.0    # seconds; doubled up to RESPAWN_MAX after each death
 RESPAWN_MAX = 60.0
@@ -53,6 +61,17 @@ RPC_TIMEOUT = 30.0       # hard ceiling on a single CDP round-trip (anti-wedge)
 # spinning evaluate() against the same broken socket forever (~2 polls of grace
 # so a momentary navigation context-drop still just retries).
 MAX_POLL_FAILURES = 2
+# Once a page has loaded, logged in and has nothing pending, polling it every
+# poll_interval only keeps a core awake. Anything that needs a faster answer wakes
+# the loop by itself: see _CDP.note_activity and ChromiumPanel._idle.
+POLL_SETTLED_SEC = 15.0
+# Consecutive (re)spawn/attach failures before a panel parks: it stops respawning
+# Chromium, so a permanently-broken panel can't churn RAM/CPU/SD forever. Re-armed
+# by set_url(). With SOC_UNATTENDED=1 a parked panel also re-arms itself after
+# PARK_RETRY_SEC, because nobody is coming to reconfigure it.
+MAX_RESPAWNS = cfg.env_int("SOC_MAX_RESPAWNS", 20, lo=1, hi=100000)
+PARK_RETRY_SEC = 600.0
+CALIBRATE_TIMEOUT_SEC = 300.0
 
 
 def cdp_allowed_origin(port: int) -> str:
@@ -132,6 +151,7 @@ class _CDP:
         self._id = 0
         self._noreply_ids = set()
         self.on_event = None        # callable(method, params) | None
+        self.activity = False       # the page moved since the loop last polled it
 
     def _targets(self):
         url = f"http://127.0.0.1:{self.port}/json"
@@ -165,6 +185,7 @@ class _CDP:
         (event or fire-and-forget response)."""
         mid = msg.get("id")
         if mid is None:
+            self.note_activity(msg.get("method"), msg.get("params"))
             if self.on_event and msg.get("method"):
                 try:
                     self.on_event(msg["method"], msg.get("params", {}))
@@ -175,6 +196,14 @@ class _CDP:
             self._noreply_ids.discard(mid)
             return True
         return False
+
+    def note_activity(self, method, params):
+        """Flag what means the settled poll must not wait: a new top-level document
+        or SPA route (it may be a login page) and a dead renderer."""
+        if method == "Page.frameNavigated":
+            self.activity = not (params or {}).get("frame", {}).get("parentId")
+        elif method in ("Page.navigatedWithinDocument", "Inspector.targetCrashed"):
+            self.activity = True
 
     def send_nowait(self, method, params=None):
         """Send a command whose response we don't care about (used from event
@@ -205,22 +234,38 @@ class _CDP:
         # returning before its socket timeout) can never starve the matching
         # reply and wedge the panel's control loop forever.
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                raw = self.ws.recv()
-            except (WebSocketConnectionClosedException, OSError) as e:
-                # A closed/reset socket is NOT a timeout (pump catches those):
-                # mark it dead and raise so the control loop reattaches.
-                self.ws = None
-                raise CDPError(f"CDP socket closed on recv: {e}")
-            msg = json.loads(raw)
-            if self._dispatch(msg):
-                continue
-            if msg.get("id") == mid:
-                if "error" in msg:
-                    raise CDPError(msg["error"])
-                return msg.get("result", {})
-            # response to a stale call — drop it
+        # Per-recv socket timeout too: a wedged Chromium that stops sending entirely
+        # would block recv() forever, and the deadline only advances between recvs.
+        ws = self.ws
+        has_to = hasattr(ws, "settimeout") and hasattr(ws, "gettimeout")
+        old = ws.gettimeout() if has_to else None
+        try:
+            while time.time() < deadline:
+                if has_to:
+                    remaining = deadline - time.time()
+                    ws.settimeout(min(max(0.05, remaining), RPC_TIMEOUT))
+                try:
+                    raw = ws.recv()
+                except WebSocketTimeoutException as e:
+                    # The socket went silent: surface it as a CDPError so the
+                    # control loop recovers instead of blocking.
+                    raise CDPError(f"CDP rpc {method} recv timed out (wedged)") from e
+                except (WebSocketConnectionClosedException, OSError) as e:
+                    # A closed/reset socket is NOT a timeout (pump catches those):
+                    # mark it dead and raise so the control loop reattaches.
+                    self.ws = None
+                    raise CDPError(f"CDP socket closed on recv: {e}")
+                msg = json.loads(raw)
+                if self._dispatch(msg):
+                    continue
+                if msg.get("id") == mid:
+                    if "error" in msg:
+                        raise CDPError(msg["error"])
+                    return msg.get("result", {})
+                # response to a stale call — drop it
+        finally:
+            if has_to and self.ws is ws:     # nulled above if the socket died
+                ws.settimeout(old)
         raise CDPError(f"CDP rpc {method} timed out after {timeout:.0f}s")
 
     def pump(self, duration: float):
@@ -307,6 +352,20 @@ class ChromiumPanel:
         self._auth_failed = False
         self._last_fetch_event = 0.0
         self._poll_failures = 0         # consecutive failed CDP polls (dead-ws watchdog)
+        self._fail_streak = 0           # consecutive spawn/attach failures
+        self._parked = False            # stop respawning until re-armed
+        self._park_until = 0.0          # unattended: when a park re-arms itself
+        self._page_ok = False           # top document loaded without error (see below)
+        self._reload_delay = RESPAWN_INITIAL   # unattended retry of an error page
+        self._reload_at = 0.0
+        self._calib = None              # pending calibrate() request, worker-owned
+        self._login_rearm = inject.LoginRearm()
+
+    def loaded_ok(self) -> bool:
+        """True if this panel's page finished loading without error. Cheap and
+        thread-safe (the control loop refreshes the flag on every poll), so the
+        main-loop heartbeat can read it each beat."""
+        return self._page_ok
 
     def _uses_proxy(self) -> bool:
         return bool(self.proxy and self.proxy.enabled and self.panel.proxy)
@@ -354,6 +413,7 @@ class ChromiumPanel:
         self._login_attempts = 0                 # fresh process = fresh budget
         profile = self._profile_dir()
         os.makedirs(os.path.join(profile, "Default"), exist_ok=True)
+        self._reap_orphan(profile)
         # Re-assert 0700 on the per-panel profile: it holds this panel's session
         # tokens and must not be readable by other panels/users (profile
         # isolation). makedirs above honours umask, so set the mode explicitly.
@@ -423,10 +483,6 @@ class ChromiumPanel:
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows",
-            # Disk cache lives on tmpfs (RAM) via --user-data-dir under
-            # XDG_RUNTIME_DIR, so this is a RAM cap, NOT an SD-card kindness.
-            # Shrunk to 10 MB under the low-memory profile to protect the tight
-            # 1 GB budget (set just below).
             "--disable-dev-shm-usage",             # /dev/shm is tiny on a 1 GB Pi
             "--disable-pinch", "--overscroll-history-navigation=0",
             # Security hardening (parity with the WebKit leg's _harden_settings):
@@ -435,8 +491,16 @@ class ChromiumPanel:
             #    deny re-asserts it once attached).
             #  * block active mixed content on HTTPS panels (the real attack-
             #    surface win) so a compromised CDN can't inject http:// script.
+            # The rest of the list is what a kiosk never uses (casting, media
+            # controls, on-device prediction) or never goes back to (back/forward
+            # cache, as WebKit's page cache). PersistentHistograms keeps metrics in
+            # an mmap of a file in the profile, dirtying the SD card all day.
+            # Site isolation stays ON: panels render attacker-influenced data.
             "--disable-features=Translate,OptimizationHints,DownloadBubble,"
-            "DownloadBubbleV2",
+            "DownloadBubbleV2,MediaRouter,DialMediaRouteProvider,GlobalMediaControls,"
+            "OptimizationHintsFetching,OptimizationTargetPrediction,"
+            "SegmentationPlatform,AutofillServerCommunication,BackForwardCache,"
+            "PersistentHistograms",
             "--block-new-web-contents",        # no panel-spawned popups/windows
             f"--ozone-platform={_ozone_platform()}",
             # sandbox stays ON in production. Some restricted CI/containers can't
@@ -466,6 +530,10 @@ class ChromiumPanel:
             args.append("--no-proxy-server")   # panel opted out (proxy: false)
         if os.environ.get("SOC_CHROMIUM_NO_SANDBOX") == "1":
             args.append("--no-sandbox")
+        # Accept self-signed / untrusted TLS (LAN appliances, IP cameras) only when
+        # the panel opts in with allow_insecure, same as the WebKit leg's TLS policy.
+        if getattr(p, "allow_insecure", False):
+            args.append("--ignore-certificate-errors")
         self.log(f"[{p.id}] chromium spawning (CDP :{self.cdp_port}, "
                  f"ozone {_ozone_platform()})")
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
@@ -563,7 +631,11 @@ class ChromiumPanel:
         # tracker blocklist (honours block_trackers + per-panel unblock)
         if self._blocked_urls:
             try:
-                self.cdp.rpc("Network.enable")
+                # The Network domain keeps a copy of every response body for a
+                # debugger that might ask (100+ MB per panel, measured). We never
+                # read one: without these limits an SPA fills that buffer.
+                self.cdp.rpc("Network.enable", {"maxTotalBufferSize": 0,
+                                                "maxResourceBufferSize": 0})
                 self.cdp.rpc("Network.setBlockedURLs", {"urls": self._blocked_urls})
                 self.log(f"[{self.panel.id}] chromium tracker block on "
                          f"({len(self._blocked_urls)} hosts)")
@@ -630,8 +702,13 @@ class ChromiumPanel:
             cdp = _CDP(self.cdp_port)
             cdp.connect()
             cdp.rpc("Page.enable")
-            cdp.rpc("Runtime.enable")
-            boot = inject.bootstrap_js(p, mode="chromium")
+            # No Runtime.enable: evaluate doesn't need it, and with it every
+            # console.log of a chatty page is serialised to this thread.
+            try:
+                cdp.rpc("Inspector.enable")    # Inspector.targetCrashed
+            except CDPError:
+                pass                           # the settled poll still catches it
+            boot = bootstrap_with_origin(p, "chromium", self.log)
             # future documents:
             cdp.rpc("Page.addScriptToEvaluateOnNewDocument", {"source": boot})
             # already-loaded document (bootstrap is idempotent):
@@ -670,13 +747,67 @@ class ChromiumPanel:
             self.proc = None
             return False
 
+    def _park(self, why: str):
+        """Stop respawning a permanently-broken panel. Logged once; re-armed by
+        set_url(), or by PARK_RETRY_SEC on an unattended wall."""
+        if self._parked:
+            return
+        self._parked = True
+        self._page_ok = False
+        self._park_until = time.monotonic() + PARK_RETRY_SEC
+        if perf.unattended():
+            self.log(f"[{self.panel.id}] chromium parked after {self._fail_streak} "
+                     f"consecutive failures ({why}); retrying in "
+                     f"{PARK_RETRY_SEC:.0f}s")
+        else:
+            self.log(f"[{self.panel.id}] chromium parked after {self._fail_streak} "
+                     f"consecutive failures ({why}); not respawning until "
+                     f"reconfigured (set a URL in Settings)")
+
+    def _spawn_failed(self, why: str, delay: float) -> bool:
+        """Count one failed spawn/attach. True if the panel just parked (the caller
+        skips its backoff), False to back off and retry."""
+        self._fail_streak += 1
+        self.log(f"[{self.panel.id}] {why}; retrying in {delay:.0f}s "
+                 f"({self._fail_streak}/{MAX_RESPAWNS})")
+        if self._fail_streak >= MAX_RESPAWNS:
+            self._park(why)
+            return True
+        return False
+
+    def _retry_error_page(self):
+        """Unattended: a panel that failed to load sits on Chromium's error page
+        with the process healthy, so nothing above respawns it, and a tunnel or VPN
+        that comes up late would never be noticed. Re-navigate on a capped backoff
+        (the WebKit leg's retry timer does the same job there)."""
+        if not perf.unattended():
+            return
+        now = time.monotonic()
+        if not self._reload_at:
+            self._reload_at = now + self._reload_delay
+        elif now >= self._reload_at:
+            self._reload_delay = min(self._reload_delay * 2, RESPAWN_MAX)
+            self._reload_at = now + self._reload_delay
+            self.log(f"[{self.panel.id}] retrying failed load")
+            self.cdp.rpc("Page.navigate", {"url": self.panel.effective_url})
+
     def _control_loop(self):
         p = self.panel
         respawn_delay = RESPAWN_INITIAL
         spawn_time = time.monotonic()
         while not self._stop.is_set():
+            if self._parked:
+                if perf.unattended() and time.monotonic() >= self._park_until:
+                    self.log(f"[{p.id}] chromium park expired; trying again")
+                    self._fail_streak = 0
+                    self._parked = False
+                else:
+                    self._stop.wait(self.poll_interval)
+                    continue
             # (re)spawn + (re)attach when the process is missing or dead
             if self.proc is None or self.proc.poll() is not None:
+                self._page_ok = False
+                self._finish_calibrate(None)
                 if self.proc is not None:
                     self.log(f"[{p.id}] chromium exited "
                              f"({self.proc.returncode}); restarting in "
@@ -688,8 +819,8 @@ class ChromiumPanel:
                 try:
                     self._spawn()
                 except Exception as e:  # noqa: BLE001
-                    self.log(f"[{p.id}] chromium spawn failed: {e}; "
-                             f"retrying in {respawn_delay:.0f}s")
+                    if self._spawn_failed(f"chromium spawn failed: {e}", respawn_delay):
+                        continue
                     self._stop.wait(respawn_delay)
                     respawn_delay = min(respawn_delay * 2, RESPAWN_MAX)
                     continue
@@ -699,24 +830,39 @@ class ChromiumPanel:
                     # already reaped the child and cleared self.proc, so without
                     # backing off here the loop would respawn with no delay — the
                     # exact uncapped spawn loop the backoff exists to prevent.
-                    self.log(f"[{p.id}] chromium attach failed; "
-                             f"retrying in {respawn_delay:.0f}s")
+                    if self._spawn_failed("chromium attach failed", respawn_delay):
+                        continue
                     self._stop.wait(respawn_delay)
                     respawn_delay = min(respawn_delay * 2, RESPAWN_MAX)
                     continue
                 spawn_time = time.monotonic()   # mark a fresh, attached spawn
                 self._poll_failures = 0         # fresh session = clean slate
 
+            settled = False
             try:
+                if self.cdp:
+                    self.cdp.activity = False
                 # one round-trip for both flags
                 st = self.cdp.evaluate(
                     "(function(){var s=window.__SOC||{};"
-                    "return {n:!!s.needLogin,l:!!s.justLoggedIn};})()",
+                    "return {n:!!s.needLogin,l:!!s.justLoggedIn,"
+                    "r:document.readyState==='complete'"
+                    "&&/^https?:$/.test(location.protocol),"
+                    "e:location.protocol==='chrome-error:'};})()",
                     return_value=True) or {}
                 need, logged_in = st.get("n"), st.get("l")
+                # An error page is chrome-error:, an unconfigured tile is data:,
+                # and the proxy placeholder is about: -- none of them count.
+                self._page_ok = bool(st.get("r"))
+                if st.get("e"):
+                    self._retry_error_page()
+                else:
+                    self._reload_delay = RESPAWN_INITIAL
+                    self._reload_at = 0.0
                 if logged_in:
                     self.cdp.evaluate("window.__SOC.justLoggedIn=false")
                     self._login_attempts = 0
+                    self._login_rearm.reset()
                     self.cdp.evaluate(inject.prompt_clear_call())
                     if self.on_login_success:
                         try:
@@ -725,6 +871,10 @@ class ChromiumPanel:
                             pass
                 if need:
                     self._login_attempts += 1
+                    if (self._login_attempts > MAX_LOGIN_ATTEMPTS
+                            and perf.unattended() and self._login_rearm.due()):
+                        self.log(f"[{p.id}] login budget re-armed (unattended)")
+                        self._login_attempts = 1
                     if self._login_attempts > MAX_LOGIN_ATTEMPTS:
                         self.cdp.evaluate(inject.prompt_call(
                             "Auto-login failed — please sign in here, or open "
@@ -740,14 +890,18 @@ class ChromiumPanel:
                             self.cdp.evaluate(inject.prompt_call(
                                 "Sign-in needed — no saved login for this page. "
                                 "Open Settings (⚙ top bar) to add one, or log in here."))
+                self._calibrate_step()
                 self._poll_failures = 0             # a successful poll heals it
+                settled = self._settled(st)
                 # Only clear the backoff once the spawn has actually survived a
                 # while: a panel that attaches, polls once, then has its renderer
                 # killed would otherwise reset to the floor delay and respawn
                 # forever instead of climbing to RESPAWN_MAX.
                 if time.monotonic() - spawn_time >= RESPAWN_STABLE_SEC:
                     respawn_delay = RESPAWN_INITIAL      # healthy again
+                    self._fail_streak = 0
             except Exception as e:  # noqa: BLE001
+                self._page_ok = False
                 if self.proc and self.proc.poll() is not None:
                     continue        # process died — handled by the respawn branch
                 # The process is alive but the poll failed. Two recovery cases,
@@ -785,34 +939,54 @@ class ChromiumPanel:
                     continue
                 # transient (e.g. a momentary navigation context-drop): just retry
                 self.log(f"[{p.id}] chromium poll: {e}")
-            # Release paused Document navigations promptly: with the nav allowlist
-            # on, every top-level nav is held paused until _on_cdp_event continues
-            # it inside a recv loop. A flat sleep would stall each nav up to a full
-            # poll_interval (~2s 'loading'); pump in short slices instead so navs
-            # are released within ~100ms. pump() blocks on recv-with-timeout (no
-            # busy-spin) so it costs ~nothing when idle, and a socket death during
-            # the pump raises CDPError -> caught next poll -> reattach.
-            if self._nav_gate and self.cdp and self.cdp.ws:
-                deadline = time.time() + self.poll_interval
-                while time.time() < deadline and not self._stop.is_set():
-                    try:
-                        self.cdp.pump(min(0.1, max(0.0, deadline - time.time())))
-                    except Exception as e:  # noqa: BLE001
-                        # socket died mid-pump: stop pumping; the next poll's
-                        # watchdog reattaches/respawns. Don't busy-loop here.
-                        self.log(f"[{p.id}] chromium nav pump: {e}")
-                        self._stop.wait(max(0.0, deadline - time.time()))
-                        break
-            else:
-                self._stop.wait(self.poll_interval)
+            self._idle(POLL_SETTLED_SEC if settled else self.poll_interval)
+
+    def _settled(self, st: dict) -> bool:
+        """Nothing is pending on this page, so the next poll can wait. Before login
+        and on anything unfinished the loop stays on poll_interval, as it always
+        did. A tile with no URL never gets further than its placeholder."""
+        if st.get("n") or st.get("l") or st.get("e") or self._calib is not None:
+            return False
+        return bool(st.get("r")) or not self.panel.effective_url
+
+    def _idle(self, delay: float):
+        """Pump CDP until the next poll is due. An event wakes the recv at once, so
+        a paused Document navigation is still released as soon as it arrives. Only
+        a settled page gets more than one poll_interval of this: a navigation, a
+        crash or a calibration request cuts it back to one, so none of them is
+        noticed any later than it always was, and no page can poll us faster."""
+        start = time.monotonic()
+        deadline = start + delay
+        while not self._stop.is_set():
+            cdp = self.cdp
+            if cdp and (cdp.activity or self._calib is not None):
+                deadline = min(deadline, start + self.poll_interval)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            left = min(left, self.poll_interval)
+            if not (cdp and cdp.ws):
+                self._stop.wait(left)
+                return
+            try:
+                cdp.pump(left)
+            except Exception as e:  # noqa: BLE001
+                # socket died mid-pump: stop pumping; the next poll's watchdog
+                # reattaches/respawns. Don't busy-loop here.
+                self.log(f"[{self.panel.id}] chromium nav pump: {e}")
+                self._stop.wait(left)
+                return
+            if self.proc and self.proc.poll() is not None:
+                return
 
     def set_url(self, url: str):
         """Repoint this panel live (from the on-screen config). Chromium can't be
         driven cross-thread safely, so we update the URL and recycle the process;
         the control loop respawns it with the new --app within a few seconds."""
         url = (url or "").strip()
-        if url and not url.lower().startswith(("http://", "https://")):
-            self.log(f"[{self.panel.id}] refusing non-http(s) URL: {url!r}")
+        if url and not cfg.valid_http_url(url, allow_empty=False):
+            self.log(f"[{self.panel.id}] refusing non-http(s) URL: "
+                     f"{cfg._url_for_msg(url)}")
             return
         self.panel.url = url or None
         if url:
@@ -823,6 +997,10 @@ class ChromiumPanel:
         self._allowlist = siteguard.build_allowlist(self.panel, self.security)
         self.log(f"[{self.panel.id}] reconfigured -> {url or '(cleared)'}; "
                  f"restarting chromium")
+        # A reconfigure clears a parked panel + its failure streak, so the control
+        # loop tries the new URL.
+        self._fail_streak = 0
+        self._parked = False
         # Don't touch self.cdp here: this runs on the GTK main thread while the
         # control-loop worker may be mid-RPC on the same (non-thread-safe)
         # websocket. Just terminate the process; the worker detects the dead
@@ -831,12 +1009,12 @@ class ChromiumPanel:
             self.proc.terminate()        # control loop respawns with the new URL
 
     def mem_rss_kb(self):
-        """RSS of the Chromium process (KiB), or None if it isn't running. Note
-        Chromium's helper processes aren't summed, so this under-counts — it is a
-        relative signal for picking the heaviest panel, not an exact total."""
+        """RSS (KiB) of this panel's whole Chromium process tree, or None if it
+        isn't running. The renderers are where a heavy page lives, so the browser
+        process alone would not say which panel to recycle."""
         p = self.proc
         if p and p.poll() is None:
-            return perf.proc_rss_kb(p.pid)
+            return perf.proc_tree_rss_kb(p.pid)
         return None
 
     def recycle(self):
@@ -849,6 +1027,38 @@ class ChromiumPanel:
         # CDP on its own thread (_attach_cdp).
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
+
+    def reinject(self):
+        """Pick up a re-rendered bootstrap (new login zones, say). Scripts added to
+        a live session can't be replaced, so restart Chromium: the control loop
+        attaches the fresh one."""
+        self.recycle()
+
+    def _reap_orphan(self, profile: str):
+        """Clear a Chromium left behind by a host that died without running stop()
+        (SIGKILLed by the heartbeat watchdog, say). It would still hold this
+        profile's singleton lock, so every new spawn would hand off to it and exit
+        at once: the panel would respawn forever around a window nothing drives.
+        The lock is a symlink named <host>-<pid>; only a process that really runs
+        this profile is killed, so a recycled pid is safe."""
+        try:
+            pid = int(os.readlink(os.path.join(profile, "SingletonLock"))
+                      .rsplit("-", 1)[1])
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                if os.fsencode(profile) not in fh.read():
+                    return
+        except (OSError, ValueError, IndexError):
+            return                               # no lock, stale lock, or not ours
+        self.log(f"[{self.panel.id}] killing orphaned chromium (pid {pid})")
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(30):
+                if self._stop.wait(0.1) or not os.path.exists(f"/proc/{pid}"):
+                    break
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def _reap(self):
         """Terminate the Chromium child and actually wait for it, escalating to
@@ -869,6 +1079,8 @@ class ChromiumPanel:
 
     def stop(self):
         self._stop.set()
+        self._page_ok = False
+        self._finish_calibrate(None)
         if self.cdp:
             # Guard the close so a throwing CDP socket can never skip _reap():
             # the child must always be terminated+waited, else a service stop
@@ -878,3 +1090,55 @@ class ChromiumPanel:
             except Exception:   # noqa: BLE001 — close is best-effort; reap is not
                 pass
         self._reap()
+
+    # ---- click-zone calibration ---------------------------------------------
+    def calibrate(self, on_done):
+        """Overlay the three-click calibration on this panel. on_done fires on the
+        GTK main thread with the zones dict, or None on cancel / timeout / a lost
+        session. This only queues the request: the control-loop thread owns the
+        CDP socket, so it injects and polls (see _calibrate_step)."""
+        if self._calib is not None:
+            self.log(f"[{self.panel.id}] calibrate already in progress")
+            return
+        if self.cdp is None:
+            self.log(f"[{self.panel.id}] calibrate: no CDP session — is the panel "
+                     f"still loading?")
+            on_done(None)
+            return
+        try:
+            src = inject.calibrate_js()
+        except OSError as e:
+            self.log(f"[{self.panel.id}] calibrate template missing: {e}")
+            on_done(None)
+            return
+        self._calib = {"src": src, "on_done": on_done, "injected": False,
+                       "deadline": time.monotonic() + CALIBRATE_TIMEOUT_SEC}
+
+    def _finish_calibrate(self, zones):
+        c, self._calib = self._calib, None
+        if c is None:
+            return
+        from gi.repository import GLib           # lazy: this module is GTK-free
+        GLib.idle_add(lambda: c["on_done"](zones) and False)
+
+    def _calibrate_step(self):
+        """Control-loop thread only: advance a pending calibration by one poll."""
+        c = self._calib
+        if c is None:
+            return
+        if not c["injected"]:
+            c["injected"] = True
+            self.cdp.evaluate(c["src"])
+            self.log(f"[{self.panel.id}] calibrate: overlay injected, "
+                     f"awaiting 3 clicks")
+            return
+        if time.monotonic() > c["deadline"]:
+            self.log(f"[{self.panel.id}] calibrate: timed out")
+            self.cdp.evaluate(inject.CALIBRATE_ABORT_JS)
+            self._finish_calibrate(None)
+            return
+        val = self.cdp.evaluate(inject.CALIBRATE_POLL_JS, return_value=True)
+        if not val:
+            return
+        self.cdp.evaluate(inject.CALIBRATE_CLEAR_JS)
+        self._finish_calibrate(inject.calibrate_zones(val, self.log, self.panel.id))

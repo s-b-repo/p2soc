@@ -6,4 +6,16 @@ __pycache__/
 # Secrets
 *.env
 !*.env.example
+# Byte-for-byte parity reference fixtures (not real env files): keep tracked
+# despite the repo-wide *.env ignore so the soc-setup tests have their inputs.
+!rust/crates/soc-setup/tests/fixtures/*.soc.env
 secret/
+
+# Local runtime + build output
+.venv/
+dev/run/
+dist/
+.pytest_cache/
+
+# Site-specific config
+config/panels.local.yaml

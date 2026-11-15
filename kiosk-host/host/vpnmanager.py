@@ -38,7 +38,9 @@ blast radius) is documented in docs/ARCHITECTURE.md.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import os
+import signal
 import threading
 import time
 import traceback
@@ -73,14 +75,15 @@ def coerce_split_tunnel(entry: dict, *, is_owner: bool, log: Callable[[str], Non
       * fortinet : set_routes=False + half_internet_routes=False -> the gateway
                    cannot push a default route onto us.
       * openvpn  : set_routes=False -> emits --route-nopull (ignore pushed routes).
-      * inode    : no global-route lever in our wrapper; left as-is (it installs
-                   only the routes the gateway scopes — documented).
+      * inode    : split_tunnel=True -> --split-tunnel, so a gateway requesting
+                   redirect-all cannot capture the default route.
       * wireguard: we cannot rewrite a vault .conf; force set_routes=False where
                    the materialize path honours it AND warn loudly so the operator
                    scopes AllowedIPs. The wg 0.0.0.0/0 guard runs at materialize.
     """
     if is_owner or not isinstance(entry, dict):
         return entry
+    entry["_soc_non_owner"] = True      # re-checked after any vault Notes overlay
     kind = cfg.vpn_kind(entry)
     name = entry.get("name") or "?"
     if kind == "fortinet":
@@ -102,8 +105,21 @@ def coerce_split_tunnel(entry: dict, *, is_owner: bool, log: Callable[[str], Non
             f"MUST scope AllowedIPs (never 0.0.0.0/0 or ::/0). The wall cannot "
             f"rewrite a vault-sourced .conf — a catch-all here would hijack the "
             f"default route from the owner.")
-    # inode: no global lever; documented.
+    elif kind == "inode":
+        if entry.get("split_tunnel") is False:
+            log(f"[vpn:{name}] not the default-route owner — forcing split-tunnel "
+                f"(--split-tunnel)")
+        entry["split_tunnel"] = True
     return entry
+
+
+def _is_catch_all(cidr: str) -> bool:
+    """True for any /0, however it is spelled: wg-quick reads '::0/0', '0::/0' and
+    '10.0.0.1/0' as the whole address space too, not just the two canonical forms."""
+    try:
+        return ipaddress.ip_network(cidr, strict=False).prefixlen == 0
+    except ValueError:
+        return False
 
 
 class _GuardedSupervisor(fortivpn.Supervisor):
@@ -112,13 +128,17 @@ class _GuardedSupervisor(fortivpn.Supervisor):
     hazard the config layer cannot pre-empt (wg-quick obeys the .conf verbatim).
 
     Everything else is the stock Supervisor: same backoff, same auth/cert holds,
-    same reconnect loop. We only hook _materialize_config to scrub a catch-all
-    AllowedIPs out of the on-disk .conf BEFORE wg-quick reads it."""
+    same reconnect loop. We only hook _materialize_config, to scrub a catch-all
+    AllowedIPs out of the on-disk .conf BEFORE wg-quick reads it and to re-assert
+    the split-tunnel coercion, which a Fortinet vault Notes overlay (set_routes,
+    half_internet_routes) would otherwise undo after _prepare ran."""
 
     def _materialize_config(self) -> bool:
         ok = super()._materialize_config()
         if not ok:
             return ok
+        if self.vpn.get("_soc_non_owner") and self.driver.kind == "fortinet":
+            coerce_split_tunnel(self.vpn, is_owner=False, log=self.log)
         if not self.vpn.get("_soc_split_tunnel"):
             return ok
         if self.driver.kind != "wireguard":
@@ -129,8 +149,11 @@ class _GuardedSupervisor(fortivpn.Supervisor):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 lines = fh.readlines()
-        except OSError:
-            return ok
+        except OSError as e:
+            # Fail closed: "could not check" must not bring up an unchecked .conf.
+            self.log(f"[vpn:{self.vpn.get('name')}] could not read .conf to check "
+                     f"for a catch-all route: {e}")
+            return False
         changed = False
         out = []
         for line in lines:
@@ -138,7 +161,7 @@ class _GuardedSupervisor(fortivpn.Supervisor):
             if stripped.lower().startswith("allowedips"):
                 _, _, rhs = stripped.partition("=")
                 cidrs = [c.strip() for c in rhs.split(",") if c.strip()]
-                kept = [c for c in cidrs if c not in ("0.0.0.0/0", "::/0")]
+                kept = [c for c in cidrs if not _is_catch_all(c)]
                 if len(kept) != len(cidrs):
                     changed = True
                     name = self.vpn.get("name") or "?"
@@ -188,8 +211,12 @@ class VpnManager:
       * stop()   — signal every supervisor to stop, terminate children, join.
       * states() — {name: vpnstatus.vpn_state(entry)} for the per-name pill.
       * state_aggregate() — one overall state for the pill's main label.
+      * stalled() — names not making progress; gates the systemd watchdog.
 
     Disabled / malformed entries are skipped (they were reported by validation).
+    `only` restricts the supervisors to one entry (a forti-vpn@<name> instance);
+    the routing policy is still decided across the whole list, so that instance
+    does not mistake itself for the single VPN that owns the default route.
     """
 
     # small gap between supervisor starts so N concurrent vault unseals
@@ -197,9 +224,14 @@ class VpnManager:
     _START_STAGGER = 0.4
 
     def __init__(self, vpns: list, pinentry: str,
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None, only: str = ""):
         self._log = log or (lambda m: print(f"[soc-vpn] {m}", flush=True))
         self.pinentry = pinentry
+        self._only = (only or "").strip()
+        # Longer than any legitimate gap between heartbeats. The worst is a vault
+        # open through the rbw CLI (about 210s of 30s subprocess calls); a false
+        # positive restarts every tunnel, so err long. Every other step beats.
+        self._stall_after = cfg.env_float("SOC_VPN_STALL_SECS", 300.0, lo=60.0, hi=3600.0)
         # Deep-copy each entry so the manager's split-tunnel coercion + the
         # supervisor's in-place config materialization never mutate the caller's
         # conf.vpns (the GTK side reads it for the pill).
@@ -247,6 +279,8 @@ class VpnManager:
             entry = copy.deepcopy(e)
             name = _name_of(entry, i)
             entry["name"] = name
+            if self._only and name != self._only:
+                continue
             is_owner = (name == owner_name)
             coerce_split_tunnel(entry, is_owner=is_owner, log=self._log)
             self._entries.append((name, entry, is_owner))
@@ -266,14 +300,16 @@ class VpnManager:
             self._spawn_one(name, entry)
             time.sleep(self._START_STAGGER)
 
-    # Defense-in-depth resurrection caps. Supervisor.run() already self-heals an
-    # internal failure into idle() (it never escapes), so this wrapper is a
-    # backstop for a TRULY unexpected escape (e.g. a bug in the guard itself).
-    # We relaunch with a bounded, growing delay and a hard cap so a
-    # deterministically-crashing entry cannot hot-loop and starve the 1 GB Pi.
+    # Supervisor.run() cleans up and propagates an unexpected failure, so this is
+    # where a supervisor thread is kept alive. The growing delay stops a
+    # deterministically-crashing entry from hot-looping on the 1 GB Pi. There is
+    # deliberately no cap: this wall runs unattended, so giving up would mean
+    # offline until someone restarts it. _RELAUNCH_MAX only marks when to shout.
+    # A run that lasted _RELAUNCH_STABLE was healthy, so its crash starts afresh.
     _RELAUNCH_MAX = 3
     _RELAUNCH_DELAY = 5.0
     _RELAUNCH_DELAY_MAX = 60.0
+    _RELAUNCH_STABLE = 600.0
 
     def _spawn_one(self, name: str, entry: dict):
         def tagged(msg, _n=name):
@@ -285,6 +321,7 @@ class VpnManager:
                 self._log(f"[vpn:{_n}] {msg}")
         driver = vpndrivers.get_driver(entry)
         sup = _GuardedSupervisor(entry, self.pinentry, log=tagged, driver=driver)
+        sup.watchdog.notify = False     # beats only; see fortivpn._supervise
         t = threading.Thread(target=self._supervised_run, args=(name, sup, tagged),
                              name=f"vpn:{name}", daemon=True)
         with self._lock:
@@ -293,14 +330,14 @@ class VpnManager:
         t.start()
 
     def _supervised_run(self, name: str, sup, tagged: Callable[[str], None]):
-        """Run sup.run(); if it ever escapes with an UNEXPECTED exception (it
-        normally falls into idle() and never returns until stop), relaunch with a
-        bounded backoff and a hard cap. Never resurrects a VPN whose stop was
-        requested, and every catch logs loudly (no silent swallow)."""
+        """Run sup.run(), relaunching it after any UNEXPECTED exception with a
+        bounded backoff, for as long as the manager runs. Never resurrects a VPN
+        whose stop was requested, and every catch logs loudly (no silent swallow).
+        One entry's crash loop stays in-process so its siblings keep their tunnels."""
         delay = self._RELAUNCH_DELAY
-        for attempt in range(self._RELAUNCH_MAX + 1):
-            if sup.stop_event.is_set():
-                return
+        crashes = 0
+        while not sup.stop_event.is_set():
+            started = time.monotonic()
             try:
                 sup.run()
                 return                                 # clean stop — done
@@ -308,40 +345,51 @@ class VpnManager:
                 tagged(f"supervisor crashed: {e!r}; {traceback.format_exc()}")
             if sup.stop_event.is_set():
                 return
-            if attempt >= self._RELAUNCH_MAX:
-                tagged(f"supervisor crashed {self._RELAUNCH_MAX} times — giving up "
-                       f"relaunch; this VPN will stay offline until the service is "
-                       f"restarted (fix the cause in the journal above)")
-                return
-            tagged(f"relaunching supervisor in {delay:.0f}s "
-                   f"(attempt {attempt + 1}/{self._RELAUNCH_MAX})")
-            # stop_event.wait so manager.stop() unblocks the backoff immediately.
-            if sup.stop_event.wait(delay):
-                return
+            if time.monotonic() - started >= self._RELAUNCH_STABLE:
+                delay, crashes = self._RELAUNCH_DELAY, 0
+            crashes += 1
+            if crashes == self._RELAUNCH_MAX:
+                tagged(f"supervisor has crashed {crashes} times running — this VPN "
+                       f"is down and will keep retrying every "
+                       f"{self._RELAUNCH_DELAY_MAX:.0f}s at most (see the journal "
+                       f"above for the cause)")
+            tagged(f"relaunching supervisor in {delay:.0f}s (crash {crashes})")
+            sup._sleep(delay)                  # stop() ends this immediately
             delay = min(delay * 2.0, self._RELAUNCH_DELAY_MAX)
 
-    def stop(self, grace: float = 10.0):
-        """Tear EVERY supervisor down: signal stop, terminate the child, join."""
+    def stop(self, grace: float = 20.0):
+        """Tear EVERY supervisor down: signal stop, terminate the child, join.
+        The default grace leaves room inside systemd's TimeoutStopSec=30 for a
+        wedged supervisor's forced cleanup below; past that, systemd SIGKILLs us
+        and the keys wait for the next start's orphan sweep."""
         with self._lock:
             supers = dict(self._supers)
             threads = dict(self._threads)
         for name, sup in supers.items():
-            try:
-                sup.stop_event.set()
-            except Exception:                          # noqa: BLE001
-                pass
-        for name, sup in supers.items():
-            try:
-                sup._terminate_child()
-            except Exception:                          # noqa: BLE001
-                pass
+            sup.stop_event.set()
+            child = sup.child
+            if child is not None and child.poll() is None:
+                # Not _terminate_child: that blocks per child, so one slow client
+                # would delay the SIGTERM to every other. Each thread does the
+                # waiting and escalation for its own.
+                sup._signal_group(child, signal.SIGTERM)
         deadline = time.monotonic() + grace
         for name, t in threads.items():
-            remaining = max(0.0, deadline - time.monotonic())
-            t.join(timeout=remaining)
-            if t.is_alive():
-                self._log(f"WARNING vpn '{name}' supervisor did not stop within "
-                          f"the grace period")
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        for name, t in threads.items():
+            if not t.is_alive():
+                continue
+            self._log(f"WARNING vpn '{name}' supervisor did not stop within the "
+                      f"grace period; cleaning up for it")
+            # It is a daemon thread: the process exit would kill it before its own
+            # teardown ran, leaving the key on disk and the child orphaned.
+            sup = supers[name]
+            for step in (sup._cleanup_materialized, sup._cleanup_mgmt,
+                         lambda s=sup: s._terminate_child(grace=2.0)):
+                try:
+                    step()
+                except Exception as e:                 # noqa: BLE001
+                    self._log(f"ERROR vpn '{name}' forced cleanup failed: {e!r}")
         with self._lock:
             self._supers.clear()
             self._threads.clear()
@@ -386,6 +434,22 @@ class VpnManager:
                     pass
         return out
 
+    def stalled(self) -> list:
+        """Names of supervisors the unit must be restarted to recover: thread died,
+        or it has not beaten within SOC_VPN_STALL_SECS. A thread cannot be killed
+        from inside the process, so all the caller can do is withhold the systemd
+        watchdog. A stopping supervisor is not stalled."""
+        now = time.monotonic()
+        with self._lock:
+            running = [(n, s, self._threads.get(n)) for n, s in self._supers.items()]
+        out = []
+        for name, sup, t in running:
+            if sup.stop_event.is_set() or t is None or t.ident is None:
+                continue
+            if not t.is_alive() or now - sup.watchdog.beat > self._stall_after:
+                out.append(name)
+        return out
+
     def state_aggregate(self) -> str:
         """Collapse per-name states to ONE for the pill's main label:
           * no enabled entries -> not_configured
@@ -398,7 +462,10 @@ def aggregate_state(states: dict) -> str:
     """Pure: collapse a {name: state} dict to a single overall state.
 
     Kept standalone so main.py can aggregate states it computed itself (it polls
-    conf.vpns directly off the GTK thread — it does not hold a manager)."""
+    conf.vpns directly off the GTK thread — it does not hold a manager).
+
+    STATE_CONNECTING counts as not online: the per-name breakdown shows it, but
+    the pill's CSS classes have no amber state to give the aggregate."""
     vals = [s for s in (states or {}).values()
             if s != vpnstatus.STATE_NOT_CONFIGURED]
     if not vals:

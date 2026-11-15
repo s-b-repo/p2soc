@@ -16,15 +16,16 @@ def test_vpn_kind_inode():
 
 def test_inode_helpers():
     vpn = {"gateway": "vpn.ex.net", "port": 3000, "config": "/opt/iNode-VPN-Client",
-           "trusted_cert": "AA:BB:CC"}
+           "trusted_cert": "AA:BB:CC", "split_tunnel": False}
     assert config.inode_gateway(vpn) == "vpn.ex.net:3000"
     assert config.inode_gateway({"gateway": "h"}) == "h:443"
     assert config.inode_gateway({}) == ""
     assert config.inode_script(vpn) == "/opt/iNode-VPN-Client/svpn-connect.sh"
     assert config.inode_script({"config": "/x/svpn-connect.sh"}) == "/x/svpn-connect.sh"
     assert config.inode_extra_args(vpn) == ["--", "--pin-sha256", "AA:BB:CC"]
-    assert config.inode_extra_args({"insecure": True}) == ["--", "--insecure"]
-    assert config.inode_extra_args({}) == []
+    assert config.inode_extra_args({"insecure": True, "split_tunnel": False}) == [
+        "--", "--insecure"]
+    assert config.inode_extra_args({"split_tunnel": False}) == []
 
 
 def test_inode_script_defaults_to_bundled(monkeypatch, tmp_path):
@@ -50,7 +51,7 @@ def test_inode_driver_classify():
 def test_inode_build_cmd_no_password_on_argv():
     d = vpndrivers.get_driver({"type": "inode"})
     vpn = {"gateway": "g", "port": 3000, "config": "/c", "domain": "system",
-           "trusted_cert": "AA:BB"}
+           "trusted_cert": "AA:BB", "split_tunnel": False}
     assert d.build_cmd(vpn, "user1") == [
         "/c/svpn-connect.sh", "g:3000", "user1", "system", "--", "--pin-sha256", "AA:BB"]
     assert d.resolve_binary(vpn) == "/c/svpn-connect.sh"

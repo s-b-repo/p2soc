@@ -23,9 +23,18 @@ export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
 cmd="${1:-}"
 case "$cmd" in
   backup)
-    out="${2:-vaultwarden-$(date +%Y%m%d-%H%M%S 2>/dev/null || echo backup).bak}"
-    shift || true; [ "${1:-}" = "backup" ] && shift || true
-    exec "$PY" -m host.backup backup "$DATA_DIR" "$out" "$@"
+    shift
+    out=""
+    fips=""
+    for arg in "$@"; do
+      case "$arg" in
+        --fips) fips="--fips" ;;
+        -*) echo "usage: $0 {backup [out.bak] [--fips] | restore <in.bak> [dest]}" >&2; exit 2 ;;
+        *) out="$arg" ;;
+      esac
+    done
+    [ -n "$out" ] || out="vaultwarden-$(date +%Y%m%d-%H%M%S 2>/dev/null || echo backup).bak"
+    exec "$PY" -m host.backup backup "$DATA_DIR" "$out" ${fips:+"$fips"}
     ;;
   restore)
     [ -n "${2:-}" ] || { echo "usage: $0 restore <in.bak> [dest]" >&2; exit 2; }

@@ -41,6 +41,7 @@ WebKit cache on 1 GB boards, GPU compositing on the Pi 5).
 
 - [**Full setup guide**](docs/SETUP.md) — start-to-finish bring-up (dev + Pi) via the `setup.py` wizard
 - [**Production deploy**](docs/DEPLOY.md) — the real Pi/kiosk install + `setup.py install/doctor/repair`
+- [**Zero-touch operation**](docs/AUTO_UPDATE.md) — how a wall runs, recovers and redeploys itself with nobody there
 - [Architecture](docs/ARCHITECTURE.md) — topology, boot/data-flow, RAM budget, rationale
 - [Install on the Pi](docs/INSTALL.md) — step-by-step bring-up + checklist
 - [Configuration](docs/CONFIGURATION.md) — `panels.yaml` reference, finding selectors, keep-alive
@@ -147,20 +148,23 @@ Arch, openSUSE, Alpine or Void — enable SSH, boot, copy this repo over, then
 configure with the interactive wizard and run the installer:
 
 ```bash
-sudo python3 setup.py deploy      # end-to-end: install + configure + seal PIN + push config + creds
-sudo ./install.sh                 # INSTALL_MODE=desktop (default) | kiosk
-                                  # VW_MODE=docker (default) | native ; HARDEN=1 to firewall
+sudo python3 setup.py deploy      # end-to-end: install + configure + seal + creds + start the wall
+sudo ./install.sh                 # just the install. INSTALL_MODE=auto (default) | kiosk | desktop
+                                  # VW_MODE=native (default) | docker ; HARDEN=1 to firewall
                                   # SESSION=x11 (default) | wayland | auto
                                   # SOC_SKIP_PACKAGES=1 on an unsupported distro
 ```
 
-By default (`INSTALL_MODE=desktop`) the installer is **desktop-friendly**: it
-deploys everything and adds a clickable **"SOC Wall"** launcher to your apps
-menu, but leaves your systemd default target and tty1 untouched — your existing
-desktop keeps working and you start the wall on demand from the menu icon (it
-runs against the current `$DISPLAY`/`$WAYLAND_DISPLAY`). Use `INSTALL_MODE=kiosk`
-for the dedicated appliance, which **takes over tty1** with autologin and boots
-straight into the wall.
+That one command is the whole deployment. It ends with a running wall, and from then
+on nothing needs a person: it starts at boot, recovers from failures and redeploys
+itself from the tracked branch, rolling back automatically if a release won't run
+([details](docs/AUTO_UPDATE.md)). For imaging or a fleet, `deploy --unattended` does it
+with no prompts at all ([docs/DEPLOY.md](docs/DEPLOY.md)).
+
+`INSTALL_MODE=auto` takes over tty1 (**kiosk**) on a box with no desktop environment,
+and leaves the boot alone (**desktop**) where a display manager is in use, so a
+workstation is never hijacked. Desktop mode adds a clickable **"SOC Wall"** launcher to
+the apps menu that runs against the current `$DISPLAY`/`$WAYLAND_DISPLAY`.
 
 Auto-installs packages via apt/dnf/pacman/zypper/apk/xbps; honours an existing
 X.Org **or XLibre** server; degrades gracefully without systemd (prints the
@@ -170,27 +174,17 @@ The wizard (`setup.py`) is re-runnable and writes/validates all three config
 files; see the [full setup guide](docs/SETUP.md). You can also edit the
 `*.example` templates by hand.
 
-The installer: installs deps, creates the `soc` (kiosk) and `socsvc` (tunnel)
-users, deploys to `/opt/soc-display`, builds the venv, lays down `/etc/soc-display`
-config, sets up Vaultwarden + autossh systemd units, zram, the Openbox session,
+The installer: installs deps, creates the `soc` (kiosk), `socsvc` (tunnel) and
+`socupdate` (redeploy) users, deploys a release under `/opt/soc-releases` with
+`/opt/soc-display` pointing at it, builds the venv, lays down `/etc/soc-display`
+config, sets up Vaultwarden, autossh and `soc-update` units, zram, the Openbox session,
 and the "SOC Wall" menu launcher. In **kiosk** mode it additionally enables tty1
 autologin and **disables the desktop session** (keeps your preloaded card; the
-desktop just doesn't run) — same RAM benefit as Pi OS Lite. Either way it is
+desktop just doesn't run) — same RAM benefit as Pi OS Lite — and switches on the
+hardware watchdog. Either way it is
 **reversible**: the install records a manifest and `./uninstall.sh` (or `make
 uninstall`) replays it, preserving operator vault data by default and restoring
 the console; `--purge` removes everything (see [docs/INSTALL.md](docs/INSTALL.md#uninstall)).
-
-Then finish setup (the installer prints this):
-
-1. `‎/etc/soc-display/panels.yaml` — your 4 panels (IPs, ports, **selectors**, `vault_item`, tunnel).
-2. `‎/etc/soc-display/soc.env` — email, url, `SOC_SESSION` (**non-secret**; `chmod 0640`).
-3. Vaultwarden's config is in its systemd unit (no `.env`); the `/admin` page is off.
-4. `systemctl start vaultwarden`, create the kiosk account in the web vault, add
-   the 4 logins **named to match each `vault_item`**.
-5. `sudo python3 setup.py first-run` — generate the **one-time PIN** + seal the
-   master password host-bound (no plaintext `.env`); or `setup.py deploy` for all of it.
-5. Tunnel key: see `security/tunnel_key.note` (restricted `permitopen` key).
-6. `systemctl reboot` → the wall comes up logged-in, hands-free.
 
 ### Finding selectors for a panel
 Open the panel's login page in a browser, right-click the username field →

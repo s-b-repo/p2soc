@@ -6,7 +6,7 @@ The master password (which derives the account key) must NOT live in a plaintext
 SOC_MASTER_SOURCE environment variable (default 'auto'):
 
   sealed          Host-bound AES-256-GCM seal via host/secretstore.py
-                  (machine-id + sealed PIN). DEFAULT for unattended / headless
+                  (host.key + machine-id + sealed PIN). DEFAULT for unattended / headless
                   kiosks: no login session, wallet, or prompt is needed to unlock,
                   so the wall self-unlocks at boot. KEEP this as the default.
 
@@ -234,7 +234,7 @@ def store_master(pw: str, source: str, attrs: dict | None = None) -> None:
 
     Only 'secret-service' is writable here (it hands the value to the wallet
     daemon — never to a plaintext file). 'sealed' is refused (sealing needs the
-    PIN + machine-id flow in secretstore.seal()/setup.py first-run). 'env' is
+    PIN + host-key flow in secretstore.seal()/setup.py first-run). 'env' is
     refused outright — this is the programmatic guarantee that no production flow
     writes the master to a file.
     """

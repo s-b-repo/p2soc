@@ -30,11 +30,21 @@ def _master() -> str:
             sys.path.insert(0, cand)
     try:
         from host import mastersource
-        return mastersource.get_master()
+        master = mastersource.get_master()
     except Exception as e:  # noqa: BLE001 — surface to rbw's stderr, fall through
         sys.stderr.write(f"pinentry-vault: {e}\n")
-    # Last resort if mastersource cannot even be imported (dev / seeding only).
-    return os.environ.get("SOC_VAULT_PASSWORD", "")
+        # Last resort if mastersource cannot even be imported (dev / seeding only).
+        master = os.environ.get("SOC_VAULT_PASSWORD", "")
+    if not master:
+        # An empty answer makes rbw fail with a generic decryption error that gives
+        # the operator no idea WHY. rbw forwards pinentry stderr to the journal.
+        sd = os.environ.get("SOC_SECRET_DIR") or "/etc/soc-display/secret"
+        sys.stderr.write(
+            f"pinentry-vault: no usable master (secret dir {sd}) — the vault "
+            f"cannot be unlocked. If this box is new or was re-imaged, run:\n"
+            f"    sudo python3 setup.py first-run\n"
+            f"to seal the master password host-bound.\n")
+    return master
 
 
 def _enc(s: str) -> str:

@@ -1,0 +1,2 @@
+layout=windows
+all_webkit=0

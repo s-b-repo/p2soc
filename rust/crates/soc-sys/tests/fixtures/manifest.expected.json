@@ -1,0 +1,13 @@
+{
+  "commit": "deadbeef",
+  "files": {
+    "README.md": "c5ce2d1f8e1bf419d73445d3cbfef25f354ebf8de358fada30ca17d230874b18",
+    "Zed.txt": "c865f6c5ab8d1b0bcd383a5e1e3879d22681c96bf462c269b7581d523fbe70ab",
+    "a/b/c.txt": "64896f89fd11190013b70103e603a1c5826e56b7fb7d2197ab279b0690043599",
+    "empty": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "kiosk-host/host/main.py": "caf026f25d7140209f98072605307a438914b9ce6f3c14b23d15d9667241de52",
+    "scripts/tarpit.py": "7efabc4853488c6fbe84e6da5de0c2900cd449d48447ac19339e7d5c432493ea"
+  },
+  "repo": "https://github.com/s-b-repo/p2soc",
+  "version": 1
+}

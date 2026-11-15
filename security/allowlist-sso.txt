@@ -1,0 +1,26 @@
+# Curated cloud SSO / identity-provider redirect domains for the SOC-wall
+# navigation allowlist. A cloud-fronted dashboard often bounces its login
+# through one of these before returning to its own origin; without them the
+# nav allowlist would refuse the redirect and the login would look broken.
+#
+# Format: one domain per line. `*.example.com` matches example.com and any
+# subdomain; a bare `example.com` matches it and all subdomains (subdomain-
+# inclusive). Lines starting with '#' and blank lines are ignored.
+#
+# Self-hosted IdPs (Keycloak, Authentik, ADFS, ...) are intentionally NOT
+# bundled — add yours via per-panel `allow:` or the global `security.sso_allow:`.
+
+login.microsoftonline.com
+*.microsoftonline.com
+sts.windows.net
+*.b2clogin.com
+login.live.com
+accounts.google.com
+*.okta.com
+*.oktacdn.com
+*.auth0.com
+*.onelogin.com
+login.duosecurity.com
+*.duosecurity.com
+*.pingidentity.com
+*.ping-eng.com

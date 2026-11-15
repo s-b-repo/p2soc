@@ -1,0 +1,16 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-brand"
+description = "p2soc branding: product name, icon and the colour palette (load + save)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+soc-core.workspace = true
+soc-sys.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

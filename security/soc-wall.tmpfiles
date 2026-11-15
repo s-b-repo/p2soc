@@ -1,0 +1,3 @@
+# Runtime directory for the wall's heartbeat. tmpfs, so no SD-card wear.
+# Installed to /etc/tmpfiles.d/soc-wall.conf.
+d /run/soc-wall 0755 soc soc -

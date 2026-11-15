@@ -1,0 +1,14 @@
+{
+ "": "empty",
+ "A": "1",
+ "B": "two",
+ "C": "quoted val",
+ "D": "dq",
+ "E": "a=b=c",
+ "F": "spaced",
+ "G": "\"mismatch'",
+ "H": "\"",
+ "I": "",
+ "J": "",
+ "export K": "1"
+}

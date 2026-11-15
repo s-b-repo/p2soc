@@ -28,8 +28,9 @@ Hardening:
       on disk (state_dir()/panellock.pin, panellock.totp); the admin override
       PIN is the host-sealed setup PIN under $SOC_SECRET_DIR.
 
-Storage is FILE-backed only — our vaultseed lacks the secure-note write
-helpers PROD used, so there is no vault-backed PIN/TOTP path here.
+The TOTP secret may instead be a vault secure note (totp.save_vault). When a ready
+vault is handed to KioskLocker that note is the source of truth and the local TOTP
+file is ignored; see verify_any_vault_first(). The PIN is always file-backed.
 """
 from __future__ import annotations
 
@@ -108,13 +109,23 @@ def load_totp(state_dir: str) -> str | None:
     return _totp.load(_totp_path(state_dir))
 
 
+def _verify_pin_hash(stored: str, code: str) -> bool:
+    """Verify `code` against a stored "<salt_hex>$<digest>" (constant-time)."""
+    try:
+        salt_hex, _, digest = (stored or "").strip().partition("$")
+        if not (salt_hex and digest):
+            return False
+        want = hashlib.sha256(bytes.fromhex(salt_hex) +
+                              code.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(want.encode(), digest.encode())
+    except ValueError:
+        return False
+
+
 def verify_pin(state_dir: str, pin: str) -> bool:
     try:
         with open(_pin_path(state_dir), "r", encoding="utf-8") as fh:
-            salt_hex, _, digest = fh.read().strip().partition("$")
-        want = hashlib.sha256(bytes.fromhex(salt_hex) +
-                              pin.encode("utf-8")).hexdigest()
-        return hmac.compare_digest(want, digest)
+            return _verify_pin_hash(fh.read(), pin)
     except (OSError, ValueError):
         return False
 
@@ -156,13 +167,57 @@ def verify_any(state_dir: str, code: str) -> bool:
     return False
 
 
+def _vault_totp(vault) -> str | None:
+    """The panel-lock TOTP secret held in a READY vault, else None. `ready` is a
+    method on the real Vault, so a bare truthiness test would read a closed vault
+    as open and start a network unlock from the GTK main thread."""
+    if vault is None:
+        return None
+    ready = getattr(vault, "ready", False)
+    try:
+        if not (ready() if callable(ready) else ready):
+            return None
+    except Exception:                                  # noqa: BLE001
+        return None
+    return _totp.load_vault(vault, "panellock")
+
+
+def verify_any_vault_first(vault, state_dir: str, code: str) -> bool:
+    """verify_any(), but with the vault as the source of truth for TOTP.
+
+    When a ready vault holds a panel-lock TOTP, the local TOTP file is NOT
+    consulted, so a stale on-disk secret cannot outlast a rotation done at the
+    glass. The panel PIN and the sealed admin override still apply: the PIN is
+    only ever stored in the file, and the override exists so a forgotten
+    credential never strands the operator.
+
+    A vault that is unreachable, not ready, has no item, or holds a malformed
+    secret falls all the way through to verify_any(), so the lock keeps working
+    offline."""
+    if not code or not code.strip():
+        return False
+    code = code.strip()
+    secret = _vault_totp(vault)
+    if secret:
+        try:
+            if _totp.verify(secret, code):
+                return True
+        except ValueError:                             # not valid base32
+            return verify_any(state_dir, code)
+        if pin_is_set(state_dir) and verify_pin(state_dir, code):
+            return True
+        return _sealed_pin_ok(code)
+    return verify_any(state_dir, code)
+
+
 # --- the GTK lock window -------------------------------------------------- #
 class KioskLocker:
     """Holds a single lock window. Idempotent — calling lock() while locked
     is a no-op. Owns its own backoff timer state."""
 
-    def __init__(self, state_dir: str):
+    def __init__(self, state_dir: str, vault=None):
         self.state_dir = state_dir
+        self.vault = vault      # optional; enables the vault-backed TOTP path
         self._win = None
         self._entry = None
         self._err = None
@@ -325,9 +380,11 @@ class KioskLocker:
         self._win = win
 
     def _has_credential(self) -> bool:
-        """Any unlock credential at all: panel PIN, panel TOTP, or a host
-        seal (the admin override is a real credential)."""
+        """Any unlock credential at all: panel PIN, panel TOTP (file or vault),
+        or a host seal (the admin override is a real credential)."""
         if pin_is_set(self.state_dir) or totp_is_set(self.state_dir):
+            return True
+        if _vault_totp(self.vault):
             return True
         if _secretstore is not None:
             try:
@@ -338,7 +395,7 @@ class KioskLocker:
 
     def _hint_text(self) -> str:
         has_pin = pin_is_set(self.state_dir)
-        has_totp = totp_is_set(self.state_dir)
+        has_totp = totp_is_set(self.state_dir) or bool(_vault_totp(self.vault))
         if has_pin and has_totp:
             return "Enter your PIN or a 6-digit authenticator code."
         if has_totp:
@@ -362,9 +419,9 @@ class KioskLocker:
     def _try(self):
         code = (self._entry.get_text() or "").strip()
         # _try() is only reachable with a credential present (lock() refuses to
-        # build the overlay otherwise), so we gate strictly on verify_any() —
+        # build the overlay otherwise), so we gate strictly on the verifier —
         # there is no fail-open "no credential → always unlock" path.
-        if verify_any(self.state_dir, code):
+        if verify_any_vault_first(self.vault, self.state_dir, code):
             self._fails = 0
             self._teardown()
             if self._on_unlock:

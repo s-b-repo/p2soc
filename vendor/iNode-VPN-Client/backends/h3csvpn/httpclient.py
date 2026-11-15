@@ -111,6 +111,8 @@ class Connection:
         return out
 
     def _read_exact(self, n: int) -> bytes:
+        if n < 0:
+            raise HTTPError(f"negative body/chunk size: {n}")
         if n > C.MAX_BODY_BYTES:
             raise HTTPError(f"declared body size {n} exceeds cap {C.MAX_BODY_BYTES}")
         while len(self._buf) < n:
@@ -206,8 +208,11 @@ class Connection:
                 raise HTTPError(f"bad chunk size: {size_line!r}")
             if size == 0:
                 # drain optional trailer header lines up to the terminating CRLF
+                trailers = 0
                 while self._read_until(b"\r\n") != b"\r\n":
-                    pass
+                    trailers += 1
+                    if trailers > C.MAX_TRAILER_LINES:
+                        raise HTTPError("too many trailer lines (hostile response)")
                 break
             out += self._read_exact(size)
             if len(out) > C.MAX_BODY_BYTES:

@@ -1,0 +1,139 @@
+{
+  "_added_panels": [
+    {
+      "grid": [
+        2,
+        1
+      ],
+      "id": "panel-4"
+    }
+  ],
+  "_display": {
+    "auto": false,
+    "cols": 3,
+    "fullscreen": false,
+    "gap": 4,
+    "height": 1440,
+    "layout": "windows",
+    "rows": 2,
+    "width": 2560
+  },
+  "_proxy": {
+    "enabled": true,
+    "ignore_hosts": [
+      "x.test",
+      "y.test",
+      "z.test"
+    ],
+    "url": "http://new.test:8080",
+    "vault_item": null
+  },
+  "_removed_panels": [
+    "p3"
+  ],
+  "_tunnel": {
+    "enabled": true,
+    "extra_forwards": [
+      "8080:web.test:80",
+      "9090:db.test:5432"
+    ],
+    "host_key_checking": "accept-new",
+    "identity": null,
+    "jump_host": "ops@jump2.test",
+    "known_hosts": "/keys/kh"
+  },
+  "_vpn": {
+    "enabled": true,
+    "gateway": "gw2.test",
+    "insecure": false,
+    "name": "hq",
+    "port": 8443,
+    "realm": null,
+    "split_tunnel": false,
+    "type": "inode",
+    "vault_item": "vpn-hq"
+  },
+  "_vpns": [
+    {
+      "enabled": true,
+      "gateway": "gw2.test",
+      "insecure": false,
+      "name": "hq",
+      "port": 8443,
+      "realm": null,
+      "split_tunnel": false,
+      "type": "inode",
+      "vault_item": "vpn-hq"
+    },
+    {
+      "config": "/etc/lab.ovpn",
+      "enabled": false,
+      "name": "lab",
+      "type": "openvpn"
+    }
+  ],
+  "_vpns_removed": [
+    "dr"
+  ],
+  "p1": {
+    "allow_insecure": true,
+    "allow_media": false,
+    "engine": "webkit",
+    "grid": [
+      1,
+      0
+    ],
+    "keepalive": {
+      "intervalSec": 90,
+      "strategy": "reload"
+    },
+    "login_marker": "",
+    "proxy": false,
+    "selectors": {
+      "pass": "#pass",
+      "user": "#user"
+    },
+    "tenant": " acme ",
+    "title": "Alpha \u2014 Ops \u2713",
+    "url": "https://a2.test/dash",
+    "vault_item": "item-a"
+  },
+  "p2": {
+    "allow_insecure": false,
+    "allow_media": false,
+    "engine": "webkit",
+    "grid": [
+      0,
+      0
+    ],
+    "keepalive": {
+      "intervalSec": 600,
+      "strategy": "none"
+    },
+    "login_marker": "#p",
+    "login_zones": {
+      "submit": {
+        "x_pct": 1.0,
+        "y_pct": 0
+      },
+      "user": {
+        "x_pct": 0.5,
+        "y_pct": 0.25
+      }
+    },
+    "proxy": true,
+    "selectors": {
+      "pass": "#p",
+      "submit": "#go",
+      "user": "#u"
+    },
+    "tenant": "",
+    "title": "",
+    "url": "http://b.test/",
+    "vault_item": "item-b"
+  },
+  "panel-4": {
+    "title": "New",
+    "url": "http://new.test/"
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-setup"
+description = "p2soc setup backend: soc.env / wall-unit rendering, doctor, repair, seal + vault orchestration, first-run and deploy plans"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+soc-core.workspace = true
+soc-sys.workspace = true
+soc-seal.workspace = true
+soc-vault.workspace = true
+zeroize.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

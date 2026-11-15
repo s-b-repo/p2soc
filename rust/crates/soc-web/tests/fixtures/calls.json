@@ -1,0 +1,57 @@
+{
+ "login": [
+  [
+   "alice",
+   "hunter2",
+   "try{window.socLogin && window.socLogin({\"user\": \"alice\", \"pass\": \"hunter2\"});}catch(e){}"
+  ],
+  [
+   "a\"b",
+   "p\\x",
+   "try{window.socLogin && window.socLogin({\"user\": \"a\\\"b\", \"pass\": \"p\\\\x\"});}catch(e){}"
+  ],
+  [
+   "",
+   "",
+   "try{window.socLogin && window.socLogin({\"user\": \"\", \"pass\": \"\"});}catch(e){}"
+  ],
+  [
+   "dom\\user",
+   "p\u00e4ss w\u00f6rd \u4e2d\u6587 \ud83d\udd11",
+   "try{window.socLogin && window.socLogin({\"user\": \"dom\\\\user\", \"pass\": \"p\\u00e4ss w\\u00f6rd \\u4e2d\\u6587 \\ud83d\\udd11\"});}catch(e){}"
+  ],
+  [
+   "u\u2028v\u2029w",
+   "tab\there\nnewline\rcr\u0000nul\u007fdel\u001besc",
+   "try{window.socLogin && window.socLogin({\"user\": \"u\\u2028v\\u2029w\", \"pass\": \"tab\\there\\nnewline\\rcr\\u0000nul\\u007fdel\\u001besc\"});}catch(e){}"
+  ],
+  [
+   "quote'single",
+   "back`tick ${x} {{MODE}}",
+   "try{window.socLogin && window.socLogin({\"user\": \"quote'single\", \"pass\": \"back`tick ${x} {{MODE}}\"});}catch(e){}"
+  ]
+ ],
+ "prompt": [
+  [
+   "Auto-login failed \u2014 please sign in here, or open Settings (\u2699 top bar) to fix the saved login.",
+   "try{window.socPrompt && window.socPrompt(\"Auto-login failed \\u2014 please sign in here, or open Settings (\\u2699 top bar) to fix the saved login.\");}catch(e){}"
+  ],
+  [
+   "Sign-in needed \u2014 no saved login for this page. Open Settings (\u2699 top bar) to add one, or log in here.",
+   "try{window.socPrompt && window.socPrompt(\"Sign-in needed \\u2014 no saved login for this page. Open Settings (\\u2699 top bar) to add one, or log in here.\");}catch(e){}"
+  ],
+  [
+   "say \"hi\"",
+   "try{window.socPrompt && window.socPrompt(\"say \\\"hi\\\"\");}catch(e){}"
+  ],
+  [
+   "",
+   "try{window.socPrompt && window.socPrompt(\"\");}catch(e){}"
+  ]
+ ],
+ "prompt_clear": "try{window.socPromptClear && window.socPromptClear();}catch(e){}",
+ "calibrate_poll": "window.__SOC_CALIBRATE_RESULT||''",
+ "calibrate_clear": "window.__SOC_CALIBRATE_RESULT=null;",
+ "calibrate_abort": "try{document.getElementById('__soc_calibrate').remove();}catch(e){}window.__SOC_CALIBRATE_ACTIVE=false;window.__SOC_CALIBRATE_RESULT=null;",
+ "fallback_bootstrap": "(function(){if(window.__SOC&&window.__SOC.installed)return;window.__SOC={installed:true,needLogin:false,justLoggedIn:false,lastLogin:0};})();"
+}

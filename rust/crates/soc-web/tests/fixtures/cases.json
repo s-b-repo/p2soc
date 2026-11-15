@@ -1,0 +1,155 @@
+[
+  {
+    "name": "direct_basic",
+    "mode": "webkit",
+    "panel": {
+      "id": "p1",
+      "engine": "webkit",
+      "grid": [0, 0],
+      "mode": "direct",
+      "url": "http://10.0.0.1:3000/login",
+      "vault_item": "Item 1",
+      "selectors": {"user": "#u", "pass": "input[name=\"pw\"]", "submit": ".go"},
+      "login_marker": "#u",
+      "keepalive": {"strategy": "reload", "intervalSec": 42}
+    }
+  },
+  {
+    "name": "tunnel_chromium",
+    "mode": "chromium",
+    "panel": {
+      "id": "p2",
+      "engine": "chromium",
+      "grid": [1, 1],
+      "mode": "tunnel",
+      "tunnel": {"local_port": 19103, "remote_host": "10.20.0.7", "remote_port": 8443},
+      "path": "/app",
+      "scheme": "http",
+      "vault_item": "Item 2",
+      "selectors": {"user": "#u", "pass": "#p", "submit": "#s"},
+      "keepalive": {"strategy": "none"}
+    }
+  },
+  {
+    "name": "hostile_strings",
+    "mode": "chromium",
+    "panel": {
+      "id": "Dash_01-x",
+      "engine": "chromium",
+      "grid": [0, 1],
+      "mode": "direct",
+      "url": "https://Dash.Example.com:8443/a/b?c=1#d",
+      "vault_item": "Item 3",
+      "selectors": {
+        "user": "input[data-x='</script><script>alert(1)</script>']",
+        "pass": "a\\b c d\u007f\u0001\ttab",
+        "submit": "button.éü中😀"
+      },
+      "login_marker": "form[action=\"/login?a=1&b=2\"] > input",
+      "keepalive": {"strategy": "xhr", "intervalSec": 300, "url": "/api/ping?x=\"1\"", "target": "#keep"},
+      "login_zones": {
+        "user": {"x_pct": 0.5, "y_pct": 0.25},
+        "pass": {"x_pct": 0.5, "y_pct": 0.4},
+        "submit": {"x_pct": 0.55, "y_pct": 0.6}
+      }
+    }
+  },
+  {
+    "name": "display_only",
+    "mode": "webkit",
+    "panel": {
+      "id": "wallboard",
+      "engine": "webkit",
+      "grid": [1, 0],
+      "url": "https://status.example.org:443/board"
+    }
+  },
+  {
+    "name": "click_keepalive",
+    "mode": "chromium",
+    "panel": {
+      "id": "c1",
+      "engine": "chromium",
+      "grid": [2, 0],
+      "url": "http://grafana.lan:80/d/abc",
+      "vault_item": "Grafana",
+      "selectors": {"user": "#user", "pass": "#password", "submit": "button[type=submit]"},
+      "login_marker": "#password",
+      "keepalive": {"strategy": "click", "intervalSec": 60, "target": ".refresh"}
+    }
+  },
+  {
+    "name": "unconfigured",
+    "mode": "webkit",
+    "panel": {
+      "id": "empty",
+      "engine": "webkit",
+      "grid": [2, 1]
+    }
+  },
+  {
+    "name": "ipv6_origin",
+    "mode": "chromium",
+    "panel": {
+      "id": "v6",
+      "engine": "chromium",
+      "grid": [3, 0],
+      "url": "http://[fd00::1]:8080/x",
+      "vault_item": "V6",
+      "selectors": {"user": "#u", "pass": "#p", "submit": "#s"}
+    }
+  },
+  {
+    "name": "zones_runtime_filtered",
+    "mode": "webkit",
+    "panel": {
+      "id": "z1",
+      "engine": "webkit",
+      "grid": [3, 1],
+      "url": "https://example.test/login",
+      "vault_item": "zabbix",
+      "selectors": {"user": "#user", "pass": "#pass", "submit": "#submit"},
+      "login_marker": "#user"
+    },
+    "mutate": {
+      "login_zones": {
+        "user": {"x_pct": 1, "y_pct": 0},
+        "pass": {"x_pct": "nope", "y_pct": 0.5},
+        "submit": {"x_pct": 1.5, "y_pct": 0.5},
+        "hackme": {"x_pct": 0.5, "y_pct": 0.5}
+      }
+    }
+  },
+  {
+    "name": "zones_float_repr",
+    "mode": "webkit",
+    "panel": {
+      "id": "z2",
+      "engine": "webkit",
+      "grid": [4, 0],
+      "url": "https://example.test/login",
+      "vault_item": "zabbix",
+      "selectors": {"user": "#user", "pass": "#pass", "submit": "#submit"}
+    },
+    "mutate": {
+      "login_zones": {
+        "user": {"x_pct": 0.00001, "y_pct": 0.1234567890123456789},
+        "pass": {"x_pct": 0.0001, "y_pct": 1.0, "extra": "dropped"},
+        "submit": {"x_pct": 0.3333333333333333, "y_pct": 2e-7}
+      }
+    }
+  },
+  {
+    "name": "token_in_value",
+    "mode": "webkit",
+    "panel": {
+      "id": "tok",
+      "engine": "webkit",
+      "grid": [4, 1],
+      "url": "https://example.test/",
+      "vault_item": "tok",
+      "selectors": {"user": "#a{{LOGIN_ZONES_JSON}}", "pass": "#p{{KEEPALIVE_JSON}}", "submit": "\"{{MODE}}\""},
+      "login_marker": "{{PANEL_ID}}"
+    }
+  }
+]

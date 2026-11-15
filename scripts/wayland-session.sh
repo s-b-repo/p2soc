@@ -9,7 +9,15 @@
 # Falls back gracefully and prints actionable errors when nothing fits.
 set -u
 
-ROOT="${SOC_ROOT:-/opt/soc-display}"
+# Self-locate: parent of this scripts/ dir (works from any checkout).
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+CHECKOUT="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
+if [ -d "$CHECKOUT/kiosk-host" ]; then
+  ROOT="$CHECKOUT"
+else
+  ROOT="${SOC_ROOT:-/opt/soc-display}"
+fi
+[ -d "$ROOT/kiosk-host" ] || { echo "wayland-session.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 if [ -f "$ENV_FILE" ]; then
   set -a
@@ -49,22 +57,31 @@ start_labwc(){
 }
 
 start_generic(){
-  # best effort for a cage-like kiosk compositor: most accept "-- <cmd>"
+  # best effort for a cage-like kiosk compositor: most accept "-- <cmd>".
+  # Run (NOT exec) so that if the operator's compositor doesn't support the
+  # "-- <cmd>" form (only cage/labwc are known to) and exits immediately, we
+  # log and RETURN — letting the caller fall through to the cage/labwc/X11 auto
+  # chain instead of vanishing into a dead exec and leaving a black screen. A
+  # working long-running compositor blocks here in the foreground exactly as an
+  # exec would, and the script ends with its exit status.
   export SOC_LAYOUT="${SOC_LAYOUT:-single}"
   log "starting $1 (SOC_COMPOSITOR; generic single-window invocation)"
-  exec "$1" -- "$LAUNCHER"
+  "$1" -- "$LAUNCHER"; rc=$?
+  log "WARNING SOC_COMPOSITOR='$1' exited rc=$rc (does it accept '-- <cmd>'? cage-style only) — falling back to auto-selection"
+  return $rc
 }
 
 # 0) explicit override wins.
 if [ -n "${SOC_COMPOSITOR:-}" ]; then
   if command -v "$SOC_COMPOSITOR" >/dev/null 2>&1; then
     case "$SOC_COMPOSITOR" in
-      cage)  start_cage ;;
-      labwc) start_labwc ;;
-      *)     start_generic "$SOC_COMPOSITOR" ;;
+      cage)  start_cage ;;     # exec — never returns on success
+      labwc) start_labwc ;;    # exec — never returns on success
+      *)     start_generic "$SOC_COMPOSITOR" ;;  # runs; returns -> fall through
     esac
+  else
+    log "WARNING SOC_COMPOSITOR='$SOC_COMPOSITOR' not found on PATH — auto-selecting"
   fi
-  log "WARNING SOC_COMPOSITOR='$SOC_COMPOSITOR' not found on PATH — auto-selecting"
 fi
 
 # 1) cage: ideal for an all-webkit wall.

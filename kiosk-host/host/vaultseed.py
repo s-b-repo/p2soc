@@ -30,6 +30,12 @@ class VaultSeedError(Exception):
     pass
 
 
+class LoginRejectedError(VaultSeedError):
+    """Vaultwarden refused the password grant. Its 400 invalid_grant covers both
+    'no such account' and 'wrong password' (anti-enumeration), so the caller
+    cannot tell which — only that the server answered and said no."""
+
+
 # Cap on a single Vaultwarden HTTP response body. A real personal vault's
 # /api/ciphers is well under this; the ceiling exists so a compromised/MITM'd
 # endpoint can't stream a multi-GB (or infinite) body into one bytes object and
@@ -119,8 +125,22 @@ def _req(url, headers=None, data=None, method="GET", form=False):
         raise VaultSeedError(f"could not reach Vaultwarden at {url}: {e}")
 
 
+def _token_subject(token: str) -> str:
+    """The user id from a Bitwarden access token (the JWT `sub` claim), or '' if it
+    can't be read. Only used to label our own writes, so the signature doesn't need
+    verifying: the server does that on every request."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return str(json.loads(base64.urlsafe_b64decode(payload)).get("sub", ""))
+    except (IndexError, ValueError):
+        return ""
+
+
 class Session:
     """An authenticated Vaultwarden session that can create/update logins."""
+
+    user_id = ""
 
     def __init__(self, url: str, email: str, master_password: str):
         self.base = url.rstrip("/")
@@ -155,28 +175,45 @@ class Session:
         senc = _hkdf_expand(master_key, b"enc")
         smac = _hkdf_expand(master_key, b"mac")
 
-        tok = _req(self.base + "/identity/connect/token", data={
-            "grant_type": "password", "username": email, "password": master_hash,
-            "scope": "api offline_access", "client_id": "cli", "deviceType": "8",
-            "deviceIdentifier": "soc-setup-0001", "deviceName": "soc-setup",
-        }, method="POST", form=True)
+        try:
+            tok = _req(self.base + "/identity/connect/token", data={
+                "grant_type": "password", "username": email, "password": master_hash,
+                "scope": "api offline_access", "client_id": "cli", "deviceType": "8",
+                "deviceIdentifier": "soc-setup-0001", "deviceName": "soc-setup",
+            }, method="POST", form=True)
+        except VaultSeedError as e:
+            if "HTTP 400" in str(e) or "HTTP 401" in str(e):
+                raise LoginRejectedError(
+                    f"Vaultwarden rejected the login for '{email}'. Either the "
+                    f"master password is wrong, or no account exists for that "
+                    f"email — register at {self.base}/#/login (a kiosk install "
+                    f"typically uses setup.py first-run, which can register the "
+                    f"account for you).")
+            raise
         if "Key" not in tok or "access_token" not in tok:
             raise VaultSeedError("login failed — check the email/master password")
         sym = _dec(tok["Key"], senc, smac)              # 64-byte account key
         self.ek, self.mk = sym[:32], sym[32:]
         self.auth = {"Authorization": f"Bearer {tok['access_token']}"}
+        self.user_id = _token_subject(tok["access_token"])
+
+    def _for_user(self, body: dict) -> dict:
+        """Current Vaultwarden rejects a cipher write with HTTP 422 unless it names
+        the user it was encrypted for; older servers ignore the field."""
+        if self.user_id:
+            body["encryptedFor"] = self.user_id
+        return body
 
     def _ciphers(self):
         r = _req(self.base + "/api/ciphers", headers=self.auth)
         return r.get("Data", r.get("data", []))
 
-    def _find(self, name: str):
-        """Cipher id of the LOGIN named `name`, or None. Mirrors the read paths
-        (list_logins/get_login): only a live type-1 login is a match, so an
-        update/delete can never hit a card/secure-note/identity or a trashed
-        login that happens to share the visible name."""
+    def _find_typed(self, name: str, cipher_type: int):
+        """Cipher id of the live cipher of `cipher_type` named `name`, or None.
+        Only that type matches, so an update/delete can never hit a different kind
+        of item, or a trashed one, that happens to share the visible name."""
         for c in self._ciphers():
-            if (c.get("Type") or c.get("type")) != 1:
+            if (c.get("Type") or c.get("type")) != cipher_type:
                 continue
             if c.get("DeletedDate") or c.get("deletedDate"):
                 continue
@@ -184,9 +221,36 @@ class Session:
             try:
                 if enc_name and _dec(enc_name, self.ek, self.mk).decode() == name:
                     return c.get("Id") or c.get("id")
-            except VaultSeedError:
+            except (VaultSeedError, ValueError):
                 continue
         return None
+
+    def _find_login(self, name: str):
+        """Cipher id of the LOGIN named `name`, or None. Mirrors the read paths
+        (list_logins/get_login)."""
+        return self._find_typed(name, 1)
+
+    def _find(self, name: str):
+        """Cipher id of the SECURE NOTE named `name`, or None — the lookup behind
+        upsert_secure_note/delete_item, so a note write can never overwrite a login
+        of the same name and a repeat write updates the note instead of adding a
+        duplicate. Logins go through _find_login."""
+        return self._find_typed(name, 2)
+
+    def _folder_id(self, folder: str) -> str:
+        """Id of the folder named `folder`, created if absent. Folder names are
+        encrypted, so they can only be matched client-side."""
+        r = _req(self.base + "/api/folders", headers=self.auth)
+        for f in r.get("Data", r.get("data", [])):
+            enc_name = f.get("Name") or f.get("name")
+            try:
+                if enc_name and _dec(enc_name, self.ek, self.mk).decode() == folder:
+                    return f.get("Id") or f.get("id")
+            except (VaultSeedError, ValueError):
+                continue
+        made = _req(self.base + "/api/folders", headers=self.auth,
+                    data={"name": self._e(folder)}, method="POST")
+        return made.get("Id") or made.get("id")
 
     def _e(self, s):
         """Encrypt a str to an EncString with the session keys (helper used by
@@ -217,13 +281,13 @@ class Session:
         `name`, it raises VaultSeedError rather than overwriting that third
         login. When rename_from is None/"" or equal to `name`, behaviour is
         byte-identical to before (resolve + upsert by `name`)."""
-        body = _login_body(self._e, name, username, password,
-                           notes=notes, uri=uri, totp=totp)
+        body = self._for_user(_login_body(self._e, name, username, password,
+                                          notes=notes, uri=uri, totp=totp))
         if rename_from and rename_from != name:
             # Renaming: fail CLOSED if the new name already belongs to a
             # different login, so we never overwrite an unrelated cipher.
-            clash = self._find(name)
-            src = self._find(rename_from)
+            clash = self._find_login(name)
+            src = self._find_login(rename_from)
             if clash and clash != src:
                 raise VaultSeedError(
                     f"a login named '{name}' already exists")
@@ -236,6 +300,20 @@ class Session:
             _req(self.base + "/api/ciphers", headers=self.auth,
                  data=body, method="POST")
             return "created"
+        cid = self._find_login(name)
+        if cid:
+            _req(self.base + f"/api/ciphers/{cid}", headers=self.auth,
+                 data=body, method="PUT")
+            return "updated"
+        _req(self.base + "/api/ciphers", headers=self.auth, data=body, method="POST")
+        return "created"
+
+    def upsert_secure_note(self, name, notes, folder=None) -> str:
+        """Create or update a secure note (type 2), for items whose payload lives
+        entirely in the Notes field, e.g. TOTP secrets. `folder` is a folder NAME,
+        created if needed. Returns 'created'|'updated'."""
+        folder_id = self._folder_id(folder) if folder else None
+        body = self._for_user(_note_body(self._e, name, notes, folder_id=folder_id))
         cid = self._find(name)
         if cid:
             _req(self.base + f"/api/ciphers/{cid}", headers=self.auth,
@@ -302,6 +380,16 @@ class Session:
     def delete_login(self, name: str) -> bool:
         """Delete the login cipher named `name`. True if one was deleted,
         False if no match was found."""
+        cid = self._find_login(name)
+        if not cid:
+            return False
+        _req(self.base + f"/api/ciphers/{cid}", headers=self.auth, method="DELETE")
+        return True
+
+    def delete_item(self, name) -> bool:
+        """Delete the secure note named `name`. True if one was deleted, False if
+        no match was found. Raises on transport / auth errors, so a 5xx surfaces
+        as a GUI 'delete failed' rather than as 'nothing to delete'."""
         cid = self._find(name)
         if not cid:
             return False
@@ -330,6 +418,21 @@ def _login_body(enc, name, username, password, notes=None, uri=None, totp=None):
     }
 
 
+def _note_body(enc, name, notes, folder_id=None):
+    """Pure assembler for a Vaultwarden secure-note cipher body; `enc` is a
+    callable str->EncString, as for _login_body."""
+    body = {
+        "type": 2,
+        "name": enc(name),
+        "favorite": False,
+        "notes": enc(notes) if notes else None,
+        "secureNote": {"type": 0},
+    }
+    if folder_id:
+        body["folderId"] = folder_id
+    return body
+
+
 def upsert_login(url, email, master_password, name, username, password,
                  notes=None, uri=None, totp=None, rename_from=None) -> str:
     """One-shot: log in and create/update a Vaultwarden login. Returns the action.
@@ -351,9 +454,44 @@ def get_login(url, email, master_password, name):
     return Session(url, email, master_password).get_login(name)
 
 
+def upsert_secure_note(url, email, master_password, name, notes,
+                       folder=None) -> str:
+    """One-shot: log in and create/update a secure note. Returns the action."""
+    return Session(url, email, master_password).upsert_secure_note(
+        name, notes, folder=folder)
+
+
 def delete_login(url, email, master_password, name) -> bool:
-    """One-shot: log in and delete the login named `name`. True if deleted."""
-    return Session(url, email, master_password).delete_login(name)
+    """One-shot: log in and delete the login named `name` or, failing that, the
+    secure note of that name (where TOTP secrets live). True if deleted."""
+    session = Session(url, email, master_password)
+    return session.delete_login(name) or session.delete_item(name)
+
+
+def account_exists(url: str, email: str, master_password: str) -> bool:
+    """True if `email` + `master_password` opens a session against the vault at
+    `url`. False if the server rejects the login (no account OR wrong password, the
+    API hides which). Anything else (vault unreachable, say) propagates, so the
+    caller can tell 'no account' from 'cannot reach the vault'."""
+    try:
+        Session(url, email, master_password)
+    except LoginRejectedError:
+        return False
+    return True
+
+
+def register_account(url: str, email: str, master_password: str,
+                     kdf_iterations: int = 600000) -> None:
+    """Create a Vaultwarden account, raising VaultSeedError on any failure,
+    including an account that already exists. The registration itself lives in
+    host.vaultsetup (lazy import: it imports this module); needs signups enabled
+    on the server."""
+    from host import vaultsetup
+    if vaultsetup.register_account(url, email, master_password,
+                                   kdf_iterations=kdf_iterations) == "exists":
+        raise VaultSeedError(
+            f"an account for '{email}' already exists in this vault — use the "
+            f"existing master password, or remove the account.")
 
 
 def available() -> bool:

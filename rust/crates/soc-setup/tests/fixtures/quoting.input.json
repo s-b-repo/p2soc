@@ -1,0 +1,23 @@
+{
+ "env": {
+  "SOC_CDP_BASE_PORT": "9222",
+  "SOC_CONFIG_VAULT_ITEM": "It's a $HOME `x` \"q\"",
+  "SOC_CRED_TTL": "30",
+  "SOC_EMPTY": "",
+  "SOC_INJECT_TMPL": "/opt/soc-display/inject/login.js.tmpl",
+  "SOC_LAUNCH_STAGGER": "1.5",
+  "SOC_OPERATOR_NOTE": "a b",
+  "SOC_PANELS_FILE": "/etc/soc-display/panels.yaml",
+  "SOC_READY_TIMEOUT": "120",
+  "SOC_ROOT": "/opt/with space",
+  "SOC_SECRET_DIR": "/etc/soc-display/secret",
+  "SOC_SESSION": "x11",
+  "SOC_UNICODE": "caf\u00e9",
+  "SOC_VAULT_BACKEND": "rbw",
+  "SOC_VAULT_EMAIL": "o'brien@soc.local",
+  "SOC_VAULT_URL": "http://127.0.0.1:8222",
+  "SOC_VPN_DRY_RUN": "0"
+ },
+ "soc_root": "/opt/soc-display",
+ "user": "soc"
+}

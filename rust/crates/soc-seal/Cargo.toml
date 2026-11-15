@@ -1,0 +1,23 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-seal"
+description = "p2soc sealed secrets: host-bound, PIN-sealed vault master password, its sources, OS-password checks and the pinentry helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+soc-core.workspace = true
+zeroize.workspace = true
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+scrypt = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11", default-features = false }
+hmac = "0.13"
+ctutils = "0.4"
+getrandom = "0.4"
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+
+[lints]
+workspace = true

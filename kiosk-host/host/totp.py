@@ -24,9 +24,8 @@ Public surface (all stateless except generate_secret + the on-disk store):
     save(path, secret_b32) -> None          # write 0600 secret to path
     clear(path) -> None                     # remove the stored secret
 
-TOTP storage is FILE-backed only — the secret lives 0600 in $SOC_STATE_DIR
-alongside panellock.pin. (Our vaultseed lacks upsert_secure_note/delete_login,
-so there is no vault-write path here.)
+TOTP secrets live 0600 in $SOC_STATE_DIR alongside panellock.pin, or as a vault
+secure note (load_vault/save_vault/clear_vault) to centralise them across walls.
 """
 from __future__ import annotations
 
@@ -162,3 +161,73 @@ def clear(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+# --- vault-backed store (centralise across roaming walls) ------------------ #
+# Same secret material as the local file pair (config.totp / panellock.totp),
+# different storage. The file API above stays as the offline fallback and the
+# migration source when an operator switches a wall to vault-backed.
+
+_VAULT_TOTP_FOLDER = "SOC Wall Auth"
+
+_VAULT_ITEM_NAMES = {
+    "settings":   "SOC Settings TOTP",
+    "panellock":  "SOC Panel Lock TOTP",
+}
+
+
+def vault_item_for(kind: str) -> str:
+    """`kind` is 'settings' (gates the settings window) or 'panellock' (gates
+    the wall input). Anything else is a programming error — raise."""
+    try:
+        return _VAULT_ITEM_NAMES[kind]
+    except KeyError:
+        raise ValueError(f"unknown TOTP kind: {kind!r}; "
+                         f"expected one of {list(_VAULT_ITEM_NAMES)}")
+
+
+def load_vault(vault, kind: str) -> str | None:
+    """Read the TOTP secret from the vault item's Notes field. Returns None on
+    empty / missing / unreadable so callers can fall back to the file path.
+    Errors from the vault are swallowed — a locker prompt should not stack-trace
+    when Vaultwarden hiccups."""
+    try:
+        note = vault.notes(vault_item_for(kind)) if vault else ""
+    except Exception:                                  # noqa: BLE001
+        return None
+    note = (note or "").strip()
+    return note or None
+
+
+def save_vault(vault, vaultseed_args, kind: str, secret_b32: str) -> None:
+    """Persist `secret_b32` to the vault item as a secure note, creating it if
+    absent. `vaultseed_args = (url, email, master_password)` — the write is
+    delegated to vaultseed.upsert_secure_note so this module stays free of HTTP
+    plumbing."""
+    from . import vaultseed
+    url, email, master = vaultseed_args
+    vaultseed.upsert_secure_note(url, email, master,
+                                 name=vault_item_for(kind),
+                                 notes=secret_b32.strip(),
+                                 folder=_VAULT_TOTP_FOLDER)
+    if vault is not None:
+        try:
+            vault.invalidate(vault_item_for(kind))
+        except Exception:                              # noqa: BLE001
+            pass
+
+
+def clear_vault(vault, vaultseed_args, kind: str) -> bool:
+    """Delete the vault item. Returns True on actual deletion, False if it was
+    already absent. Raises on transport / auth failure so the GUI can show a
+    precise error."""
+    from . import vaultseed
+    url, email, master = vaultseed_args
+    rc = vaultseed.delete_login(url, email, master,
+                                name=vault_item_for(kind))
+    if vault is not None:
+        try:
+            vault.invalidate(vault_item_for(kind))
+        except Exception:                              # noqa: BLE001
+            pass
+    return bool(rc)

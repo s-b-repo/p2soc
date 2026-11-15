@@ -1,0 +1,9 @@
+# Pinned Vaultwarden image for scripts/fetch-vaultwarden.py. The digest is the
+# SHA-256 of the multi-arch index, so it covers every architecture at once.
+# To move to a new version:
+#   scripts/fetch-vaultwarden.py --resolve <tag>-alpine > security/vaultwarden.lock
+# The -alpine image is used because its binary is statically linked, so it runs on
+# any distro regardless of the libc there.
+image=vaultwarden/server
+tag=1.37.5-alpine
+digest=sha256:bbe684a02d6b0db54256ff88eac9754f4519284a7b26314afc241fd7d0918191

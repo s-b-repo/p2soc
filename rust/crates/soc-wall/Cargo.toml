@@ -1,0 +1,47 @@
+[package]
+publish = false  # private kiosk crate; never goes to crates.io (enables deny.toml allow-wildcard-paths)
+name = "soc-wall"
+description = "p2soc — SOC video-wall kiosk host (single binary: wall, VPN supervisor, vault client, tools)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "soc_wall"
+path = "src/lib.rs"
+
+[[bin]]
+name = "soc-wall"
+path = "src/main.rs"
+
+[features]
+default = ["gui"]
+# The GTK/WebKit wall itself. Without it the binary still provides every
+# headless tool (config check, VPN supervisor, vault client, tunnel args...).
+gui = ["dep:gtk", "dep:gdk", "dep:glib", "dep:gio", "dep:webkit2gtk", "dep:javascriptcore"]
+
+[dependencies]
+soc-brand.workspace = true
+soc-core.workspace = true
+soc-seal.workspace = true
+soc-gui.workspace = true
+soc-inode.workspace = true
+soc-setup.workspace = true
+soc-state.workspace = true
+soc-sys.workspace = true
+soc-vpn.workspace = true
+soc-vault.workspace = true
+soc-web.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+libc.workspace = true
+gtk = { version = "0.18", optional = true }
+gdk = { version = "0.18", optional = true }
+glib = { version = "0.18", optional = true }
+gio = { version = "0.18", optional = true }
+javascriptcore = { package = "javascriptcore-rs", version = "1.1", optional = true }
+webkit2gtk = { version = "2.0", optional = true, features = ["v2_40"] }
+
+[lints]
+workspace = true

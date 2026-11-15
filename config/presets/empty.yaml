@@ -1,0 +1,38 @@
+# name: Empty (blank canvas)
+# desc: A 2x2 grid with no panels — the blank canvas you fill entirely by hand in
+#       the wizard. Also the safe fallback if another preset fails to load.
+# =============================================================================
+# SOC video-wall preset — a complete, valid panels.yaml starting point.
+# Loaded by the graphical setup wizard (host.setupgui) and customizable by hand.
+# =============================================================================
+
+display:
+  auto: true
+  width: 1920
+  height: 1080
+  cols: 2
+  rows: 2
+  gap: 0
+  layout: auto
+
+panels: []
+
+tunnel:
+  enabled: false
+  jump_host: ""
+  identity: ""
+  extra_forwards: []
+
+vpn:
+  enabled: false
+  type: fortinet
+  gateway: ""
+  port: 443
+  vault_item: ""
+  trusted_cert: ""
+
+proxy:
+  enabled: false
+  url: ""
+  vault_item: ""
+  ignore_hosts: []

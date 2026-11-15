@@ -1,0 +1,63 @@
+# Bad-pattern audit: runs the BAD_PATTERNS regex matrix
+# (rust/scripts/audit-bad-patterns.sh) over the Rust workspace and reports
+# what it finds. It WARNS — it never fails the build — so a reviewer sees the
+# matrix on every PR without it blocking a merge. To gate a specific category
+# instead, run the script locally with `--strict`.
+name: audit
+
+on:
+  push:
+    branches: [main, rust-remake]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bad-patterns:
+    name: bad-pattern matrix (warn only)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the audit
+        id: audit
+        working-directory: rust
+        run: |
+          set -o pipefail
+          # Non-strict: informational. Capture the full report for the summary.
+          bash scripts/audit-bad-patterns.sh | tee audit-report.txt
+
+          # Surface the per-section breakdown in the job summary.
+          {
+            echo '## Bad-pattern audit (warn only)'
+            echo
+            echo 'The BAD_PATTERNS matrix over `rust/crates/*/src`, production code'
+            echo 'only (`#[cfg(test)]` blocks and test-only modules are excluded).'
+            echo 'Reviewed, intentional matches are tagged `// audit-allow: <reason>`'
+            echo 'on the hit line and do not count. Scan the strict categories'
+            echo '(A/B/C/L/M/N/O) for anything new and untagged.'
+            echo
+            echo '```'
+            cat audit-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Emit a warning annotation with the strict total
+        if: always()
+        working-directory: rust
+        run: |
+          strict=$(grep -E 'Strict \(A/B/C/L/M/N/O\)' audit-report.txt | grep -oE '[0-9]+' | tail -1)
+          total=$(grep -E 'Total hit lines' audit-report.txt | grep -oE '[0-9]+' | tail -1)
+          echo "::warning title=Bad-pattern audit::${total:-0} matrix hit(s) across the workspace, ${strict:-0} in strict categories (A/B/C/L/M/N/O). See the job summary for the breakdown; this check never fails the build."

@@ -1,0 +1,179 @@
+# Rust remake of the wall (rust/): compile on x86-64 and arm64, run the test
+# suite on both, and hunt for bugs with clippy, Miri, fuzzing and advisory /
+# license checks. Everything runs on GitHub-hosted runners; the Pi never
+# compiles anything.
+name: rust
+
+on:
+  push:
+    branches: [main, rust-remake]
+    paths:
+      - 'rust/**'
+      - 'inject/**'
+      - 'security/**'
+      - 'config/**'
+      - 'openbox/**'
+      - 'labwc/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - 'inject/**'
+      - 'security/**'
+      - 'config/**'
+      - 'openbox/**'
+      - 'labwc/**'
+      - '.github/workflows/rust.yml'
+  workflow_dispatch:
+  schedule:
+    # Weekly: new advisories and a longer fuzz run even when nothing changed.
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: rust
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  GUI_PACKAGES: libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install GTK/WebKit headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GUI_PACKAGES
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.arch }}
+      - name: Install GTK/WebKit headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GUI_PACKAGES
+      - name: Test
+        run: xvfb-run -a cargo test --workspace --locked
+
+  release-build:
+    name: release binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: release-${{ matrix.arch }}
+      - name: Install GTK/WebKit headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $GUI_PACKAGES
+      - run: cargo build --release --locked
+      - name: Smoke test + size
+        run: |
+          ./target/release/soc-wall --version
+          ./target/release/soc-wall check ../config/panels.yaml
+          ls -l target/release/soc-wall
+          echo "### soc-wall ${{ matrix.arch }}: $(stat -c %s target/release/soc-wall) bytes" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soc-wall-${{ matrix.arch }}
+          path: rust/target/release/soc-wall
+          if-no-files-found: error
+
+  miri:
+    name: miri (undefined behaviour)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: miri
+      # The pure-logic crates: no FFI, so Miri can interpret every test.
+      - run: cargo miri test -p soc-core
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [config_load, url_split, guards]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/fuzz
+          key: fuzz-${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz
+        working-directory: rust/fuzz
+        run: |
+          secs=120
+          [ "${{ github.event_name }}" = schedule ] && secs=900
+          # Pin the build target: the prebuilt cargo-fuzz binary defaults
+          # `--target` to its OWN build triple (musl), whose std is not installed
+          # on the runner. Force the gnu host target, which has std + the ASan
+          # runtime shipped with the nightly toolchain.
+          cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=$secs -max_len=65536 -rss_limit_mb=2048
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: rust/fuzz/artifacts
+
+  supply-chain:
+    name: advisories + licenses + unused deps
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
+      - run: cargo deny check
+      - run: cargo machete

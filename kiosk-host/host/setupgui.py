@@ -591,7 +591,7 @@ entry {{ background-color: {sunken}; color: {text};
   caret-color: {accent}; transition: border-color 120ms ease, box-shadow 120ms ease; }}
 entry:focus, entry:focus-visible {{ border: 1px solid {accent};
   box-shadow: 0 0 0 2px {ring}; }}
-entry image, entry placeholder {{ color: {text_dim}; }}
+entry image, entry placeholder {{ color: {text}; opacity: 0.90; }}
 .soc-field-bad {{ border: 1px solid {bad}; }}
 .soc-field-bad:focus {{ border: 1px solid {bad}; box-shadow: 0 0 0 2px {_rgba(bad, 0.30)}; }}
 .soc-field-good {{ border: 1px solid {good}; }}
@@ -2404,10 +2404,10 @@ class SetupAssistant:
             paths = self.model.paths
             backend = soc_env.get("SOC_VAULT_BACKEND") or paths.get("default_backend", "litebw")
 
-            # Guard: never launch the worker with nothing to install. Surface a
-            # guiding status instead of a silent "no wizard config yet" line buried in
-            # the per-step log — the operator must configure display + panels first.
-            if not (cfg.get("display") and cfg.get("panels")):
+            # Guard: never launch the worker with no display configured. Panels can be
+            # empty — the wall opens with blank frames; the operator adds panels later.
+            # Surface a guiding status instead of a silent "no wizard config yet" line.
+            if not cfg.get("display"):
                 self._install_busy = False
                 for w in (self._install_run_btn, self._install_preview_btn,
                           self._install_dry_chk, self._install_mode_combo):
@@ -2415,7 +2415,7 @@ class SetupAssistant:
                         w.set_sensitive(True)
                 self.assistant.set_page_complete(self._install_page, True)
                 self._install_set_status(
-                    "configure the display + panels first (run the wizard pages), "
+                    "configure the display first (run the wizard), "
                     "then install", bad=True)
                 return
 
@@ -2739,8 +2739,8 @@ class SetupAssistant:
         return False
 
     def _install_finish(self, ok, dry):
-        """MAIN-thread completion: on a successful REAL run, RETURN TO THE START
-        MENU (clean Gtk.main_quit -> the launcher wrapper relaunches the menu)."""
+        """MAIN-thread completion: on success, spawn the control center directly
+        (via subprocess — no reliance on wrapper-script env) then exit cleanly."""
         self._install_busy = False
         # Re-arm controls (so a failed/dry run can be retried).
         for w in (self._install_run_btn, self._install_preview_btn,
@@ -2753,14 +2753,22 @@ class SetupAssistant:
             self._install_set_status(
                 "dry-run complete — no host state changed. Uncheck Dry-run to install.")
         elif ok:
-            self._install_set_status("Installed — returning to menu…")
-            # Drop the Appearance preview poison (mirror _on_quit) then quit cleanly;
-            # the setup-gui wrapper (SOC_RETURN_TO_MENU=1) relaunches the start menu.
+            self._install_set_status("Installed — launching control center…")
             try:
                 self.branding.load(refresh=True)
             except Exception:  # noqa: BLE001
                 pass
-            self.GLib.timeout_add(900, lambda: (self.Gtk.main_quit(), False)[1])
+            # Spawn the control center NOW: the wrapper's SOC_RETURN_TO_MENU=1 can be
+            # lost across env/sudo boundaries. If it survived, the wrapper relaunches
+            # the menu itself, and spawning one here would open a second.
+            menu = os.path.join(_repo_root(), "scripts", "soc-wall-menu")
+            if os.environ.get("SOC_RETURN_TO_MENU") != "1" and os.path.exists(menu):
+                try:
+                    subprocess.Popen([menu], start_new_session=True)
+                except OSError:
+                    pass
+            # Schedule quit after the status is visible, then exit.
+            self.GLib.timeout_add(600, self.Gtk.main_quit)
         else:
             self._install_set_status("install FAILED — see the log above", bad=True)
         return False

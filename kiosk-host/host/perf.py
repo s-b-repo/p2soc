@@ -17,6 +17,7 @@ profile from the actual hardware and exposes overrides:
                             Chromium counterpart (see host/chromium_panel.py
                             _hwaccel_flags): auto adds V3D GPU flags on ARM
                             boards with a render node, never opts out.
+  SOC_UNATTENDED=0|1        nobody is at this box (see unattended() below)
   SOC_FAKE_ARCH=<machine>   TEST-ONLY override for is_arm() — pretend the host
                             reports this platform.machine() (e.g. aarch64) so the
                             ARM tuning branch can be exercised on an x86 dev box /
@@ -78,9 +79,78 @@ def proc_rss_kb(pid: int, status_path: str = None):
     return None
 
 
+def proc_table(root: str = "/proc") -> dict:
+    """{pid: (ppid, comm)} for every live process, zombies left out. One pass over
+    /proc: a few milliseconds and no fork, so it is safe on the main thread."""
+    table = {}
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return table
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"{root}/{name}/stat", "rb") as fh:
+                raw = fh.read()
+            # comm may itself hold spaces and parens, so split on the LAST ')'.
+            head, _, tail = raw.rpartition(b")")
+            state, ppid = tail.split()[:2]
+            if state not in (b"Z", b"X"):
+                table[int(name)] = (int(ppid),
+                                    head.partition(b"(")[2].decode("ascii", "replace"))
+        except (OSError, ValueError):
+            continue                       # it exited while we were looking
+    return table
+
+
+def web_process_pids(table: dict = None, parent: int = None) -> set:
+    """The WebKitWebProcess children of `parent` (default: this process)."""
+    table = proc_table() if table is None else table
+    parent = os.getpid() if parent is None else parent
+    # comm is cut to 15 characters by the kernel
+    return {pid for pid, (ppid, comm) in table.items()
+            if ppid == parent and comm.startswith("WebKitWebProces")}
+
+
+def proc_tree_rss_kb(pid: int, table: dict = None, rss=None):
+    """Summed RSS (KiB) of `pid` and all its descendants, or None if `pid` is gone.
+    A browser's memory is in its renderers, so its own RSS says little about it.
+    Shared pages count once per process: this ranks panels, it is not a total."""
+    table = proc_table() if table is None else table
+    rss = rss or proc_rss_kb
+    if pid not in table:
+        return None
+    children = {}
+    for p, (ppid, _comm) in table.items():
+        children.setdefault(ppid, []).append(p)
+    total, stack = 0, [pid]
+    while stack:
+        p = stack.pop()
+        total += rss(p) or 0
+        stack.extend(children.get(p, ()))
+    return total
+
+
+def log_repeat(n: int, first: int = 5, every: int = 30) -> bool:
+    """Is the n-th straight repeat of a failure worth a log line? The journal lives
+    on the SD card, and a panel that stays down retries for as long as it takes:
+    tell the story of the first few, then one line in `every`."""
+    return n <= first or n % every == 0
+
+
 def under_pressure(avail_mb, min_mb) -> bool:
     """True when available memory is known and below the floor."""
     return avail_mb is not None and avail_mb < min_mb
+
+
+def unattended() -> bool:
+    """SOC_UNATTENDED=1: nobody is at the keyboard. Anything that would wait for a
+    human (a prompt, a parked panel, an exhausted login budget, the operator-action
+    exit code) must instead show its state and retry on a capped backoff, forever.
+    Read at each use, so it has one spelling and tests can flip it."""
+    return os.environ.get("SOC_UNATTENDED", "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def is_arm() -> bool:

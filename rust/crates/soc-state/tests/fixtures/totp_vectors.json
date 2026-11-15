@@ -1,0 +1,45 @@
+{
+  "codes": {
+    "0": "702218",
+    "1111111109": "088309",
+    "1234567890": "401544",
+    "1700000000": "406058",
+    "1700000029": "661763",
+    "1700000030": "661763",
+    "2000000000": "978524",
+    "59": "503347"
+  },
+  "gate_schedule": [
+    0,
+    0,
+    5,
+    10,
+    20,
+    40,
+    60,
+    60,
+    60
+  ],
+  "lock_schedule": [
+    0,
+    0,
+    5,
+    10,
+    15,
+    20,
+    25,
+    30,
+    35,
+    40,
+    45,
+    50,
+    55,
+    60,
+    60
+  ],
+  "secret": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+  "spaced_code_1700000000": "921300",
+  "spaced_secret": "gezd gnbv gy3t qojq gezd gnbv gy3t qojq",
+  "uri_lock": "otpauth://totp/SOC%20Wall%20%E2%80%94%20Panel%20lock:kiosk@soc.local?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=SOC+Wall+%E2%80%94+Panel+lock&algorithm=SHA1&digits=6&period=30",
+  "uri_settings": "otpauth://totp/SOC%20Wall%20%E2%80%94%20Settings:kiosk@soc.local?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=SOC+Wall+%E2%80%94+Settings&algorithm=SHA1&digits=6&period=30"
+}

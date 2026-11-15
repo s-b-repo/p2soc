@@ -14,18 +14,57 @@ validation rejects layout: single with engine: chromium.
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
-from . import style  # noqa: E402
+from . import perf, style, vpnstatus  # noqa: E402
+
+# Unattended: how long a modal may stay up before it dismisses itself.
+MODAL_TIMEOUT_SEC = 120
+
+
+def _delete_event_action(on_hide_to_tray):
+    """delete-event policy, GTK-free so it can be tested. True swallows the close
+    (the tray hid the window); False lets it propagate to destroy, which shuts the
+    host down. A hide that fails also returns False: better to close than to leave
+    an unresponsive zombie on screen."""
+    if on_hide_to_tray is None:
+        return False
+    try:
+        on_hide_to_tray()
+    except Exception:                                  # noqa: BLE001
+        return False
+    return True
+
+
+def _run_bounded(dlg):
+    """dlg.run(), except that on an unattended wall nothing may wait on a person
+    forever: if someone opens a modal and walks away it dismisses itself. A nested
+    run keeps the main loop turning (so the heartbeat never notices), but the modal
+    would still sit on top of the wall."""
+    if not perf.unattended():
+        return dlg.run()
+    fired = []
+
+    def _expire():
+        fired.append(True)
+        dlg.response(Gtk.ResponseType.DELETE_EVENT)
+        return False
+    src = GLib.timeout_add_seconds(MODAL_TIMEOUT_SEC, _expire)
+    rc = dlg.run()
+    if not fired:
+        GLib.source_remove(src)
+    return rc
 
 
 class WallWindow:
     def __init__(self, conf, log, on_destroy=None, on_config=None, on_vpn=None,
-                 on_lock=None, on_show_vpn_log=None):
+                 on_lock=None, on_show_vpn_log=None, on_hide_to_tray=None):
         self.conf = conf
         self.log = log
         self.on_config = on_config        # callable() -> open the config window
@@ -35,7 +74,16 @@ class WallWindow:
         # reconnect. Kept SEPARATE from the pill (which reconnects): the 📜
         # button only observes, the pill only restarts.
         self.on_show_vpn_log = on_show_vpn_log
-        self.vpn_pill = None
+        # Set when main built a tray icon: the close button then hides the wall
+        # instead of destroying it.
+        self.on_hide_to_tray = on_hide_to_tray
+        # One pill per enabled VPN (name + traffic-light colour), or a single
+        # aggregate pill when there are 0 or 1. Every pill reconnects through the
+        # same on_vpn: one supervisor unit runs all the VPNs.
+        self.vpn_pills = []               # [{"button": Gtk.Button, "name": str}]
+        self.vpn_pill = None              # the first pill
+        self._cells = {}                  # panel id -> grid widget
+        self._pill_shown = {}             # pill button -> (state, label) on it now
         win = Gtk.Window()
         win.set_title("soc-wall")
         try:
@@ -57,13 +105,19 @@ class WallWindow:
         # own region above the grid keeps them always visible + clickable.
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         toolbar.get_style_context().add_class("soc-toolbar")
-        pill = Gtk.Button(label="VPN: …")
-        pill.get_style_context().add_class("soc-vpn-pill")
-        pill.get_style_context().add_class("unconfigured")
-        pill.set_tooltip_text("VPN status — click to re-check / reconnect")
-        pill.connect("clicked", lambda *_: self.on_vpn and self.on_vpn())
-        self.vpn_pill = pill
-        toolbar.pack_start(pill, False, False, 0)
+        enabled = [v for v in (conf.vpns or [])
+                   if isinstance(v, dict) and v.get("enabled")]
+        names = ([vpnstatus.vpn_name(v, i) for i, v in enumerate(enabled)]
+                 if len(enabled) > 1 else [""])
+        for name in names:
+            pill = Gtk.Button(label=f"{name or 'VPN'}: …")
+            pill.get_style_context().add_class("soc-vpn-pill")
+            pill.get_style_context().add_class("unconfigured")
+            pill.set_tooltip_text("VPN status — click to re-check / reconnect")
+            pill.connect("clicked", lambda *_: self.on_vpn and self.on_vpn())
+            self.vpn_pills.append({"button": pill, "name": name})
+            toolbar.pack_start(pill, False, False, 0)
+        self.vpn_pill = self.vpn_pills[0]["button"]
         toolbar.pack_start(Gtk.Box(), True, True, 0)        # spacer
         if on_config is not None:
             gear = Gtk.Button(label="⚙ Settings")
@@ -81,6 +135,12 @@ class WallWindow:
                                   "(Ctrl+Alt+L). Panels stay visible.")
             lock.connect("clicked", lambda *_: self.on_lock and self.on_lock())
             toolbar.pack_end(lock, False, False, 0)
+        # Screenshot of the wall, saved to ~/soc-wall-*.png (private to this user).
+        shot = Gtk.Button(label="📷 Shot")
+        shot.get_style_context().add_class("soc-toolbar-action")
+        shot.set_tooltip_text("Save a screenshot of the wall")
+        shot.connect("clicked", lambda *_: self._take_screenshot())
+        toolbar.pack_end(shot, False, False, 0)
         if on_show_vpn_log is not None:
             # Dedicated 'show the VPN log' button — distinct from the VPN
             # pill (which RECONNECTS), this just opens the live log viewer
@@ -115,6 +175,10 @@ class WallWindow:
                 key, mod = Gtk.accelerator_parse("<Control><Alt>l")
                 if key:
                     accel.connect(key, mod, 0, self._accel_lock)
+
+        # The close button: hide to the tray if there is one, else destroy.
+        win.connect("delete-event",
+                    lambda *_: _delete_event_action(self.on_hide_to_tray))
 
         if on_destroy:
             # losing the wall window (e.g. the compositor killed it) leaves
@@ -295,7 +359,7 @@ class WallWindow:
                  detail.get("extras") or [], "?")
 
         dlg.show_all()
-        rc = dlg.run()
+        rc = _run_bounded(dlg)
         dlg.destroy()
         if rc == Gtk.ResponseType.CLOSE:
             prev = getattr(self, "_warn_bar", None)
@@ -306,22 +370,70 @@ class WallWindow:
                     pass
                 self._warn_bar = None
 
-    def set_vpn_status(self, state: str, label: str):
-        """Update the pill. `state` in online|offline|unconfigured|checking."""
-        if self.vpn_pill is None:
-            return
-        ctx = self.vpn_pill.get_style_context()
-        for c in ("online", "offline", "unconfigured", "checking"):
-            ctx.remove_class(c)
-        ctx.add_class(state)
-        dot = {"online": "● ", "offline": "● ", "checking": "… "}.get(state, "")
-        self.vpn_pill.set_label(f"{dot}{label}")
+    def set_vpn_status(self, state: str, label: str, name: "str | None" = ""):
+        """Update a pill. `state` in online|offline|unconfigured|checking|connecting.
+        `name` picks that VPN's pill; '' the first pill; None every pill."""
+        if name is None:
+            targets = [p["button"] for p in self.vpn_pills]
+        elif name:
+            targets = [p["button"] for p in self.vpn_pills if p["name"] == name]
+        else:
+            targets = [self.vpn_pill] if self.vpn_pill is not None else []
+        dot = {"online": "● ", "offline": "● ", "checking": "… ",
+               "connecting": "◐ "}.get(state, "")
+        for pill in targets:
+            if self._pill_shown.get(pill) == (state, label):
+                continue                  # the same reading restyles nothing
+            self._pill_shown[pill] = (state, label)
+            ctx = pill.get_style_context()
+            for c in ("online", "offline", "unconfigured", "checking", "connecting"):
+                ctx.remove_class(c)
+            ctx.add_class(state)
+            pill.set_label(f"{dot}{label}")
 
     def attach(self, panel, widget):
         col, row = panel.grid
         widget.set_hexpand(True)
         widget.set_vexpand(True)
         self.grid.attach(widget, col, row, 1, 1)
+        self._cells[panel.id] = widget
+
+    def detach(self, pid: str):
+        """Take a panel's widget off the grid."""
+        widget = self._cells.pop(pid, None)
+        if widget is not None:
+            self.grid.remove(widget)
+
+    def _take_screenshot(self):
+        """Grab the wall on the main thread (GDK), encode + save off it: PNG-encoding
+        a full screen takes about a second on a Pi and would stall every panel."""
+        try:
+            win = self.window.get_window()
+            pb = win and Gdk.pixbuf_get_from_window(
+                win, 0, 0, win.get_width(), win.get_height())
+        except Exception as e:                         # noqa: BLE001
+            self.log(f"screenshot failed: {e}")
+            return
+        if not pb:
+            self.log("screenshot failed: this backend cannot read the window")
+            return
+        path = os.path.expanduser(time.strftime("~/soc-wall-%Y%m%d-%H%M%S.png"))
+        threading.Thread(target=self._save_screenshot, args=(pb, path),
+                         daemon=True).start()
+
+    def _save_screenshot(self, pixbuf, path: str):
+        """Worker thread. 0600 from the first byte: a wall screenshot shows whatever
+        the dashboards were showing. log() is thread-safe, GTK is not touched."""
+        try:
+            ok, data = pixbuf.save_to_bufferv("png", [], [])
+            if not ok:
+                raise OSError("PNG encode failed")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            self.log(f"screenshot saved: {path}")
+        except Exception as e:                         # noqa: BLE001
+            self.log(f"screenshot failed: {e}")
 
     def _screen_size(self):
         w, h = self.conf.display.width, self.conf.display.height

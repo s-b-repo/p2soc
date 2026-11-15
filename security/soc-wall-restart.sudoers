@@ -1,44 +1,36 @@
-# Lets the SOC wall (running as user `soc`) restart specific services
-# without a password — needed so the ⚙ Settings tab's "Save" applies
-# VPN / tunnel / tarpit changes LIVE instead of just queuing a "PENDING
-# restart" message for the operator to run by hand.
+# Lets the SOC wall (running as user `soc`) restart specific services without a
+# password, so the Settings tab's "Save" applies VPN / tunnel / tarpit changes
+# live instead of queuing a "PENDING restart" message for an operator.
 #
-# Scope is intentionally MINIMAL:
-#   * forti-vpn(@*)            VPN config change → restart the VPN unit
-#   * autossh-tunnel.service    tunnel config change → restart autossh
-#   * soc-tarpit.service        tarpit knob change  → restart tarpit
+# Scope is intentionally MINIMAL: exactly three units. The host drives every VPN
+# through the single forti-vpn.service, so no @-instances are needed.
 #
-# soc CANNOT use this drop-in to restart anything else (no soc-wall
-# itself — that's done via sys.exit + launcher loop; no random units;
-# no privilege escalation beyond these specific commands).
+# Every entry is an EXACT command line, on purpose: in sudoers `*` also matches
+# spaces. `systemctl restart soc-vpn@*.service` would let a compromised renderer
+# restart ANY unit by appending it, and `journalctl -u x *` would hand it every
+# journalctl flag as root. The wall uses the two journalctl shapes below and nothing
+# else (see host/vpn_log_viewer.py).
 #
-# Installed by install.sh to /etc/sudoers.d/soc-wall-restart, mode 0440,
-# parsed under visudo so a syntax error blocks the install rather than
-# breaking the whole sudoers stack.
-#
-# Defaults env_reset is implicit; we don't need any env vars passed.
+# Installed by install.sh to /etc/sudoers.d/soc-wall-restart, mode 0440, checked
+# with visudo first so a syntax error can't break the whole sudoers stack.
 
-soc ALL=(root) NOPASSWD: /usr/bin/systemctl restart soc-vpn.service, \
-                         /usr/bin/systemctl restart soc-vpn@*.service, \
-                         /usr/bin/systemctl restart forti-vpn.service, \
-                         /usr/bin/systemctl restart forti-vpn@*.service, \
+soc ALL=(root) NOPASSWD: /usr/bin/systemctl restart forti-vpn.service, \
                          /usr/bin/systemctl restart autossh-tunnel.service, \
                          /usr/bin/systemctl restart soc-tarpit.service, \
-                         /usr/bin/systemctl stop    soc-vpn@*.service, \
-                         /usr/bin/systemctl disable soc-vpn@*.service, \
-                         /usr/bin/systemctl enable  soc-vpn@*.service, \
-                         /usr/bin/systemctl stop    forti-vpn@*.service, \
-                         /usr/bin/systemctl disable forti-vpn@*.service, \
-                         /usr/bin/systemctl enable  forti-vpn@*.service, \
-                         /usr/bin/systemctl status  soc-vpn.service, \
-                         /usr/bin/systemctl status  soc-vpn@*.service, \
+                         /usr/bin/systemctl start   forti-vpn.service, \
+                         /usr/bin/systemctl start   autossh-tunnel.service, \
+                         /usr/bin/systemctl start   soc-tarpit.service, \
+                         /usr/bin/systemctl stop    forti-vpn.service, \
+                         /usr/bin/systemctl stop    autossh-tunnel.service, \
+                         /usr/bin/systemctl stop    soc-tarpit.service, \
+                         /usr/bin/systemctl enable  forti-vpn.service, \
+                         /usr/bin/systemctl enable  autossh-tunnel.service, \
+                         /usr/bin/systemctl enable  soc-tarpit.service, \
+                         /usr/bin/systemctl disable forti-vpn.service, \
+                         /usr/bin/systemctl disable autossh-tunnel.service, \
+                         /usr/bin/systemctl disable soc-tarpit.service, \
                          /usr/bin/systemctl status  forti-vpn.service, \
-                         /usr/bin/systemctl status  forti-vpn@*.service, \
                          /usr/bin/systemctl status  autossh-tunnel.service, \
                          /usr/bin/systemctl status  soc-tarpit.service, \
-                         /usr/bin/journalctl -u soc-vpn.service *, \
-                         /usr/bin/journalctl -u soc-vpn@*.service *, \
-                         /usr/bin/journalctl -u forti-vpn.service *, \
-                         /usr/bin/journalctl -u forti-vpn@*.service *, \
-                         /usr/bin/journalctl -u autossh-tunnel.service *, \
-                         /usr/bin/journalctl -u soc-tarpit.service *
+                         /usr/bin/journalctl -u forti-vpn.service -n 0 --no-pager, \
+                         /usr/bin/journalctl -u forti-vpn.service -f --no-pager -n 100 -o cat
