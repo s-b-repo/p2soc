@@ -35,9 +35,12 @@ pub const VALID_URL_SCHEMES: [&str; 2] = ["http", "https"];
 /// deliberately absent.
 pub const VALID_HOST_KEY_CHECKING: [&str; 2] = ["yes", "accept-new"];
 
-/// True if `s` holds a control character (incl. `\n` `\r` `\t` NUL DEL).
+/// True if `s` holds a control character: the full Unicode `Cc` category — C0
+/// (incl. `\n` `\r` `\t` NUL), DEL, and the C1 range U+0080..=U+009F. The C1
+/// controls matter because callers reject these in URLs, hostnames and argv,
+/// where an embedded C1 byte is a smuggling vector, never legitimate input.
 pub fn has_ctrl(s: &str) -> bool {
-    s.chars().any(|c| u32::from(c) < 0x20 || u32::from(c) == 0x7f)
+    s.chars().any(char::is_control)
 }
 
 /// True if `s` holds a control character or any whitespace.
@@ -50,14 +53,18 @@ pub fn has_ctrl_or_space(s: &str) -> bool {
 /// confusion/leak vector) and no control or whitespace character (those enable
 /// scheme smuggling and request splitting).
 pub fn valid_http_url(url: &str, allow_empty: bool) -> bool {
-    let s = url.trim();
-    if s.is_empty() {
+    if url.trim().is_empty() {
         return allow_empty;
     }
-    if has_ctrl_or_space(s) {
+    // Validate the string exactly as the caller will use it. Leading/trailing
+    // whitespace must be REJECTED, not trimmed away: callers load the original
+    // string, browsers may strip surrounding whitespace/control themselves, and
+    // `Url::split` does not trim — so trimming here accepted inputs like
+    // "\n http://evil" that parse with no http scheme once actually used.
+    if has_ctrl_or_space(url) {
         return false;
     }
-    let Ok(parts) = Url::split(s) else {
+    let Ok(parts) = Url::split(url) else {
         return false;
     };
     VALID_URL_SCHEMES.contains(&parts.scheme.as_str()) && parts.host.is_some() && !parts.netloc.contains('@')
@@ -350,6 +357,20 @@ mod tests {
         assert!(!valid_http_url("http://h/\njavascript:alert(1)", false));
         assert!(!valid_http_url("http://h/a b", false));
         assert!(!valid_http_url("http:///nohost", false));
+        // Leading/trailing whitespace must be rejected, not trimmed: the raw
+        // string is what gets loaded, and it parses with no http scheme. (Fuzz
+        // regression: `valid_http_url` used to trim then accept these.)
+        assert!(!valid_http_url("\n http://h", false));
+        assert!(!valid_http_url(" http://h ", false));
+        assert!(!valid_http_url("http://h\t", false));
+        // A blank/whitespace-only value is still treated as empty.
+        assert!(valid_http_url("   ", true));
+        assert!(!valid_http_url("   ", false));
+        // A non-ASCII C1 control char (U+0099) embedded in the host must be
+        // rejected (fuzz regression: has_ctrl missed the C1 range U+0080..=009F).
+        assert!(!valid_http_url("http://h\u{0099}x", false));
+        assert!(has_ctrl("a\u{0099}b"));
+        assert!(has_ctrl("a\u{0085}b")); // NEL, another C1 control
     }
 
     #[test]
@@ -360,6 +381,17 @@ mod tests {
         // A password containing '@' must be masked in full.
         assert_eq!(url_for_msg("http://u:p@ss@h/x"), "'http://***@h/x'");
         assert_eq!(url_for_msg("http://h/a?b=c@d"), "'http://h/a?***@d'");
+        // Fuzz-found pathological input (`userinfo` is `*@BBBBBBBB`): the whole
+        // userinfo is masked and its characters never survive before the host.
+        let shown = url_for_msg("//*@BBBBBBBB@BBBBBBBBB/@B/@@");
+        assert_eq!(shown, "'//***@BBBBBBBBB/@B/@@'");
+        assert!(!shown.contains("*@BBBBBBBB@"), "the credential+separator must not survive: {shown}");
+        // Only the authority's userinfo is masked; an identical byte run that
+        // recurs later in the path stays visible (it is path data, not a
+        // credential). This is why a bare substring leak-check is wrong.
+        assert_eq!(url_for_msg("http://aaaa@h/aaaa@x"), "'http://***@h/aaaa@x'");
+        // A scheme-relative URL whose host is control bytes still masks the user.
+        assert_eq!(url_for_msg("//333333333,@\u{0}\u{8}?x"), "'//***@\\x00\\x08?x'");
     }
 
     #[test]
