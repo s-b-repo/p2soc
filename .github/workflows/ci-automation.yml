@@ -9,28 +9,23 @@ concurrency:
   cancel-in-progress: true
 jobs:
   python:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-      - name: Install (best-effort)
+      - name: Install system test dependencies
         run: |
-          python -m pip install -U pip
-          [ -f requirements.txt ] && pip install -r requirements.txt || true
-          { [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; } && { pip install -e . || pip install . || true; } || true
-          pip install ruff pytest pip-audit || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-venv python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+      - name: Install Python dependencies and tools
+        run: |
+          PATH="/usr/bin:$PATH" make venv
+          .venv/bin/python -m pip install ruff pip-audit
       - name: Ruff lint (report-only)
-        run: ruff check . || true
+        run: .venv/bin/ruff check .
         continue-on-error: true
       - name: Tests
-        run: |
-          if find . -path ./.git -prune -o -name 'test_*.py' -print -o -name '*_test.py' -print | grep -q . || [ -d tests ] || [ -d test ]; then
-            pytest -q
-          else
-            echo "No tests found; skipping pytest."
-          fi
+        run: make test
       - name: pip-audit (security, report-only)
-        run: pip-audit || true
+        run: .venv/bin/pip-audit
         continue-on-error: true
