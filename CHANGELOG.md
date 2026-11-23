@@ -1,9 +1,28 @@
 # Changelog
 
 All notable changes to **p2soc** (the SOC video-wall kiosk). Format follows
-[Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0.
+[Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+
+## [1.4.0] - 2026-11-23
+
+### Native Rust release
+
+- The default wall, setup tools, desktop menu, and service commands use
+  `soc-wall`. The distro installer and session entry points call the native
+  binary. The Python compatibility runtime remains available.
+- Setup covers interactive and unattended deployment, desktop configuration,
+  Vaultwarden registration and recovery, seal migration, and credentials.
+- The native updater stages and validates releases before switching the live
+  tree. It monitors startup and rolls back failed releases.
+- Both browser engines support login-zone calibration in Settings. Desktop mode
+  includes tray controls.
+- Release builds package the executable for AMD64 and ARM on GNU/Linux and
+  Alpine. The [performance notes](docs/PERFORMANCE.md) report the measured
+  resource comparison with the Python host.
+
+### Earlier changes in this tree
 
 ### Zero-touch operation
 

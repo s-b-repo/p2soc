@@ -7,7 +7,7 @@ name: audit
 
 on:
   push:
-    branches: [main, rust-remake]
+    branches: [main, rust-remake, rust-rewrite-ci, 'rust-v*']
     paths:
       - 'rust/**'
       - '.github/workflows/audit.yml'

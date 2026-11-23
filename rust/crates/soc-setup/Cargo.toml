@@ -12,8 +12,11 @@ soc-core.workspace = true
 soc-sys.workspace = true
 soc-seal.workspace = true
 soc-vault.workspace = true
+soc-vpn.workspace = true
 zeroize.workspace = true
 serde_json.workspace = true
+scraper = { version = "0.29.0", default-features = false }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [lints]
 workspace = true

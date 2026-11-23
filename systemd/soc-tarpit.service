@@ -1,6 +1,5 @@
 [Unit]
 Description=SOC wall scanner-deception tarpit (port 80; off unless SOC_TARPIT_ENABLE=1)
-Documentation=file:///opt/soc-display/scripts/tarpit.py
 After=network-online.target
 Wants=network-online.target
 
@@ -19,7 +18,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 Environment=SOC_TARPIT_ENABLE=0
 EnvironmentFile=-/etc/soc-display/soc.env
 EnvironmentFile=-/etc/soc-display/tarpit.env
-ExecStart=/usr/bin/python3 /opt/soc-display/scripts/tarpit.py
+ExecStart=/opt/soc-display/scripts/soc-service.sh tarpit
 
 Restart=on-failure
 RestartSec=5

@@ -1,6 +1,6 @@
 [project]
 name = "soc-kiosk-host"
-version = "1.0.0"
+version = "1.4.0"
 description = "SOC video-wall kiosk host: renders 4 panels (WebKitGTK + Chromium fallback), injects logins from Vaultwarden, keeps sessions alive."
 requires-python = ">=3.9"
 # NOTE: PyGObject + WebKit2 come from SYSTEM packages, not pip:

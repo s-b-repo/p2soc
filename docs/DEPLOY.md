@@ -1,8 +1,8 @@
 # Production deploy
 
 The real install on a Raspberry Pi / kiosk box, where systemd autostarts the
-wall on boot and restarts it after a crash. The dev `make dev` runner is for a
-workstation only; production is `install.sh` + systemd.
+wall on boot and restarts it after a crash. Production uses the native installer
+and systemd. For a workstation preview, run `./launch.sh`.
 
 ## 0. Prereqs
 
@@ -10,21 +10,22 @@ workstation only; production is `install.sh` + systemd.
   64-bit recommended, an HDMI monitor, network, SSH.
 - Copy this repo to the box and `cd` into it.
 
-## 1. One command
+## 1. Build and deploy
 
 ```bash
-sudo python3 setup.py deploy        # or run `setup.py` and pick "Deploy" from the menu
+make rust-release
+sudo ./rust/target/release/soc-wall setup deploy
 ```
 
 End-to-end: OS installer → config wizard → start Vaultwarden → create the account →
 seal the master password (one-time PIN) → push the config + logins into the vault →
-`doctor` → **start the wall**. There is nothing to do afterwards: no reboot, no account
-to create by hand. From then on the box runs itself; see
-[AUTO_UPDATE.md](AUTO_UPDATE.md).
+`doctor` → **start the wall**. A kiosk with an active display manager schedules a
+reboot to hand off the display. A desktop install starts from the application
+menu. See [Zero-touch operation](AUTO_UPDATE.md).
 
 Add `--clean` to wipe generated config/state first. On a box that is already
-installed, deploy **skips the slow OS-package step** (it asks first; pass `--fresh`
-to force a full reinstall).
+installed, deploy skips the OS-package step. Pass `--fresh` to force a full
+reinstall.
 
 `install.sh` picks the install mode by itself: **kiosk** on a box with no desktop
 environment (it takes over tty1), **desktop** where a display manager is in use, so a
@@ -36,11 +37,11 @@ For imaging or a fleet, supply everything up front. Secrets arrive over file
 descriptors, so they never appear in `ps`, shell history or argv:
 
 ```bash
-sudo python3 setup.py deploy --unattended \
+sudo sh -c 'exec ./rust/target/release/soc-wall setup deploy --unattended \
     --email ops@example.com \
     --config wall.yaml \
     --master-fd 3 3<master.txt \
-    --creds-fd 4 4<logins.json
+    --creds-fd 4 4<logins.json'
 ```
 
 `logins.json` holds the panel logins, by `vault_item` name:
@@ -68,7 +69,7 @@ The wizard writes, with input validation:
   boot source of truth); the file is the offline fallback.
 - **`/etc/soc-display/soc.env`** — `SOC_VAULT_EMAIL/URL`, `SOC_SECRET_DIR`,
   `SOC_CONFIG_VAULT_ITEM`, `SOC_SESSION` (**non-secret**; the master password is
-  sealed by `setup.py first-run`, never stored here).
+  sealed by `soc-wall setup first-run`, never stored here).
 - **Vaultwarden** — config inline in its systemd unit (no `.env`): localhost, signups off, `/admin` off.
 
 You can also point tiles at URLs + set their vault logins later from the
@@ -86,28 +87,28 @@ no Docker daemon on the box. Signups are off, always, except for the seconds it 
 `deploy` to create the one account. That window is opened through a `/run` drop-in, so
 even a power cut can't leave it open.
 
-`setup.py creds` stores or changes a login at any time (panels, `vpn`, `proxy`). For
+`soc-wall setup creds` stores or changes a login (panels, `vpn`, `proxy`). For
 OpenVPN/WireGuard with `config_from_vault`, paste the `.ovpn`/`.conf` into that item's
 **Notes**.
 
 ## 4. Verify
 
 ```bash
-sudo python3 setup.py doctor    # all green?
+sudo soc-wall setup doctor      # all green?
 soc-update status               # redeploy is armed, tracking the right ref
 ```
 
 ## Troubleshooting + repair
 
 ```bash
-python3 setup.py doctor   # diagnose: deps, venv, config, vault, services, perms
-sudo python3 setup.py repair   # install missing packages, recreate venv, fix perms,
+soc-wall setup doctor          # diagnose dependencies, config, vault, units and permissions
+sudo soc-wall setup repair     # install missing packages, fix permissions,
                                # generate the tunnel key, …
 journalctl -t soc-kiosk -f     # the wall's own log
 journalctl -u forti-vpn -f     # VPN supervisor (STATUS= in systemctl status)
 ```
 
-`doctor` checks each of: venv + `gi`/WebKit2/yaml imports, `litebw`, the VPN client
+`doctor` checks `litebw`, the VPN client
 for your `vpn.type`, an X server / Wayland compositor for `SOC_SESSION`,
 `panels.yaml` parses, **autossh** + the tunnel key, Vaultwarden reachable, the
 **sealed master password (it test-unseals — catching `machine-id` drift)**, the
@@ -115,7 +116,7 @@ config source, file perms, and the systemd units.
 
 ## Bring-up checklist
 
-- [ ] `setup.py doctor` is all-green (or only expected WARNs)
+- [ ] `soc-wall setup doctor` is all-green (or only expected WARNs)
 - [ ] the one-time PIN is recorded off-device
 - [ ] `journalctl -t soc-kiosk` shows `[pN] injected login` for the auto-login panels
 - [ ] VPN (if used): `systemctl status forti-vpn` STATUS reads "Tunnel up"; pill is green

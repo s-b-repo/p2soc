@@ -15,6 +15,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$HERE")"
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  exec "$NATIVE" vault-backup "$@"
+fi
 PY="${SOC_PY:-$ROOT/.venv/bin/python}"
 [ -x "$PY" ] || PY=python3
 DATA_DIR="${SOC_VAULT_DATA_DIR:-/var/lib/vaultwarden}"

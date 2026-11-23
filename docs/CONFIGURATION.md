@@ -24,12 +24,12 @@ Cell geometry is computed as `(width - gap*(cols-1)) / cols` × `(height - gap*(
 The Vaultwarden master password (which `litebw`/`rbw` need to derive the account
 key) does **not** live in any `.env` in production. Its **source** is pluggable
 and resolved the same way by `litebw`, the host, and the legacy
-`pinentry-vault.py` (`host/mastersource.py`). Set `SOC_MASTER_SOURCE` in `soc.env`
+`pinentry-vault.sh` (`soc-seal`). Set `SOC_MASTER_SOURCE` in `soc.env`
 to one of:
 
 | `SOC_MASTER_SOURCE` | How the master is obtained | Use when |
 |---|---|---|
-| `sealed` *(default)* | host-bound AES-256-GCM seal (`host/secretstore.py`): machine-id + a sealed one-time PIN | **unattended / headless walls** — no login session, wallet, or prompt is needed to unlock at boot |
+| `sealed` *(default)* | host-bound AES-256-GCM seal (`soc-seal`): private host key, machine ID and a sealed one-time PIN | **unattended / headless walls** — no login session, wallet, or prompt is needed to unlock at boot |
 | `secret-service` | freedesktop Secret Service (`org.freedesktop.secrets`) via the libsecret `secret-tool` CLI | **attended** hosts where a human login unlocks the wallet (KWallet / GNOME Keyring / KeePassXC all implement it) |
 | `env` | `$SOC_VAULT_PASSWORD` from the environment (prints a deprecation warning) | **dev / seeding only** — never written to a file by any production flow |
 | `auto` | `sealed` (if a complete seal exists) → `secret-service` (if `secret-tool` is present and the lookup succeeds) → `env` | the default behaviour when `SOC_MASTER_SOURCE` is unset |
@@ -47,7 +47,7 @@ secret-tool store --label 'SOC wall vault master' service soc-wall account vault
 secret-tool lookup service soc-wall account vault-master
 ```
 
-`setup.py first-run` lets you pick the source and, for `secret-service`, stores +
+`soc-wall setup first-run` lets you pick the source and, for `secret-service`, stores +
 verifies the value in the wallet; it persists only the **source name** to
 `soc.env`, never the password. Install `secret-tool` (an **optional** package:
 `libsecret-tools`/`libsecret`) only if you use this source.
@@ -207,8 +207,7 @@ vpn: { enabled: true, type: openvpn, config: "/etc/openvpn/soc.ovpn",
 vpn: { enabled: true, type: wireguard, config: "/etc/wireguard/wg0.conf",
        ready_probe: "10.50.0.5:443", health_check_interval: 30 }
 
-# iNode (H3C SSL VPN — the client is BUNDLED in vendor/iNode-VPN-Client, so no
-# `config` is needed; set it only to use a client elsewhere. Needs tesseract for
+# iNode (H3C SSL VPN — uses the native client by default. Needs tesseract for
 # the gateway CAPTCHA and root for the TUN, which the service has):
 vpn: { enabled: true, type: inode, gateway: "vpn.example.com", port: 3000,
        vault_item: "SOC iNode VPN", domain: "system",
@@ -218,9 +217,9 @@ vpn: { enabled: true, type: inode, gateway: "vpn.example.com", port: 3000,
 All four share the supervisor: backoff on drops, a long hold on auth/cert
 failures, the systemd watchdog, and the `ready_probe` health check (which forces
 a reconnect when the tunnel goes stale — for WireGuard it falls back to the
-peer's last handshake age when no `ready_probe` is set). `make vpn-check`
-dry-runs any type without connecting; `make verify-vpn` behaviorally tests all
-four with fake clients. iNode self-detects a dead tunnel via its keepalive
+peer's last handshake age when no `ready_probe` is set).
+`soc-wall vpn-args --config /path/to/panels.yaml` previews the client arguments.
+The Rust tests exercise the VPN drivers with test doubles. iNode self-detects a dead tunnel via its keepalive
 heartbeat (~30 s × 5 misses), a forced log-off, or a socket close and exits, so
 the supervisor reconnects it automatically — no `ready_probe` required.
 
@@ -267,7 +266,7 @@ vpn:
 ```
 
 **Supervised, not fire-and-forget.** `forti-vpn.service` runs a supervisor
-(`host/fortivpn.py`) that classifies openfortivpn's output and reconnects with
+(`soc-vpn`) that classifies openfortivpn's output and reconnects with
 exponential backoff. Keep **`persistent: 0`** so the supervisor owns reconnects:
 on an **auth failure** it holds for `SOC_VPN_AUTH_RETRY_DELAY` (default 300 s)
 instead of hammering the gateway — rapid retries with a bad password can **lock
@@ -303,7 +302,7 @@ Verify the wiring without a real FortiGate (resolves the vault creds and prints
 the command it would run, but does not connect):
 
 ```bash
-make vpn-check
+soc-wall vpn-args --config /etc/soc-display/panels.yaml
 ```
 
 ## `proxy` (outbound HTTP(S)/SOCKS proxy)
@@ -384,8 +383,9 @@ than crashing the host at boot.
 Chromium panels also run with a capped 50 MB disk cache, background networking
 and sync disabled — kinder to SD cards and RAM. When the wall runs as
 `soc-wall.service`, the unit additionally caps the whole session with
-`MemoryHigh=80%` / `MemoryMax=92%` so a leak throttles (or restarts the session)
-instead of OOM-killing the box.
+`MemoryHigh=80%` to throttle sustained pressure. The panel watchdog recycles
+individual browser processes. See [Performance](PERFORMANCE.md) for a measured
+comparison and the device checks.
 
 Other tips:
 

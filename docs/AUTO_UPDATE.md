@@ -1,6 +1,6 @@
 # Zero-touch operation
 
-After `setup.py deploy`, a wall needs nobody. It boots into the panels, recovers
+After `soc-wall setup deploy`, the wall boots into the panels, recovers
 from failures, and redeploys itself when a new version is published. This page
 covers how that works, what it needs from you, and how to operate it.
 
@@ -34,8 +34,8 @@ When there is a new commit:
    enforcement is on and the commit isn't validly signed.
 3. **Build** a complete release beside the live one, in `/opt/soc-releases/<id>/`.
    Any new OS packages install here. A failure here means "retry later".
-4. **Prove** it, with the wall untouched: everything compiles, shell scripts parse,
-   core modules import, the live config loads, the new updater passes its self-test.
+4. **Prove** it. The candidate builds, its shell scripts parse, its config checks
+   pass, and its updater passes its self-test before activation.
 5. **Swap.** `/opt/soc-display` is a symlink, so switching is one atomic rename. The
    intent is written to disk first, so a power cut at any moment is recoverable.
 6. **Restart** tunnels, then the wall.
@@ -93,6 +93,9 @@ that breaks the build never reaches a wall. Until `stable` first exists, walls u
 The health check catches a release that won't run. CI catches a release that runs but
 is wrong. You want both.
 
+Version tags build downloadable packages. They do not move the tracked
+`stable` branch. See [Releasing](RELEASING.md).
+
 ## Configuration
 
 `/etc/soc-display/update.env`, read as plain data and never sourced:
@@ -110,9 +113,13 @@ is wrong. You want both.
 | `SOC_UPDATE_HEALTH_TIMEOUT` | `300` | Seconds a new release has to prove itself |
 | `SOC_UPDATE_HEALTH_STABLE` | `60` | Seconds it must stay healthy on one process |
 | `SOC_UPDATE_KEEP` | `3` | Releases kept for rollback |
-| `SOC_UPDATE_MIN_FREE_MB` | `300` | Free disk needed before building |
+| `SOC_UPDATE_MIN_FREE_MB` | `300` | Minimum free disk before staging a release. Allow additional room for Cargo’s build files on source installations. |
 
 ## Operating it
+
+Source installations stage and build the native binary before switching the live
+release. Run the updater with Rust 1.87 or newer on root’s `PATH`. Distribution
+packages use the distribution’s package manager for updates.
 
 ```bash
 soc-update status                 # what's deployed, last result, blocklist
@@ -147,4 +154,4 @@ that wait.
   far side (a rotated VPN password has to be updated in the vault), and to read the
   alert if a release is rolled back.
 - The first deployment still needs someone to supply panels and logins, once, unless
-  you script it with `setup.py deploy --unattended` (see [DEPLOY.md](DEPLOY.md)).
+  you script it with `soc-wall setup deploy --unattended` (see [DEPLOY.md](DEPLOY.md)).

@@ -5,7 +5,7 @@
 # the vault PIN if it was not sealed at install) on the console BEFORE the kiosk
 # session takes tty1; it writes /etc/soc-display/.configured and every later boot
 # goes straight to the wall. The terminal equivalent is `./launch.sh` (which runs
-# the same setup.py firstboot when the marker is absent).
+# the same soc-wall setup firstboot command when the marker is absent).
 #
 # install.sh templates @SOC_ROOT@ / @ETC@ and enables this unit. Ordering only:
 # a skipped / timed-out / failed setup never blocks the wall from coming up — the
@@ -36,7 +36,7 @@ TTYVHangup=yes
 # Nothing is written until the wizard's final confirm, so a timeout writes no
 # partial config; the wall then comes up unconfigured and start-session.sh says how.
 TimeoutStartSec=1800
-ExecStart=@SOC_ROOT@/.venv/bin/python @SOC_ROOT@/setup.py firstboot --target pi
+ExecStart=@SOC_ROOT@/scripts/soc-service.sh firstboot --target pi
 
 [Install]
 WantedBy=multi-user.target

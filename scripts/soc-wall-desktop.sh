@@ -17,15 +17,6 @@ ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)
 [ -d "$ROOT/kiosk-host" ] || { echo "soc-wall-desktop: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 MODE="fullscreen"
 
-# Resolve which soc.env the wall reads via the SAME resolver the wizard writes
-# with (host.configpaths), so shell + Python never drift. Needs PYTHONPATH/PYBIN.
-export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
-RESOLVE_PY="$ROOT/.venv/bin/python"
-[ -x "$RESOLVE_PY" ] || RESOLVE_PY="$(command -v python3)"
-: "${SOC_ENV_FILE:=$("$RESOLVE_PY" -m host.configpaths --env 2>/dev/null || true)}"
-: "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
-ENV_FILE="$SOC_ENV_FILE"
-
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
 
 for a in "$@"; do
@@ -46,6 +37,19 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
   echo "  For an unattended kiosk on tty1, install with INSTALL_MODE=kiosk instead." >&2
   exit 1
 fi
+
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  export SOC_ROOT="$ROOT" SOC_WINDOW_MODE="$MODE" MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+  exec "$NATIVE" with-env run
+fi
+
+export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
+RESOLVE_PY="$ROOT/.venv/bin/python"
+[ -x "$RESOLVE_PY" ] || RESOLVE_PY="$(command -v python3)"
+: "${SOC_ENV_FILE:=$("$RESOLVE_PY" -m host.configpaths --env 2>/dev/null || true)}"
+: "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
+ENV_FILE="$SOC_ENV_FILE"
 
 # Load the (non-secret) env for vault creds, ports and timeouts if it is present.
 # Absent in dev checkouts — the host falls back to its defaults / dev vault.

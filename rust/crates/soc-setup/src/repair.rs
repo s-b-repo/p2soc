@@ -269,7 +269,7 @@ impl Repair {
                 i.paths.pinentry.display().to_string(),
             ];
             let rc = cx.exec(cmd, Duration::from_secs(30));
-            out.push(verdict(&format!("{backend} pinentry"), "pinentry -> pinentry-vault.py", rc));
+            out.push(verdict(&format!("{backend} pinentry"), "pinentry -> pinentry-vault.sh", rc));
         }
         out
     }

@@ -49,7 +49,7 @@ fn hex(bytes: &[u8]) -> String {
 /// whitespace ignored.
 fn unhex(text: &str) -> Option<Vec<u8>> {
     let digits: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return None;
     }
     digits

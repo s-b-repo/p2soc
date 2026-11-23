@@ -2,7 +2,7 @@
 
 This is the single, start-to-finish walkthrough for bringing up the SOC video
 wall — on a **Raspberry Pi** (production) or on a **dev workstation** (no Pi
-needed). It ties together the interactive wizard (`setup.py`) and the manual
+needed). It ties together the interactive wizard (`soc-wall setup`) and the manual
 steps, and covers the autossh **tunnel** and the Fortinet **VPN**.
 
 For deep dives see [ARCHITECTURE](ARCHITECTURE.md), [CONFIGURATION](CONFIGURATION.md),
@@ -17,7 +17,7 @@ using credentials from a local **Vaultwarden** vault. Panels can be reached
 directly, through an **SSH jump host** (autossh `-L`), or across a **Fortinet
 SSL-VPN** (openfortivpn). Everything starts on boot and self-heals.
 
-You will produce three files:
+The deployment uses these files:
 
 | File | Purpose | Where (Pi) |
 |---|---|---|
@@ -25,39 +25,38 @@ You will produce three files:
 | `soc.env` | vault settings (email/url) + paths — **non-secret** | `/etc/soc-display/soc.env` |
 | _(Vaultwarden)_ | server config inline in its systemd unit — **no `.env`** | `systemd/vaultwarden*.service` |
 
-The **interactive wizard writes all three for you**. You can also write them by
-hand from the `*.example` templates.
+The wizard writes the panel and environment configuration. The installer
+installs the Vaultwarden service unit.
 
 Two more things live outside these files: the vault **master password** is sealed
-host-bound under `/etc/soc-display/secret/` (`setup.py first-run`, no plaintext
+host-bound under `/etc/soc-display/secret/` (`soc-wall setup first-run`, no plaintext
 `.env`), and in production the wall **config is pushed into the Vaultwarden
 `SOC Wall Config` note** (the source of truth; `panels.yaml` is the fallback).
 
 ---
 
-## 1. The fast path: `setup.py`
+## 1. The fast path: `soc-wall setup`
 
-`setup.py` is a pure-stdlib, re-runnable wizard. It detects your environment,
-asks one section at a time, validates the result, and offers to run the installer
-or the dev harness at the end.
+`soc-wall setup wizard` is a re-runnable terminal wizard. It detects your environment,
+asks one section at a time, validates the result and saves the configuration.
 
 ```bash
-python3 setup.py              # interactive menu (Deploy / Configure / First-time setup / …)
-python3 setup.py deploy       # end-to-end: install → configure → seal PIN → creds → check
-python3 setup.py deploy --clean  # wipe generated config/state first, then deploy fresh
-python3 setup.py deploy --fresh   # force a full OS reinstall (deploy skips it if already installed)
-python3 setup.py first-run    # generate the one-time PIN + seal the master password
-python3 setup.py wizard       # just the configuration wizard
-python3 setup.py --dry-run    # show what it would write, write nothing
-python3 setup.py --defaults   # accept every default (non-interactive wizard)
-python3 setup.py --target dev # force dev output (config/panels.local.yaml, .env)
-python3 setup.py --target pi  # force Pi output (/etc/soc-display/...)  [needs sudo]
-python3 setup.py --section vpn   # one section: display|panels|tunnel|vpn|proxy|vault|server
+soc-wall setup              # interactive menu (Deploy / Configure / First-time setup / …)
+soc-wall setup deploy       # end-to-end: install → configure → seal PIN → creds → check
+soc-wall setup deploy --clean  # wipe generated config/state first, then deploy fresh
+soc-wall setup deploy --fresh   # force a full OS reinstall (deploy skips it if already installed)
+soc-wall setup first-run    # generate the one-time PIN + seal the master password
+soc-wall setup wizard       # just the configuration wizard
+soc-wall setup wizard --dry-run    # show what it would write, write nothing
+soc-wall setup wizard --defaults   # accept every default (non-interactive wizard)
+soc-wall setup wizard --target dev # force dev output (config/panels.local.yaml, .env)
+soc-wall setup wizard --target pi  # force Pi output (/etc/soc-display/...)  [needs sudo]
+soc-wall setup wizard --section vpn   # one section: display|panels|tunnel|vpn|proxy|vault|server
 ```
 
-It chooses the target automatically: **root → Pi**, otherwise **dev**. Re-running
-loads your previous answers as the defaults, and every file is backed up
-(`*.bak.<timestamp>`) before it's overwritten.
+The wizard defaults to the Pi target for root and on deployed hosts. It uses
+the development target on an unprivileged checkout. Re-running loads the
+previous configuration as defaults and backs up each overwritten file.
 
 The seven sections:
 
@@ -67,14 +66,13 @@ The seven sections:
    vs `tunnel`, URL or tunnel forward, `vault_item`, login **selectors**,
    `login_marker`, keep-alive.
 3. **Tunnel** — autossh jump host + identity key (asked when any panel is tunneled).
-4. **VPN** — Fortinet gateway, `vault_item`, cert pinning (can fetch the digest
-   for you), routing/DNS, supervisor reconnect + liveness check, optional TOTP.
+4. **VPN** — Fortinet, OpenVPN, WireGuard, or iNode settings, including
+   routing and readiness checks.
 5. **Proxy** — optional outbound HTTP(S)/SOCKS proxy: URL, the vault login holding
    its credentials (in-memory auth), and hosts to bypass.
-6. **Vault** — backend (`litebw` prod default / `rbw` legacy / `dev` JSON), account email/URL, the secret
-   dir + config-note name, and the session backend. The master password is **not**
-   entered here — it is sealed later by `first-run` (one-time PIN).
-7. **Server** — Vaultwarden bind + admin token (can generate the argon2 hash).
+6. **Vault** — backend, account email and URL, and the config-note name.
+   The first-run command seals the master and displays the one-time PIN.
+7. **Session** — choose the kiosk display stack.
 
 > **Selectors tip:** open the panel's login page in a browser, right-click the
 > username field → Inspect, and copy a stable CSS selector (prefer `#id`). Do the
@@ -86,44 +84,38 @@ The seven sections:
 After it writes the files it runs a parse + geometry check, so you'll know
 immediately if anything is off.
 
-For production, follow the wizard with **`setup.py first-run`** (generates the
-one-time PIN and seals the master password — no plaintext `.env`) and let it push
-the config into the Vaultwarden `SOC Wall Config` note (the boot source of truth).
-**`setup.py deploy`** chains the installer, the wizard, sealing, and credential
+For production, follow the wizard with **`soc-wall setup first-run`** (generates the
+one-time PIN and seals the master password). The deploy command can also
+push the configuration into the Vaultwarden `SOC Wall Config` note.
+**`soc-wall setup deploy`** chains the installer, the wizard, sealing, and credential
 storage in one go.
 
 ---
 
 ## 2. Dev workstation walkthrough (no Pi)
 
-Try the whole wall on x86 against bundled dummy panels.
-
-**Prereqs:** `python3`, `python3-gi`, `gir1.2-webkit2-4.x`, `Xvfb`/`Xephyr`,
-`chromium`, ImageMagick (`import`). The real vault path uses the bundled
-pure-Python `litebw` (legacy `rbw` optional); needs Docker.
+Build on a workstation with the GTK and WebKitGTK headers listed in
+[Development](DEVELOPMENT.md). The preview uses a development vault and can
+open with a preset or a local panel configuration.
 
 ```bash
-make venv                 # build .venv (PyYAML, websocket-client, pytest)
-python3 setup.py --target dev    # (optional) generate config/panels.local.yaml + .env
-make dev-vault            # write dev/run/dev-vault.json (the dev vault backend)
-make verify               # headless end-to-end: 4 logins + tunnel gate + screenshot
-make verify-single        # headless: the single-window (Wayland) layout
-make verify-proxy         # headless: authenticated-proxy path (WebKit + Chromium)
-make dev                  # interactive: the wall in a Xephyr window (Ctrl-C to stop)
-make test                 # unit tests (config, injection, vault, VPN, proxy, perf)
+make rust-release
+./launch.sh
+./launch.sh --headless
+make test
 ```
 
-The dev run uses `config/panels.dev.yaml` and the **dev vault backend** (a JSON
-file), so no Vaultwarden is needed. To exercise the real **litebw → Vaultwarden**
-path: `make vault` (starts Vaultwarden in Docker, registers an account, seeds 4
-logins, verifies `litebw` reads them).
-
-**Try the VPN wiring without a FortiGate:**
+`./launch.sh --setup` opens the terminal menu. For a graphical wizard or a
+named preset, use the release binary:
 
 ```bash
-make vpn-check            # resolves VPN creds from the dev vault and prints the
-                          # openfortivpn command it WOULD run — no connection
+rust/target/release/soc-wall setup-gui
+rust/target/release/soc-wall setup-gui --list-presets
 ```
+
+To check VPN wiring without connecting, use
+`soc-wall vpn-args --config /path/to/panels.yaml`. See
+[Performance](PERFORMANCE.md) for the repeatable comparison with Python.
 
 ---
 
@@ -145,10 +137,11 @@ preserves any `/etc/soc-display/*` you already wrote.
 
 ```bash
 cd p2soc
-sudo python3 setup.py deploy     # end-to-end: install → configure → seal PIN → push config → creds → doctor
+make rust-release
+sudo ./rust/target/release/soc-wall setup deploy --mode kiosk
 # …or do the two main steps by hand:
-sudo python3 setup.py            # menu → Configure (panels.yaml + soc.env)
-sudo ./install.sh                # deps, users, /opt/soc-display, systemd units, zram, autologin
+sudo ./install.sh
+sudo /opt/soc-display/bin/soc-wall setup wizard
 ```
 
 Installer knobs (env): `VW_MODE=native|docker`, `HARDEN=1` (nftables + key-only
@@ -163,22 +156,17 @@ The installer auto-enables `autossh-tunnel.service` only if a panel uses
 sudo systemctl start vaultwarden
 ```
 
-Open the web vault over an SSH tunnel for safety:
+The default native Vaultwarden install provides the service API. Register the
+configured account and store its credentials through the setup commands:
 
 ```bash
-ssh -L 8222:127.0.0.1:8222 pi@<ip>     # then browse http://127.0.0.1:8222
+sudo soc-wall setup vault-register --email ops@example.com
+sudo soc-wall setup first-run
+sudo soc-wall setup creds
 ```
 
-Create the kiosk account (matching `SOC_VAULT_EMAIL`), then add **one login item
-per panel, named exactly to match its `vault_item`**. If the VPN is enabled, also
-add a login named to match **`vpn.vault_item`** holding the FortiGate username +
-password. Turn signups back off afterwards (it's a systemd drop-in now — no `.env`).
-
-Then seal the master password (skip if you ran `setup.py deploy`):
-
-```bash
-sudo python3 setup.py first-run   # one-time PIN + host-bound seal (no plaintext .env)
-```
+Enter a consistent vault email in the wizard and in `vault-register`. Store each
+login under the name configured in its `vault_item`.
 
 The wall config is stored in the Vaultwarden `SOC Wall Config` note — the source
 of truth at boot; the local `panels.yaml` is only the offline fallback.
@@ -192,19 +180,16 @@ at the key.
 
 ### 3.5 Fortinet VPN (if `vpn.enabled`)
 
-Set the `vpn` section (the wizard does this). Pin the gateway certificate —
-`setup.py` can fetch the digest, or:
+Set the VPN configuration and pin the gateway certificate. Fetch and verify
+the digest before entering it in the wizard:
 
 ```bash
 openssl s_client -connect vpn.example.com:443 </dev/null 2>/dev/null \
   | openssl x509 -noout -fingerprint -sha256 | sed 's/.*=//;s/://g' | tr A-Z a-z
 ```
 
-On first start, `forti-vpn.service` unlocks root's `rbw` via the same host-bound
-sealed secret + `pinentry-vault.py` as the kiosk host (no plaintext password) and
-connects. The FortiGate password
-is fed to openfortivpn via a pinentry helper — **never on the command line or
-disk**. Watch it:
+The VPN supervisor reads the configured vault item and gives the password to
+openfortivpn through pinentry. Check the connection with these commands:
 
 ```bash
 sudo systemctl status forti-vpn
@@ -215,13 +200,12 @@ ip a show ppp0                      # has an address once connected
 Routing note: accepting all gateway routes can pull your LAN/SSH path over the
 VPN. Use `half_internet_routes: true` or `set_routes: false` to keep your own
 default route, and `set_dns: false` to keep your resolver. See
-[CONFIGURATION.md](CONFIGURATION.md#vpn-fortinet--fortigate-ssl-vpn).
+[CONFIGURATION.md](CONFIGURATION.md#vpn-fortinet-openvpn-wireguard-or-inode).
 
 ### 3.6 Calibrate the monitor (if not 1920×1080)
 
 ```bash
-sudo -u soc /opt/soc-display/.venv/bin/python \
-  /opt/soc-display/scripts/gen-openbox-rc.py \
+sudo -u soc /opt/soc-display/bin/soc-wall wm-rc openbox \
   --panels /etc/soc-display/panels.yaml \
   --template /opt/soc-display/openbox/rc.xml.tmpl \
   --out ~soc/.config/openbox/rc.xml --width <W> --height <H>
@@ -247,7 +231,7 @@ panels, hands-free.
 - [ ] each VPN-side panel host answers from the Pi (`nc -z <host> <port>`)
 - [ ] `zramctl` shows an active zram swap device
 - [ ] no credentials appear in `journalctl` (incl. `journalctl -u forti-vpn`)
-- [ ] the master password is **sealed** (`setup.py first-run`); the one-time PIN is recorded off-device
+- [ ] the master password is **sealed** (`soc-wall setup first-run`); the one-time PIN is recorded off-device
 
 ---
 
@@ -256,13 +240,13 @@ panels, hands-free.
 Re-run the wizard (it loads your current answers as defaults):
 
 ```bash
-python3 setup.py                 # all sections
-python3 setup.py --section panels   # just edit the panels
-python3 setup.py --section vpn      # just edit the VPN
+soc-wall setup                 # all sections
+soc-wall setup wizard --section panels   # just edit the panels
+soc-wall setup wizard --section vpn      # just edit the VPN
 ```
 
 > In production the wall reads its config from the Vaultwarden `SOC Wall Config`
-> note, so after a local edit re-push it with `sudo python3 setup.py deploy` — or
+> note, so after a local edit re-push it with `sudo soc-wall setup deploy` — or
 > edit live from the on-screen ⚙ Settings, which writes changes back to the note
 > automatically.
 

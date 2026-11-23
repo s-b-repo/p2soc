@@ -11,7 +11,7 @@ panel (different IP/port), **auto-logs in** from a local secrets vault, and
 **keeps the session alive / re-logs-in** on timeout. One or more panels can live
 on a remote network reached only through an **SSH jump host**, kept up by a
 persistent **autossh** tunnel, or behind a supervised **VPN** — **Fortinet
-SSL-VPN, OpenVPN, or WireGuard** (`vpn.type`) — with auto-reconnect, health
+SSL-VPN, OpenVPN, WireGuard, or iNode** (`vpn.type`) — with auto-reconnect, health
 checks, and classified error handling, credentials from the same vault. Tiles
 are **universal**: point any panel at any URL from the **on-screen config**
 (corner ⚙ or Ctrl+Shift+C, optional PIN lock) — no SSH, no file editing. Outbound
@@ -26,27 +26,29 @@ Runs on **X11 (X.Org or XLibre, Openbox)** or **Wayland (cage / labwc)**, on
 Fedora/RHEL, Arch, openSUSE, Alpine and Void** — plus any other distro with
 `SOC_SKIP_PACKAGES=1`, and degrades gracefully on non-systemd inits. The Pi 5 is
 the reference target. Built entirely from open-source parts: **WebKitGTK** (with
-a **Chromium** fallback per panel), **Vaultwarden** + **litebw** (a pure-Python,
-`rbw`-compatible client — no Rust toolchain; the legacy `rbw` still works), **autossh**,
+a **Chromium** fallback per panel), **Vaultwarden** with a native client that
+also provides the `litebw` command, **autossh**,
 **openfortivpn**, **systemd**, **zram**. It auto-profiles the hardware (lighter
 WebKit cache on 1 GB boards, GPU compositing on the Pi 5).
 
 ![wall](docs/img/wall.png)
 
-> Produced by the dev harness (`make verify`): four panels logged in — WebKit
+> The development wall with four panels logged in — WebKit
 > direct, WebKit through a tunnel, Chromium via CDP, and a WebKit panel with a
 > live chart.
 
 ## Docs
 
-- [**Full setup guide**](docs/SETUP.md) — start-to-finish bring-up (dev + Pi) via the `setup.py` wizard
-- [**Production deploy**](docs/DEPLOY.md) — the real Pi/kiosk install + `setup.py install/doctor/repair`
+- [**Full setup guide**](docs/SETUP.md) — display, Vaultwarden and network configuration
+- [**Production deploy**](docs/DEPLOY.md) — kiosk services and unattended configuration
 - [**Zero-touch operation**](docs/AUTO_UPDATE.md) — how a wall runs, recovers and redeploys itself with nobody there
 - [Architecture](docs/ARCHITECTURE.md) — topology, boot/data-flow, RAM budget, rationale
 - [Install on the Pi](docs/INSTALL.md) — step-by-step bring-up + checklist
 - [Configuration](docs/CONFIGURATION.md) — `panels.yaml` reference, finding selectors, keep-alive
 - [Security](docs/SECURITY.md) — threat model, the unattended-unlock tradeoff, hardening
 - [Development](docs/DEVELOPMENT.md) — dev harness, make targets, testing
+- [Performance](docs/PERFORMANCE.md) — measured Rust and Python resource use
+- [Releasing](docs/RELEASING.md) — package targets and versioning
 - [Changelog](CHANGELOG.md) — what changed
 
 ---
@@ -63,7 +65,7 @@ systemd (system)
                                  systemd watchdog, STATUS= in systemctl status)
 
 getty@tty1 autologin (soc) → start-session.sh   (SOC_SESSION=x11|wayland|auto)
-  ├─ x11:     startx → Openbox → launcher.sh → kiosk host (Python / PyGObject)
+  ├─ x11:     startx → Openbox → launcher.sh → soc-wall supervise
   │           Openbox rc.xml forces each WM_CLASS=soc-pN window into its cell
   └─ wayland: cage (all-webkit wall → ONE fullscreen grid window)
               or labwc (generated window rules tile the panel windows)
@@ -80,10 +82,9 @@ Protocol on localhost). There is **no credential broker, no open port, no
 page-context fetch** — credentials never leave the host process except as the
 values typed into the login form.
 
-**Why these choices on 1 GB:** the 4 panels are different `IP:port` origins, so
-cookies isolate naturally — no need for 4 browser profiles. WebKitGTK shares one
-process tree (~250–450 MB) versus four Chromium renderers (~600–800 MB), so
-Chromium is opt-in per panel. zram + throttled chart refresh absorb the rest.
+WebKitGTK is the default for each panel. Chromium is available for dashboards
+that require it. The [resource comparison](docs/PERFORMANCE.md) measures the wall
+and its browser processes on four local WebKit dashboards.
 
 ---
 
@@ -92,51 +93,42 @@ Chromium is opt-in per panel. zram + throttled chart refresh absorb the rest.
 | Path | What |
 |------|------|
 | `config/panels.yaml` | wall config (panels, tunnel, vpn, proxy). In production the Vaultwarden `SOC Wall Config` note is the source of truth; this file is the offline fallback |
-| `kiosk-host/host/` | the host: `main.py`, `webkit_panel.py`, `chromium_panel.py`, `wall.py` (single-window grid), `fortivpn.py` (VPN supervisor), `style.py` (status cards), `perf.py` (hw profile), `vault.py`, `secretstore.py` (sealed master pw), `inject.py`, `config.py` |
+| `rust/` | Native wall, dashboard engines, settings, vault, VPN, setup, and updater |
+| `kiosk-host/host/` | Python compatibility runtime and reference implementation |
 | `inject/login.js.tmpl` | shared auto-login + keep-alive + re-login script (both engines) |
 | `openbox/` | `rc.xml.tmpl` (2×2, no panel, draggable), `menu.xml`, `autostart` |
 | `labwc/` | `rc.xml.tmpl` — the Wayland twin of the Openbox config |
-| `scripts/` | `start-session.sh`, `wayland-session.sh`, `launcher.sh`, `autossh-tunnel.sh`, `forti-vpn*.{sh,py}`, `gen-openbox-rc.py`, `gen-labwc-rc.py`, `tunnel-args.py`, `pinentry-vault.py`, `xinitrc` |
+| `scripts/` | session, desktop, systemd, and pinentry entry points |
 | `systemd/` | `vaultwarden(-docker).service`, `autossh-tunnel.service`, `forti-vpn.service`, `getty-autologin.conf` |
 | `security/` | `nftables.conf`, `sshd_hardening.conf`, `zram.conf`, `99-soc-sysctl.conf`, `tunnel_key.note` |
-| `dev/` | dummy panels, vault seeding, tunnel stand-in, `auth-proxy.py`, `verify*.sh`, `run-wall.sh` |
-| `setup.py` | menu / `deploy` / `first-run` / `wizard` / `doctor` / `repair` / `creds`: writes config, seals the master password (one-time PIN), pushes config to the vault |
+| `dev/benchmark.py` | reproducible dashboard benchmark for the Rust and Python hosts |
+| `setup.py` | setup entry point for the Python compatibility runtime |
 | `install.sh` | idempotent multi-distro installer (apt/dnf/pacman/zypper/apk/xbps, X.Org/XLibre/Wayland) |
 
 ---
 
 ## Try it on your workstation (no Pi needed)
 
-Requires: `python3` + `python3-gi` + `gir1.2-webkit2-4.x`, `Xvfb`/`Xephyr`,
-`chromium`, ImageMagick (`import`).
-
-**Fastest first run** — one idempotent command sets up the venv + dev vault, then
-launches the wall (use `--pi` instead to hand off to the production deploy):
+Source builds need Rust 1.87 or newer, a C compiler, `pkg-config`,
+GTK 3 and WebKitGTK 4.1 development headers. Install Xvfb for the GUI tests and
+Chromium if you use Chromium panels. The desktop preview opens an empty wall
+with a development vault. Set a panel URL in Settings or pass `SOC_PANELS_FILE`.
 
 ```bash
-./launch.sh             # show the wall in a window (Xephyr); headless if no display
-./launch.sh --headless  # headless end-to-end check (Xvfb + screenshot)
-./launch.sh --pi        # production: sudo setup.py deploy (install + configure + seal + checks)
+./launch.sh              # build and open the wall in a desktop window
+./launch.sh --headless   # run WebKit and Settings smoke tests under Xvfb
+./launch.sh --setup      # terminal setup menu
+make test                # Rust workspace tests, including GUI tests
+make test-python         # Python compatibility suite
 ```
 
-Or drive the pieces directly:
+The installed binary also provides the standalone tools:
 
 ```bash
-make verify         # headless: brings up 4 dummy panels + the host, asserts logins,
-                    # tunnel gate, Chromium CDP, writes dev/run/verify.png
-make verify-single  # headless check of the single-window (Wayland-style) layout
-make verify-proxy   # headless check of the authenticated-proxy path (WebKit + Chromium)
-make dev            # interactive: shows the wall in a Xephyr window (Ctrl-C to stop)
-make test           # unit tests (config, geometry, injection, VPN supervisor, proxy, perf)
-make vpn-check      # dry-run the VPN: resolve creds + print the openfortivpn command
-```
-
-`make verify` uses the **dev vault backend** (a JSON file) so it needs no
-Vaultwarden. To exercise the real **litebw → Vaultwarden** path:
-
-```bash
-make vault      # starts Vaultwarden in Docker, registers an account,
-                # seeds 4 logins via the API, verifies litebw can read them
+soc-wall setup-gui
+soc-wall setup doctor
+soc-wall setup-gui --list-presets
+soc-wall update status
 ```
 
 ---
@@ -148,15 +140,11 @@ Arch, openSUSE, Alpine or Void — enable SSH, boot, copy this repo over, then
 configure with the interactive wizard and run the installer:
 
 ```bash
-sudo python3 setup.py deploy      # end-to-end: install + configure + seal + creds + start the wall
-sudo ./install.sh                 # just the install. INSTALL_MODE=auto (default) | kiosk | desktop
-                                  # VW_MODE=native (default) | docker ; HARDEN=1 to firewall
-                                  # SESSION=x11 (default) | wayland | auto
-                                  # SOC_SKIP_PACKAGES=1 on an unsupported distro
+make rust-release
+sudo ./rust/target/release/soc-wall setup deploy --mode kiosk
 ```
 
-That one command is the whole deployment. It ends with a running wall, and from then
-on nothing needs a person: it starts at boot, recovers from failures and redeploys
+Installation wires the kiosk for the next boot. It starts at boot, recovers from failures and redeploys
 itself from the tracked branch, rolling back automatically if a release won't run
 ([details](docs/AUTO_UPDATE.md)). For imaging or a fleet, `deploy --unattended` does it
 with no prompts at all ([docs/DEPLOY.md](docs/DEPLOY.md)).
@@ -170,13 +158,13 @@ Auto-installs packages via apt/dnf/pacman/zypper/apk/xbps; honours an existing
 X.Org **or XLibre** server; degrades gracefully without systemd (prints the
 service + autologin steps to wire up by hand). See [docs/INSTALL.md](docs/INSTALL.md).
 
-The wizard (`setup.py`) is re-runnable and writes/validates all three config
+The wizard (`soc-wall setup wizard`) is re-runnable and writes and validates all three config
 files; see the [full setup guide](docs/SETUP.md). You can also edit the
 `*.example` templates by hand.
 
 The installer: installs deps, creates the `soc` (kiosk), `socsvc` (tunnel) and
 `socupdate` (redeploy) users, deploys a release under `/opt/soc-releases` with
-`/opt/soc-display` pointing at it, builds the venv, lays down `/etc/soc-display`
+`/opt/soc-display` pointing at it, installs the native binary and writes `/etc/soc-display`
 config, sets up Vaultwarden, autossh and `soc-update` units, zram, the Openbox session,
 and the "SOC Wall" menu launcher. In **kiosk** mode it additionally enables tty1
 autologin and **disables the desktop session** (keeps your preloaded card; the
@@ -233,15 +221,14 @@ auto-tunes its WebKit cache + GPU policy from the detected RAM/CPU
 
 ## Security model & tradeoffs
 
-- **Vault**: Vaultwarden bound to `127.0.0.1`. The host reads via `litebw` (the
-  pure-Python default; legacy `rbw` optional); creds
-  stay in a short-TTL in-RAM cache, never written to disk by the host, never
-  logged.
+- **Vault**. Vaultwarden listens on `127.0.0.1`. The native client keeps
+  credentials in a short-lived memory cache. Existing `rbw` configurations
+  remain supported.
 - **Unattended unlock**: the master password is **sealed host-bound** (AES-256-GCM,
-  key = scrypt(machine-id + a one-time PIN); `secretstore.py` + `pinentry-vault.py`),
+  with the private host key, machine ID and a one-time PIN),
   so there is no plaintext secret in any `.env` and the sealed files are useless if
   copied off the box. A local root on the running Pi can still derive it — the cost
-  of any unattended wall. Generate the PIN + seal with `setup.py first-run`.
+  of any unattended wall. Generate the PIN and seal with `soc-wall setup first-run`.
 - **Residual exposure**: auto-filling any login form puts the password into the
   page DOM at submit time — inherent to form auto-login. The host scrubs its copy
   after injection and uses no network channel for creds.
@@ -265,7 +252,7 @@ systemctl status vaultwarden autossh-tunnel forti-vpn   # services
 journalctl -u autossh-tunnel -u forti-vpn -f     # tunnel + VPN logs
 loginctl ; journalctl _UID=$(id -u soc) -f       # kiosk session / host logs
 # Re-place windows for a different resolution:
-sudo -u soc /opt/soc-display/.venv/bin/python /opt/soc-display/scripts/gen-openbox-rc.py \
+sudo -u soc /opt/soc-display/bin/soc-wall wm-rc openbox \
   --panels /etc/soc-display/panels.yaml --template /opt/soc-display/openbox/rc.xml.tmpl \
   --out ~soc/.config/openbox/rc.xml --width 1920 --height 1080
 ```
@@ -296,7 +283,7 @@ PARTICULAR PURPOSE.
 
 ## Contributing
 
-Issues and PRs welcome. Run `make lint && make test && make verify` before
+Issues and PRs welcome. Run `make lint && make test && make test-python` before
 submitting; see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 > Use only against panels and networks you are authorized to access. This is a

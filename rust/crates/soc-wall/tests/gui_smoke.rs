@@ -16,6 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use webkit2gtk::WebViewExt;
 use zeroize::Zeroizing;
 
 const LOGIN_PAGE: &str = "<!doctype html><title>login</title><form method=post action=/session>\
@@ -234,12 +235,37 @@ fn webkit_panel_logs_in_and_gates_navigation() {
     assert!(refused, "the off-allowlist navigation was not refused\n{}", dump());
     assert!(panel.loaded_ok(), "the dashboard should still be showing\n{}", dump());
 
+    fn webview(widget: &gtk::Widget) -> Option<webkit2gtk::WebView> {
+        if let Ok(view) = widget.clone().downcast::<webkit2gtk::WebView>() {
+            return Some(view);
+        }
+        widget.clone().downcast::<gtk::Container>().ok()?.children().iter().find_map(webview)
+    }
+    let engine = webview(&panel.widget()).unwrap();
+    let captured = Rc::new(RefCell::new(None));
+    let result = captured.clone();
+    panel.calibrate(Box::new(move |zones| *result.borrow_mut() = Some(zones)));
+    engine.evaluate_javascript(
+        r#"window.__SOC_CALIBRATE_RESULT = '{"user":{"x_pct":0.4,"y_pct":0.6}}'"#,
+        None,
+        None,
+        gio::Cancellable::NONE,
+        |result| assert!(result.is_ok()),
+    );
+    assert!(pump_until(Duration::from_secs(5), || captured.borrow().is_some()));
+    assert_eq!(captured.borrow().as_ref().unwrap().as_ref().unwrap()["user"]["x_pct"], 0.4);
+
+    let cancelled = Rc::new(Cell::new(false));
+    let result = cancelled.clone();
+    panel.calibrate(Box::new(move |zones| result.set(zones.is_none())));
+
     // Web data is private to the wall user.
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&webdata).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "web-data root must be 0700");
 
     panel.stop();
+    assert!(cancelled.get());
     panel.stop(); // idempotent
     wall.window().close();
     pump_until(Duration::from_millis(300), || false);

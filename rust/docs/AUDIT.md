@@ -13,7 +13,7 @@ bash scripts/audit-bad-patterns.sh --strict      # exit non-zero on a strict hit
 bash scripts/audit-bad-patterns.sh --files list.txt   # restrict to listed files
 ```
 
-The `audit` GitHub workflow runs it in warn-only mode on every push and PR and
+The `audit` GitHub workflow runs it in warn-only mode on configured branch pushes and pull requests and
 posts the breakdown to the job summary. It never fails the build.
 
 ## What it scans
@@ -59,3 +59,5 @@ Nearly all syscalls go through `rustix` (safe) and signals through
 
 Each is confined to the smallest possible function, carries a `// SAFETY:`
 comment, and is tagged `// audit-allow:`.
+
+The development guide lists the release checks alongside the regex audit. [Development](../../docs/DEVELOPMENT.md)

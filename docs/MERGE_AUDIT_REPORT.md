@@ -1,5 +1,7 @@
 # Production Merge & Security Audit Report
 
+> This report records the June 2026 Python merge audit. For current runtime and verification, see [Architecture](ARCHITECTURE.md) and [Performance](PERFORMANCE.md).
+
 **Project:** p2soc — SOC Video Wall (Raspberry Pi 5 kiosk)
 **Date:** 2026-06-23
 **Deliverable:** `soc-wall-prod/` (this folder)

@@ -1,33 +1,10 @@
 #!/usr/bin/env bash
-# =============================================================================
-# p2soc — package postinstall (deb/rpm/apk).
-#
-# Reuses the project's own installer for ALL deploy/config/service work:
-#
-#     SOC_SKIP_PACKAGES=1 /opt/soc-display/install.sh
-#
-# SOC_SKIP_PACKAGES=1 turns install.sh's pm_install/pm_try/pm_refresh into
-# no-ops — the package's declared per-packager Depends already pulled every OS
-# package — so install.sh runs only its distro-agnostic steps: create the `soc`
-# (kiosk) + `socsvc` (service) users, self-deploy/re-chown the tree, install the
-# litebw launcher, build the --system-site-packages venv (PyYAML +
-# websocket-client + wheel-only cryptography), populate /etc/soc-display, copy
-# the systemd units, daemon-reload, enable vaultwarden + (conditionally)
-# autossh-tunnel/forti-vpn, and wire the kiosk session + tty1 autologin.
-# soc-wall.service is deployed but intentionally left NOT enabled (boot stays on
-# getty autologin until validated on the target display).
-#
-# This script only adds a thin safety-net on top of install.sh: it guards on the
-# installer being present, re-affirms the venv deps if for any reason install.sh
-# skipped them, makes sure the core units are enabled, and prints the next
-# steps. It is idempotent — safe to run on every upgrade.
-# =============================================================================
+# Install packaged files and services using the same installer as source builds.
 set -euo pipefail
 
 SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
 ETC="${SOC_ETC:-/etc/soc-display}"
 INSTALLER="$SOC_ROOT/install.sh"
-VENV="$SOC_ROOT/.venv"
 
 log()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!!\033[0m %s\n' "$*"; }
@@ -57,34 +34,7 @@ SOC_ROOT="$SOC_ROOT" \
   "$INSTALLER"
 
 # --------------------------------------------------------------------------- #
-# 2. venv safety-net. install.sh already builds the venv and pip-installs these,
-#    so this is a no-op on a normal run; it only repairs the rare case where the
-#    installer's venv step was skipped (e.g. an older install.sh) so the wall is
-#    never left without its Python deps. cryptography stays wheel-only and falls
-#    back to the distro python3-cryptography Depends (the venv is
-#    --system-site-packages) — never a source build on the Pi.
-# --------------------------------------------------------------------------- #
-PY="$VENV/bin/python"
-PIP="$VENV/bin/pip"
-if [ ! -x "$PY" ]; then
-  log "venv missing after install.sh — creating $VENV"
-  python3 -m venv --system-site-packages "$VENV"
-  "$PIP" install -q --upgrade pip || true
-fi
-
-if ! "$PY" -c 'import yaml, websocket, cryptography' >/dev/null 2>&1; then
-  log "Ensuring venv deps (PyYAML, websocket-client, cryptography)"
-  "$PIP" install -q PyYAML websocket-client || warn "pip install PyYAML/websocket-client failed"
-  # wheel-only; if no wheel for this arch, the distro python3-cryptography Depends
-  # is already importable through --system-site-packages.
-  if ! "$PY" -c 'import cryptography' >/dev/null 2>&1; then
-    "$PIP" install -q --only-binary=:all: cryptography \
-      || warn "no cryptography wheel for this arch — relying on the distro python3-cryptography Depends"
-  fi
-fi
-
-# --------------------------------------------------------------------------- #
-# 3. Enable (do NOT start) the core units. install.sh already enables
+# 2. Enable (do NOT start) the core units. install.sh already enables
 #    vaultwarden (+ conditionally autossh-tunnel/forti-vpn from panels.yaml);
 #    re-affirm vaultwarden idempotently here so an upgrade can't leave it
 #    disabled. soc-wall.service is deliberately left NOT enabled — boot stays on
@@ -100,7 +50,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 4. Next steps (the package is installed; the operator still does first-run).
+# 3. Next steps (the package is installed; the operator still does first-run).
 # --------------------------------------------------------------------------- #
 cat <<EOF
 
@@ -111,10 +61,10 @@ $(printf '\033[32mp2soc installed.\033[0m')  Next steps:
   2. Non-secret env:     sudo \$EDITOR $ETC/soc.env
      (email/url + SOC_SESSION; the master password is NOT here — it is sealed
       host-bound at first-run, step 3).
-  3. First-time setup:   sudo python3 $SOC_ROOT/setup.py first-run
+  3. First-time setup:   sudo $SOC_ROOT/bin/soc-wall setup first-run
      -> seals the Vaultwarden master password host-bound (no plaintext .env),
         points litebw at the sealed master, and generates the one-time PIN.
-     (Guided menu for everything:  sudo python3 $SOC_ROOT/setup.py)
+     (Guided menu for everything:  sudo $SOC_ROOT/bin/soc-wall setup)
   4. Start the vault, create the kiosk account + logins (named to match each
      vault_item), then validate + enable the wall:
         sudo systemctl start vaultwarden

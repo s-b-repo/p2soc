@@ -11,27 +11,24 @@ deploying anywhere sensitive.
 - **No broker, no port, no page fetch.** The kiosk host reads creds via `litebw` and
   injects them into each view itself (WebKit `socCreds` message handler; Chromium
   CDP). Credentials never traverse a network socket or page-context `fetch`.
-- **CDP debugger locked to the host.** The Chromium control channel binds
-  `127.0.0.1` and `--remote-allow-origins` is pinned to the exact
-  `http://127.0.0.1:<port>` the host connects from — never `*`. Because browsers
-  forbid page JS from forging the `Origin` header, a rendered dashboard (or XSS
-  on a panel) cannot open the DevTools websocket, attach CDP, and read the
-  injected credentials of every panel.
+- **Chromium debugging.** The native wall uses an ephemeral loopback port.
+  Chromium reports it through `DevToolsActivePort` in the private browser
+  profile. The native client connects without an Origin header, and Chromium
+  rejects page-origin connections. Local processes that can reach the debug
+  port are within the device trust boundary.
 - **RAM only.** Creds live in a short-TTL (~30 s) in-memory cache in the host
   process; the host never writes them to disk and never logs them. The host
   scrubs its copy right after injecting.
 
 ## The unattended-unlock model (read this)
 
-There is **no plaintext master password on disk** and **no secret in any
-`.env`**. The vault master password is sealed with AES-256-GCM under a key
-derived (scrypt) from this host's `machine-id` **and** a one-time PIN that
-`setup.py first-run` generates and shows you once (`host/secretstore.py`). The
-PIN is itself sealed under a machine-id-only key, so the wall self-unlocks at
-boot with no prompt, while the sealed files (`/etc/soc-display/secret/*.enc`,
-`0600`, owned by the kiosk user) are **useless if copied to another machine** — a
-different `machine-id` makes the GCM authentication fail. `rbw` gets the master
-password from `scripts/pinentry-vault.py`, which unseals it in memory.
+The vault master password is stored in an AES-256-GCM seal. The key derivation
+uses the private per-host key (`host.key`), machine ID and a one-time PIN.
+The PIN is also encrypted using the host key and machine ID so the wall can
+unlock at boot. The kiosk user owns the secret directory (0700) and its files
+(0600). `soc-wall setup first-run` displays the PIN for recovery or re-sealing.
+Existing Python seals can migrate on first unseal. External `rbw` obtains the
+master via `scripts/pinentry-vault.sh`.
 
 The wall **config** is the vault's too: a secure-note (`SOC Wall Config`) is the
 source of truth, fetched after unlock; the local `panels.yaml` is only an offline
@@ -41,13 +38,13 @@ tuning.
 
 ### Where the master password comes from (`SOC_MASTER_SOURCE`)
 
-The master-password source is **pluggable and universal** (`host/mastersource.py`,
+The master-password source is **pluggable and universal** (`soc-seal::master`,
 resolved the same way by `litebw`, the long-running host, and the legacy `rbw`
-`pinentry-vault.py`). Set `SOC_MASTER_SOURCE` to one of:
+`pinentry-vault.sh`). Set `SOC_MASTER_SOURCE` to one of:
 
 | source | how | when |
 | --- | --- | --- |
-| `sealed` *(default)* | host-bound AES-256-GCM seal (`secretstore.py`) — machine-id + sealed PIN | **unattended / headless walls**: no login session, wallet, or prompt is needed to unlock at boot |
+| `sealed` *(default)* | host-bound AES-256-GCM seal (`soc-seal::store`) using the private host key, machine ID and sealed PIN | **unattended / headless walls**: no login session, wallet, or prompt is needed to unlock at boot |
 | `secret-service` | freedesktop Secret Service (`org.freedesktop.secrets`) via the libsecret `secret-tool` CLI | **attended** hosts where a human login unlocks the wallet |
 | `env` | `$SOC_VAULT_PASSWORD` from the process environment (prints a deprecation warning) | **dev / seeding only** — never written to a file by any production flow |
 | `auto` | `sealed` (if a complete seal exists) → `secret-service` (if `secret-tool` is present and the lookup succeeds) → `env` | the default when `SOC_MASTER_SOURCE` is unset |
@@ -70,7 +67,7 @@ secret-tool lookup service soc-wall account vault-master
 ```
 
 `secret-tool store` reads the secret from its own prompt / stdin, never from
-`argv`, so the password cannot leak via `ps`/`/proc`. `setup.py first-run` lets
+`argv`, so the password cannot leak via `ps`/`/proc`. `soc-wall setup first-run` lets
 you pick the source and, for `secret-service`, stores + verifies the value in the
 wallet; it persists only the **source name** to `soc.env`, never the password.
 
@@ -206,11 +203,11 @@ restricted address families incl. `AF_NETLINK`/`AF_PPPOX`) because `pppd` needs
 `/dev/ppp`, netlink, and write access to `/etc/resolv.conf` — over-hardening it
 breaks the tunnel. The vault master password is never in the unit nor in
 `soc.env`: the wrapper unlocks `rbw` via the same host-bound sealed secret +
-`pinentry-vault.py` as the kiosk host, so it never appears in `systemctl show`
+`pinentry-vault.sh` as the kiosk host, so it never appears in `systemctl show`
 or the process environment.
 
 The kiosk session itself can run as a supervised unit (`soc-wall.service`,
-generated by `setup.py`) with the non-secret config baked in as `Environment=`
+generated by `soc-wall setup`) with the non-secret config baked in as `Environment=`
 lines instead of a sourced `soc.env`, and `Restart=always` so a dead compositor
 recovers rather than leaving a black screen. The vault master is never among
 those `Environment=` lines — it stays host-sealed. (Switching the boot from
@@ -231,7 +228,7 @@ getty-autologin to this service is validated per-deployment on the target Pi.)
       in `ps`/`/proc` for the VPN client or chromium
 - [ ] decide on the on-screen config: set a PIN, or disable it with
       `SOC_ONSCREEN_CONFIG=0` for a locked-down wall
-- [ ] the master password is **sealed** (`setup.py first-run`), not in any
+- [ ] the master password is **sealed** (`soc-wall setup first-run`), not in any
       `.env`; the one-time PIN is recorded off-device; you accept the host-bound
       unattended-unlock tradeoff
 
@@ -270,5 +267,5 @@ sealed bytes, and is never written to disk. `SOC_UNSEAL_CACHE_TTL=0` disables it
 ## Jump-host keys
 
 The tunnel checks the jump host's key strictly. The key is pinned at the tunnel's first
-start (`scripts/pin-jump-host.py`), which is trust-on-first-use, once, during deployment.
+start (`soc-wall pin-jump-host`), which is trust-on-first-use, once, during deployment.
 Put the key in `/etc/soc-display/keys/known_hosts` beforehand to remove even that window.

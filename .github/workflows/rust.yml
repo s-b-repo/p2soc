@@ -1,12 +1,11 @@
 # Rust remake of the wall (rust/): compile on x86-64 and arm64, run the test
 # suite on both, and hunt for bugs with clippy, Miri, fuzzing and advisory /
-# license checks. Everything runs on GitHub-hosted runners; the Pi never
-# compiles anything.
+# license checks. These jobs run on GitHub-hosted Linux runners.
 name: rust
 
 on:
   push:
-    branches: [main, rust-remake]
+    branches: [main, rust-remake, rust-rewrite-ci, 'rust-v*']
     paths:
       - 'rust/**'
       - 'inject/**'

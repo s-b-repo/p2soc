@@ -4,7 +4,7 @@
 
 use super::panel::{Profile, WallServices, WebKitPanel};
 use super::services::{Log, Services};
-use super::settings::{SettingsContext, SettingsWindow, VaultAccess};
+use super::settings::{CalibrateDone, SettingsContext, SettingsWindow, VaultAccess};
 use super::style;
 use super::wall::{PillState, WallActions, WallWindow};
 use gtk::prelude::*;
@@ -38,6 +38,7 @@ pub struct HostOptions {
 }
 
 type ChromiumSink = Rc<dyn Fn(&str, PanelEvent)>;
+type TrayAction = (&'static str, fn(&Host));
 
 enum View {
     Webkit(WebKitPanel),
@@ -63,6 +64,13 @@ impl View {
         match self {
             View::Webkit(p) => p.show(),
             View::Chromium { panel, .. } => panel.start(),
+        }
+    }
+
+    fn reinject(&self) {
+        match self {
+            View::Webkit(p) => p.reinject(),
+            View::Chromium { panel, .. } => panel.reinject(),
         }
     }
 
@@ -353,6 +361,9 @@ impl Host {
                 WallActions { on_destroy: Some(destroy), on_vpn, on_show_vpn_log, on_lock, ..actions.clone() };
             let log = inner.log.clone();
             let wall = WallWindow::new(&conf, inner.opts.windowed, wall_actions, Rc::new(move |m: &str| log(m)));
+            if inner.opts.windowed {
+                self.install_tray(wall.window());
+            }
             *inner.wall.borrow_mut() = Some(wall);
         }
 
@@ -377,6 +388,62 @@ impl Host {
         }
         self.start_mem_watch();
         self.every(Duration::from_secs(15), Host::check_theme);
+    }
+
+    fn install_tray(&self, window: &gtk::Window) {
+        let menu = gtk::Menu::new();
+        let host = self.weak_host();
+        let actions: [TrayAction; 7] = [
+            ("Show wall", Host::present),
+            ("Lock panel", Host::lock_wall),
+            ("Open Settings", Host::open_settings),
+            ("Show VPN log", Host::open_vpn_log),
+            ("Restart wall", Host::restart_wall),
+            ("Reboot machine", Host::reboot_machine),
+            ("Quit", Host::shutdown),
+        ];
+        for (title, action) in actions {
+            let item = gtk::MenuItem::with_label(title);
+            let host = host.clone();
+            item.connect_activate(move |_| {
+                if let Some(host) = host() {
+                    action(&host);
+                }
+            });
+            menu.append(&item);
+        }
+        menu.show_all();
+        if let Some(tray) = super::ffi::TrayIcon::new(&menu, move || {
+            if let Some(host) = host() {
+                host.present();
+            }
+        }) {
+            window.connect_delete_event(move |window, _| {
+                if tray.available() {
+                    window.hide();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+        }
+    }
+
+    fn present(&self) {
+        if let Some(wall) = self.inner.wall.borrow().as_ref() {
+            wall.window().present();
+        }
+    }
+
+    fn reboot_machine(&self) {
+        use soc_sys::run::{Runner, SystemRunner, argv};
+        let log = self.inner.log.clone();
+        std::thread::spawn(move || {
+            let result = SystemRunner.run(&argv(&["systemctl", "reboot"]), Duration::from_secs(10));
+            if !result.is_ok_and(|out| out.success()) {
+                log("tray: reboot request failed");
+            }
+        });
     }
 
     fn make_view(&self, panel: &Panel, index: usize, on_config: Option<Rc<dyn Fn()>>) -> View {
@@ -749,8 +816,10 @@ impl Host {
                 Some(h) => h.set_login_zones(id, zones),
                 None => Err("the wall is shutting down".to_string()),
             }),
-            // No click-zone calibrator exists in the Rust wall yet: the button explains.
-            calibrate: None,
+            calibrate: Some(Rc::new(move |id, done| match host() {
+                Some(h) => h.calibrate_panel(id, done),
+                None => done(None),
+            })),
             lock_wall: Some(Rc::new(move || {
                 if let Some(h) = h10() {
                     h.lock_wall();
@@ -770,6 +839,49 @@ impl Host {
                     h.inner.settings.borrow_mut().take();
                 }
             }),
+        }
+    }
+
+    fn calibrate_panel(&self, id: &str, done: CalibrateDone) {
+        let host = self.weak_host();
+        let panel_id = id.to_string();
+        let finish: CalibrateDone = Box::new(move |zones| {
+            let Some((h, zones)) = host().zip(zones) else { return done(None) };
+            match h.set_login_zones(&panel_id, &zones) {
+                Ok(_) => done(Some(zones)),
+                Err(e) => {
+                    h.log(&format!("[{panel_id}] could not save calibration: {e}"));
+                    done(None);
+                }
+            }
+        });
+        let webkit = {
+            let views = self.inner.views.borrow();
+            match views.iter().find(|v| v.id() == id) {
+                Some(View::Webkit(view)) => Some(view.clone()),
+                Some(View::Chromium { panel, .. }) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    panel.calibrate(move |zones| {
+                        let _ = tx.send(zones); // audit-allow: the GTK consumer may have closed
+                    });
+                    let mut finish = Some(finish);
+                    glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+                        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        result => {
+                            if let Some(finish) = finish.take() {
+                                finish(result.ok().flatten().map(serde_json::Value::Object));
+                            }
+                            glib::ControlFlow::Break
+                        }
+                    });
+                    return;
+                }
+                None => None,
+            }
+        };
+        match webkit {
+            Some(view) => view.calibrate(finish),
+            None => finish(None),
         }
     }
 
@@ -797,15 +909,14 @@ impl Host {
         plan.overrides.save(dir).map_err(|e| e.to_string())?;
         let new_zones = plan.config.panel(id).map(|p| p.login_zones.clone()).unwrap_or_default(); // audit-allow: no such panel means nothing to repaint
         *self.inner.conf.borrow_mut() = plan.config;
-        if let Some(View::Webkit(view)) = self.inner.views.borrow().iter().find(|v| v.id() == id) {
-            view.update_panel(|p| p.login_zones = new_zones);
+        if let Some(view) = self.inner.views.borrow().iter().find(|v| v.id() == id) {
+            match view {
+                View::Webkit(view) => view.update_panel(|p| p.login_zones = new_zones),
+                View::Chromium { panel, .. } => panel.update_panel(|p| p.login_zones = new_zones),
+            }
         }
         for action in &plan.actions {
-            if let soc_state::Action::Reinject { panel } = action {
-                if let Some(View::Webkit(view)) = self.inner.views.borrow().iter().find(|v| v.id() == *panel) {
-                    view.reinject();
-                }
-            }
+            self.run_action(action, &self.inner.conf.borrow());
         }
         Ok(plan.had_zones)
     }
@@ -835,20 +946,23 @@ impl Host {
         plan.report
     }
 
-    /// Hand each WebKit view the login-relevant fields of its panel's new
+    /// Hand each view the login-relevant fields of its panel's new
     /// config (they take effect on the next load / re-inject).
     fn sync_view_panels(&self, conf: &Config) {
         for view in self.inner.views.borrow().iter() {
-            let View::Webkit(p) = view else { continue };
-            let Some(new) = conf.panel(&p.panel().id) else { continue };
-            p.update_panel(|old| {
+            let Some(new) = conf.panel(&view.id()) else { continue };
+            let update = |old: &mut Panel| {
                 old.title.clone_from(&new.title);
                 old.vault_item.clone_from(&new.vault_item);
                 old.selectors.clone_from(&new.selectors);
                 old.login_marker.clone_from(&new.login_marker);
                 old.tenant.clone_from(&new.tenant);
                 old.grid = new.grid;
-            });
+            };
+            match view {
+                View::Webkit(panel) => panel.update_panel(update),
+                View::Chromium { panel, .. } => panel.update_panel(update),
+            }
         }
     }
 
@@ -869,7 +983,7 @@ impl Host {
                 }
             }
             Action::Reinject { panel } => {
-                if let Some(View::Webkit(view)) = self.inner.views.borrow().iter().find(|v| v.id() == *panel) {
+                if let Some(view) = self.inner.views.borrow().iter().find(|v| v.id() == *panel) {
                     view.reinject();
                 }
             }
@@ -973,7 +1087,7 @@ impl Host {
         let host = self.weak_host();
         glib::timeout_add_local_once(Duration::from_millis(500), move || {
             let Some(host) = host() else { return };
-            if std::env::var_os("INVOCATION_ID").is_some() {
+            if std::env::var_os("INVOCATION_ID").is_some() || std::env::var_os("SOC_SUPERVISED").is_some() {
                 return host.shutdown();
             }
             host.log("restart_wall: re-execing");

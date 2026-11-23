@@ -118,14 +118,15 @@ struct Launch {
 /// The child an unprivileged tile starts (`None` for the privileged ones).
 fn plan(action: Action, exe: &Path) -> Option<Launch> {
     let sub = |name: &str| vec![exe.as_os_str().to_owned(), OsString::from(name)];
+    let configured = |name: &str| vec![exe.as_os_str().to_owned(), OsString::from("with-env"), OsString::from(name)];
     let (argv, env_set, env_remove) = match action {
-        Action::Desktop => (sub("run"), vec![("SOC_WINDOWED", "1"), ("SOC_WINDOW_MODE", "window")], vec![]),
-        Action::Kiosk => (sub("run"), vec![("SOC_WINDOW_MODE", "fullscreen")], vec!["SOC_WINDOWED"]),
+        Action::Desktop => (configured("run"), vec![("SOC_WINDOWED", "1"), ("SOC_WINDOW_MODE", "window")], vec![]),
+        Action::Kiosk => (configured("run"), vec![("SOC_WINDOW_MODE", "fullscreen")], vec!["SOC_WINDOWED"]),
         // Ask the wizard to come back HERE when it finishes, so the operator
         // lands on the launcher again rather than the bare desktop.
         Action::Setup => (sub("setup-gui"), vec![("SOC_RETURN_TO_MENU", "1")], vec![]),
-        Action::Appearance => (sub("appearance"), vec![], vec![]),
-        Action::Credentials => (sub("credentials"), vec![], vec![]),
+        Action::Appearance => (configured("appearance"), vec![], vec![]),
+        Action::Credentials => (configured("credentials"), vec![], vec![]),
         Action::Install | Action::Uninstall => return None,
     };
     Some(Launch { argv, env_set, env_remove })
@@ -555,7 +556,7 @@ mod tests {
     fn desktop_and_kiosk_plans() {
         let exe = Path::new("/usr/bin/soc-wall");
         let d = plan(Action::Desktop, exe).expect("desktop plan"); // audit-allow: test
-        assert_eq!(d.argv, os(&["/usr/bin/soc-wall", "run"]));
+        assert_eq!(d.argv, os(&["/usr/bin/soc-wall", "with-env", "run"]));
         assert!(d.env_set.contains(&("SOC_WINDOWED", "1")));
         let k = plan(Action::Kiosk, exe).expect("kiosk plan"); // audit-allow: test
         assert!(k.env_remove.contains(&"SOC_WINDOWED"));

@@ -16,7 +16,7 @@
 # Wayland compositor), SOC_XSERVER (explicit X server binary/command).
 
 # Self-locate: parent of this scripts/ dir (works from any checkout).
-SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 CHECKOUT="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
 if [ -d "$CHECKOUT/kiosk-host" ]; then
   ROOT="$CHECKOUT"
@@ -29,15 +29,26 @@ fi
 # path agrees with the wizard + the in-session launcher. Running as the root kiosk
 # user there is no per-user marker, so /etc wins here as before; the literal
 # fallback (== read tier #3) keeps the pre-install/non-systemd path working.
-RESOLVE_PY="$ROOT/.venv/bin/python"
-[ -x "$RESOLVE_PY" ] || RESOLVE_PY="$(command -v python3 2>/dev/null || true)"
-if [ -n "$RESOLVE_PY" ]; then
-  : "${SOC_ENV_FILE:=$(PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}" \
-        "$RESOLVE_PY" -m host.configpaths --env 2>/dev/null || true)}"
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  if [ "${SOC_ENV_LOADED:-0}" != 1 ]; then
+    export SOC_ROOT="$ROOT"
+    exec "$NATIVE" with-env --script start-session.sh "$@"
+  fi
+else
+  RESOLVE_PY="$ROOT/.venv/bin/python"
+  [ -x "$RESOLVE_PY" ] || RESOLVE_PY="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$RESOLVE_PY" ]; then
+    : "${SOC_ENV_FILE:=$(PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}" \
+          "$RESOLVE_PY" -m host.configpaths --env 2>/dev/null || true)}"
+  fi
 fi
 : "${SOC_ENV_FILE:=/etc/soc-display/soc.env}"
+export SOC_ENV_FILE
 ENV_FILE="$SOC_ENV_FILE"
-if [ -r "$ENV_FILE" ]; then
+if [ "${SOC_ENV_LOADED:-0}" = 1 ]; then
+  :
+elif [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"

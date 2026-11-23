@@ -1,4 +1,4 @@
-# Contributing to pi2soc
+# Contributing to p2soc
 
 ## Before your first commit
 
@@ -54,10 +54,12 @@ DATABASE_PASSWORD=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # EXAMPLE-OK
 ```sh
 make lint
 make test
+make test-python
 ```
 
-There is no remote CI yet — you are the CI. Pre-push your branch only
-after both pass.
+GitHub Actions checks Rust and the compatibility suite. The release workflow
+builds distro packages from version tags. Only pushes to `main` can promote
+the appliance's `stable` channel.
 
 ## Running the scrub manually
 
@@ -80,8 +82,9 @@ don't want pinned in history.
 
 ## Code style
 
-- Python: stdlib first; PyGObject for GUI; `pytest` for tests; no `pip`-
-  installed deps in `setup.py` (it runs before the venv exists).
+- Rust: run `cargo fmt --all` and Clippy from `rust/`. Keep Linux process and
+  filesystem operations in the crate that owns the feature.
+- Compatibility Python: stdlib first, PyGObject for GUI, and pytest for tests.
 - Shell: `set -e` at the top, `bash -n` clean (`make lint` enforces).
 - Tests: fakes over mocks; mirror `FakeBackend` in `conftest.py` when
   you add a new backend method.
@@ -91,6 +94,7 @@ don't want pinned in history.
 - `docs/ARCHITECTURE.md` — runtime topology and module map.
 - `docs/SECURITY.md` — secret-store model, kiosk-lock, blocked URLs.
 - `docs/WIZARD.md` — first-run flow and every panel option.
+- `docs/PERFORMANCE.md` — reproducible host and browser resource measurements.
 - `CHANGELOG.md` — what shipped, when, why.
 
 When in doubt, grep the codebase for the closest existing pattern and

@@ -168,6 +168,64 @@ impl Locations {
     }
 }
 
+/// Render the desktop launcher or resolve its branded icon for the installer.
+pub fn cli(args: &[String]) -> i32 {
+    let locations = Locations::from_env();
+    let branding = locations.load();
+    let arg = |i| args.get(i).map(String::as_str);
+    match arg(0) {
+        None => {
+            for (key, _) in DEFAULT_TEXT {
+                println!("{key}={}", branding.get(key));
+            }
+        }
+        Some("get") if args.len() == 2 => println!("{}", branding.get(&args[1])),
+        Some("icon-path") if args.len() == 1 => {
+            let root = locations.root.as_deref().unwrap_or_else(|| Path::new("/opt/soc-display"));
+            let icon = Path::new(branding.get("icon"));
+            for candidate in [
+                root.join(icon),
+                Path::new("/usr/share/soc-display").join(icon),
+                Path::new("/etc/soc-display").join(icon),
+                root.join("share/icons/soc-wall.svg"),
+                PathBuf::from("/usr/share/icons/hicolor/scalable/apps/soc-wall.svg"),
+            ] {
+                if candidate.is_file() {
+                    println!("{}", candidate.display());
+                    return 0;
+                }
+            }
+            return 1;
+        }
+        Some("desktop") if args.len() <= 3 => {
+            let program = arg(1).unwrap_or("/opt/soc-display/scripts/soc-wall-menu");
+            let icon = arg(2).unwrap_or("soc-wall");
+            if program.chars().any(char::is_control) || icon.chars().any(char::is_control) {
+                return 2;
+            }
+            let escape = |s: &str| s.replace('\\', "\\\\");
+            let program = program
+                .replace('%', "%%")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('`', "\\`");
+            println!(
+                "[Desktop Entry]\nName={}\nComment={}\nExec=\"{}\"\nIcon={}\nTerminal=false\nType=Application\nCategories=System;\nKeywords=soc;security;wall;kiosk;dashboard;",
+                escape(branding.get("name")),
+                escape(branding.get("tagline")),
+                escape(&program),
+                escape(icon)
+            );
+        }
+        _ => {
+            eprintln!("usage: soc-wall branding [get KEY | icon-path | desktop [EXEC [ICON]]]");
+            return 2;
+        }
+    }
+    0
+}
+
 /// Persist a theme to `path` (0600) and touch the marker via `locations`.
 /// Writes a complete, loadable `branding.yaml`: the text fields followed by the
 /// 14 colour keys.

@@ -15,6 +15,12 @@ SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
 ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)}"
 [ -d "$ROOT/kiosk-host" ] || { echo "soc-wall-setup-gui: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  APP=("$NATIVE" setup-gui)
+  SHOW_ERROR=("$NATIVE" guierror)
+fi
+
 # Headless / discovery invocations don't need a display.
 HEADLESS=0
 for a in "$@"; do
@@ -29,14 +35,20 @@ if [ "$HEADLESS" -eq 0 ]; then
   if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     echo "soc-wall-setup-gui: no graphical display detected" >&2
     echo "  Run this from inside your desktop session (\$DISPLAY or \$WAYLAND_DISPLAY)." >&2
-    echo "  For a text-mode wizard over SSH/tty, run instead: python3 setup.py wizard" >&2
+    if [ -n "${NATIVE:-}" ]; then
+      echo "  For a text-mode wizard over SSH/tty, run: $NATIVE setup wizard" >&2
+    else
+      echo "  For a text-mode wizard over SSH/tty, run: python3 setup.py wizard" >&2
+    fi
     exit 1
   fi
 fi
 
 # Load the (non-secret) env for vault backend, paths and timeouts if present.
 # Absent in dev checkouts — the wizard falls back to its defaults / dev vault.
-if [ -r "$ENV_FILE" ]; then
+if [ -n "${NATIVE:-}" ]; then
+  :
+elif [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
@@ -62,14 +74,18 @@ export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
 # cut on the 1GB Pi (same rationale as launcher.sh).
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
-PYBIN="$ROOT/.venv/bin/python"
-[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+if [ -z "${NATIVE:-}" ]; then
+  PYBIN="$ROOT/.venv/bin/python"
+  [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+  APP=("$PYBIN" -m host.setupgui)
+  SHOW_ERROR=("$PYBIN" -m host.guierror)
+fi
 
 cd "$ROOT" 2>/dev/null || true
 
 # Headless / discovery runs (CI, setup.py reuse): let output flow and exec.
 if [ "$HEADLESS" -eq 1 ]; then
-  exec "$PYBIN" -m host.setupgui "$@"
+  exec "${APP[@]}" "$@"
 fi
 
 # GUI run: do NOT exec — a clickable .desktop launch (Terminal=false) discards
@@ -81,7 +97,7 @@ ERRLOG="$(mktemp 2>/dev/null || echo "/tmp/soc-wall-setup.$$.log")"
 # Single-quoted so $ERRLOG expands at trap-fire time. (Same idiom as dev/run-wall.sh.)
 trap 'rm -f "$ERRLOG" 2>/dev/null' EXIT INT TERM
 set +e
-"$PYBIN" -m host.setupgui "$@" 2>"$ERRLOG"
+SOC_RETURN_TO_MENU=0 "${APP[@]}" "$@" 2>"$ERRLOG"
 rc=$?
 set -e
 
@@ -89,7 +105,7 @@ if [ "$rc" -ne 0 ]; then
   cat "$ERRLOG" >&2 2>/dev/null || true       # still log to a terminal if there is one
   detail="$(tail -n 15 "$ERRLOG" 2>/dev/null)"
   [ -n "$detail" ] || detail="The setup wizard exited with status $rc and produced no message."
-  "$PYBIN" -m host.guierror "SOC Wall setup couldn't start (exit $rc)" "$detail" 2>/dev/null || true
+  "${SHOW_ERROR[@]}" "SOC Wall setup couldn't start (exit $rc)" "$detail" 2>/dev/null || true
   rm -f "$ERRLOG" 2>/dev/null || true
   exit "$rc"
 fi

@@ -13,6 +13,7 @@
 //! whenever the page is not live so a dark cell always says why.
 
 use super::ffi::{self, Filter, FilterStore};
+use super::settings::CalibrateDone;
 use super::style::{self, PanelFrame};
 use crate::logic::{Healing, LoginBudget, LoginStep, ProxyAuth};
 use gtk::prelude::*;
@@ -21,13 +22,13 @@ use soc_core::guard::{url_for_msg, valid_http_url};
 use soc_core::{Login, Mode, Panel, ProxyCfg};
 pub use soc_sys::perf::HwAccel;
 use soc_sys::perf::log_repeat;
-use soc_web::inject::LoginRearm;
+use soc_web::inject::{self, Calibration, LoginRearm};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use webkit2gtk::{
     AuthenticationRequestExt, CacheModel, CookieAcceptPolicy, CookieManagerExt, CookiePersistentStorage, Credential,
     CredentialPersistence, DownloadExt, HardwareAccelerationPolicy, LoadEvent, MemoryPressureSettings,
@@ -225,6 +226,13 @@ struct Inner {
     nav_gate: Option<NavGate>,
     st: RefCell<State>,
     handlers: RefCell<Vec<glib::SignalHandlerId>>,
+    calibration: RefCell<Option<PendingCalibration>>,
+}
+
+struct PendingCalibration {
+    token: Rc<()>,
+    timer: Option<glib::SourceId>,
+    done: CalibrateDone,
 }
 
 /// A WebKit-rendered wall panel.
@@ -415,6 +423,7 @@ impl WebKitPanel {
                 nav_gate,
                 st: RefCell::new(State::default()),
                 handlers: RefCell::new(Vec::new()),
+                calibration: RefCell::new(None),
             }),
         };
         this.connect_signals(on_config);
@@ -735,6 +744,74 @@ impl WebKitPanel {
         apply(&mut self.inner.panel.borrow_mut());
     }
 
+    /// Show the login-zone overlay and collect its result on the GTK thread.
+    pub fn calibrate(&self, done: CalibrateDone) {
+        if !self.loaded_ok() || self.inner.calibration.borrow().is_some() {
+            done(None);
+            return;
+        }
+        let script = match inject::calibrate_js() {
+            Ok(script) => script,
+            Err(e) => {
+                self.log(&format!("calibrate template missing: {e}"));
+                done(None);
+                return;
+            }
+        };
+        let token = Rc::new(());
+        let weak = self.weak();
+        let poll_token = token.clone();
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let timer = glib::timeout_add_local(Duration::from_millis(500), move || {
+            let Some(inner) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let panel = WebKitPanel { inner };
+            if Instant::now() >= deadline {
+                if let Some(pending) = panel.inner.calibration.borrow_mut().as_mut() {
+                    pending.timer.take();
+                }
+                panel.log("calibrate: timed out");
+                panel.finish_calibration(None);
+                return glib::ControlFlow::Break;
+            }
+            let weak = panel.weak();
+            let poll_token = poll_token.clone();
+            panel.evaluate(
+                inject::CALIBRATE_POLL_JS,
+                Some(Box::new(move |value| {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let matches =
+                        inner.calibration.borrow().as_ref().is_some_and(|p| Rc::ptr_eq(&p.token, &poll_token));
+                    if !matches {
+                        return;
+                    }
+                    if let Some(value) = value.filter(|v| v.is_string()) {
+                        let text = value.to_string();
+                        if !text.is_empty() {
+                            let panel = WebKitPanel { inner };
+                            let result = Calibration::parse(&text);
+                            panel.inner.svc.log(&result.log_line(&panel.id()));
+                            panel.finish_calibration(result.zones());
+                        }
+                    }
+                })),
+            );
+            glib::ControlFlow::Continue
+        });
+        *self.inner.calibration.borrow_mut() = Some(PendingCalibration { token, timer: Some(timer), done });
+        self.evaluate(&script, None);
+    }
+
+    fn finish_calibration(&self, zones: Option<soc_core::Dict>) {
+        let pending = self.inner.calibration.borrow_mut().take();
+        if let Some(pending) = pending {
+            if let Some(timer) = pending.timer {
+                timer.remove();
+            }
+            self.evaluate(inject::CALIBRATE_ABORT_JS, None);
+            (pending.done)(zones.map(serde_json::Value::Object));
+        }
+    }
+
     // ---- self-healing ------------------------------------------------------
 
     /// Record a failure, put up the right card and schedule the retry.
@@ -802,6 +879,7 @@ impl WebKitPanel {
             // A new navigation starts clean; the failure flag is set later
             // only if this load fails.
             LoadEvent::Started => {
+                self.finish_calibration(None);
                 let mut st = inner.st.borrow_mut();
                 st.load_failed = false;
                 st.page_ok = false;
@@ -1027,6 +1105,7 @@ impl WebKitPanel {
             st.page_ok = false;
         }
         self.cancel_retry();
+        self.finish_calibration(None);
         for id in inner.handlers.borrow_mut().drain(..) {
             inner.webview.disconnect(id);
         }

@@ -1,15 +1,14 @@
 # p2soc — Rust remake of the SOC video-wall kiosk.
 # One workspace, one shipped binary (`soc-wall`); the library crates below are
-# statically linked into it. Every crate except soc-wall builds without GTK, so
-# the logic is testable on any CI runner.
+# statically linked into it. The desktop tools and wall GUI use GTK.
 [workspace]
 resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -58,8 +57,6 @@ debug = "line-tables-only"
 # the test suite crawl (scrypt at production cost: ~30 s debug vs ~1 s).
 [profile.dev.package.scrypt]
 opt-level = 3
-[profile.dev.package.salsa20]
-opt-level = 3
 [profile.dev.package.pbkdf2]
 opt-level = 3
 [profile.dev.package.sha2]
@@ -67,6 +64,4 @@ opt-level = 3
 [profile.dev.package.hmac]
 opt-level = 3
 [profile.dev.package.argon2]
-opt-level = 3
-[profile.dev.package.blake2]
 opt-level = 3

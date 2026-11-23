@@ -12,7 +12,7 @@ Environment=SOC_PANELS_FILE=/etc/soc-display/panels.yaml
 # Records the jump host's key on first start, so strict host-key checking has
 # something to check against. `+` because the sandbox below makes the key dir
 # read-only; `-` because it only ever helps: the tunnel then fails closed on its own.
-ExecStartPre=-+/opt/soc-display/.venv/bin/python /opt/soc-display/scripts/pin-jump-host.py
+ExecStartPre=-+/opt/soc-display/scripts/soc-service.sh pin-jump-host
 ExecStart=/opt/soc-display/scripts/autossh-tunnel.sh
 Restart=always
 RestartSec=5

@@ -14,6 +14,11 @@ else
   ROOT="${SOC_ROOT:-/opt/soc-display}"
 fi
 [ -d "$ROOT/kiosk-host" ] || { echo "forti-vpn.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  export SOC_ROOT="$ROOT"
+  exec "$NATIVE" with-env vpn
+fi
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
 [ -r "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 export SOC_PANELS_FILE="${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}"

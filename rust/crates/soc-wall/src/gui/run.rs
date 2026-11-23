@@ -442,7 +442,11 @@ fn host_options(conf: &Config, paths: &PathEnv, machine: &soc_sys::perf::Profile
         profile,
         machine: machine.clone(),
         stagger: Duration::from_secs_f64(env_float("SOC_LAUNCH_STAGGER", 1.5, Some(0.0), Some(60.0))),
-        windowed: env_str("SOC_WINDOWED").as_deref() == Some("1") || !conf.display.fullscreen,
+        windowed: match env_str("SOC_WINDOW_MODE").as_deref() {
+            Some("window") => true,
+            Some("fullscreen") => false,
+            _ => env_str("SOC_WINDOWED").as_deref() == Some("1") || !conf.display.fullscreen,
+        },
         layout: env_str("SOC_LAYOUT").as_deref().and_then(Layout::parse).filter(|l| *l != Layout::Auto),
         // Chromium picks a free DevTools port unless one is pinned on purpose.
         cdp_base: env_str("SOC_CDP_BASE_PORT")
@@ -463,6 +467,14 @@ pub fn run() -> i32 {
     }
 
     let display = gtk::init().is_ok();
+    if !display
+        && env_bool("SOC_SUPERVISED", false)
+        && env_str("SOC_WAYLAND_BACKEND").as_deref() == Some("auto")
+        && env_str("GDK_BACKEND").as_deref() == Some("wayland")
+    {
+        log("GTK could not start on native Wayland");
+        return 1;
+    }
     let looks = branding::Locations::from_env();
     if display {
         style::apply_css(&style::tokens_from_colors(&looks.load().colors));
@@ -491,7 +503,7 @@ fn run_wall(boot: &Boot, machine: &soc_sys::perf::Profile) -> i32 {
         Ok(r) => r,
         Err(e) => return boot.fatal("Vault backend error", &e.to_string(), ""),
     };
-    let mut env = VaultEnv::from_process();
+    let mut env = crate::vaultsetup::env_settings();
     // Nobody can answer a prompt on an unattended wall; with a display and an
     // operator, a missing master becomes the Unlock dialog instead of an error.
     env.interactive =

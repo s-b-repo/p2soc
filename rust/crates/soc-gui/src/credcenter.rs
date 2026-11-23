@@ -24,11 +24,7 @@
 //! cross that channel only as `Zeroizing` values; the master password and PINs
 //! live in RAM only and are never logged or put on argv.
 //!
-//! # Simplifications
-//!
-//! No QR image is drawn (there is no QR encoder in the dependency set): the
-//! setup URI and the base32 secret are shown as selectable text, which every
-//! authenticator app accepts as a manual entry.
+//! The provisioning URI and base32 secret are available as selectable text.
 
 use crate::style;
 use glib::ControlFlow;
@@ -931,12 +927,7 @@ fn show_uri_dialog(ui: &Rc<Ui>, title: &str, hint: &str, uri: &str, secret: Opti
         secret_entry.set_editable(false);
         area.pack_start(&field_row("Secret", &secret_entry), false, false, 0);
     }
-    area.pack_start(
-        &make_label("No QR image is drawn; paste the URI or type the secret into the authenticator app.", None),
-        false,
-        false,
-        0,
-    );
+    area.pack_start(&make_label("Paste the URI or enter the secret in your authenticator app.", None), false, false, 0);
     dialog.connect_response(|d, _| d.close());
     dialog.show_all();
 }
@@ -1631,6 +1622,16 @@ fn enrol_totp(ui: &Rc<Ui>) {
 /// Show the credentials & security control center and run its main loop.
 /// Returns the process exit code (`1` when there is no display).
 pub fn run(args: &[String]) -> i32 {
+    if args == ["--check"] {
+        let locations = soc_sys::paths::PathEnv::from_process();
+        if let Some(panels) = locations.resolve_panels() {
+            if let Err(e) = soc_core::load(&panels) {
+                eprintln!("credentials: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("usage: soc-wall credcenter\n\nThe credentials & security control center (needs a display).");
         return 0;

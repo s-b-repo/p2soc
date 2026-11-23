@@ -339,7 +339,7 @@ fn build_spa(spa_key: &str, spa_aid: &str, spa_ports: &str) -> Option<SpaConfig>
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
     let cleaned: String = s.chars().filter(|ch| !ch.is_whitespace() && *ch != ':').collect();
-    if cleaned.is_empty() || cleaned.len() % 2 != 0 {
+    if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
         return None;
     }
     let bytes = cleaned.as_bytes();

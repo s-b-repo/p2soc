@@ -163,6 +163,13 @@ configure_wall_env() {
 
 main() {
     ensure_xdg_runtime_dir
+    . "$SOC_ROOT/scripts/soc-native.sh"
+    if NATIVE="$(soc_native_path "$SOC_ROOT")"; then
+        discover_xauthority
+        configure_wall_env
+        export SOC_ROOT SOC_ENV_FILE SOC_WINDOW_MODE=window
+        exec "$NATIVE" with-env run
+    fi
     source_soc_env
     discover_xauthority
     configure_wall_env

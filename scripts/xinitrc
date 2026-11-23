@@ -13,12 +13,18 @@ else
 fi
 [ -d "$SOC_ROOT/kiosk-host" ] || { echo "xinitrc: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
+. "$SOC_ROOT/scripts/soc-native.sh"
+NATIVE="$(soc_native_path "$SOC_ROOT" || true)"
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
-if [ -f "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
+if [ "${SOC_ENV_LOADED:-0}" != 1 ]; then
+  if [ -n "$NATIVE" ]; then
+    exec "$NATIVE" with-env --script xinitrc "$@"
+  elif [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  fi
 fi
 
 # Make sure DPMS/blanking is off even before Openbox autostart runs.
@@ -32,9 +38,14 @@ xset s off -dpms s noblank 2>/dev/null || true
 RES="$(xrandr --current 2>/dev/null | awk '/\*/{print $1; exit}')"
 case "$RES" in
   [0-9]*x[0-9]*)
-    PYBIN="$SOC_ROOT/.venv/bin/python"
-    [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
-    "$PYBIN" "$SOC_ROOT/scripts/gen-openbox-rc.py" \
+    if [ -n "$NATIVE" ]; then
+      set -- "$NATIVE" wm-rc openbox
+    else
+      PYBIN="$SOC_ROOT/.venv/bin/python"
+      [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+      set -- "$PYBIN" "$SOC_ROOT/scripts/gen-openbox-rc.py"
+    fi
+    "$@" \
         --panels "${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}" \
         --template "$SOC_ROOT/openbox/rc.xml.tmpl" \
         --out "$HOME/.config/openbox/rc.xml" \

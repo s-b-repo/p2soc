@@ -196,14 +196,13 @@ fn reboot_machine() -> UiResult<()> {
 }
 
 fn repair_install() -> UiResult<()> {
-    let root = soc_core::env::env_str("SOC_DEPLOY_ROOT").unwrap_or_else(|| "/opt/soc-display".to_string());
-    let exe = format!("{root}/.venv/bin/python");
-    let setup = format!("{root}/setup.py");
-    let ran = SystemRunner.run(&argv(&["sudo", "-n", &exe, &setup, "repair"]), Duration::from_secs(600));
+    let exe = std::env::current_exe().map_err(|e| format!("could not locate soc-wall: {e}"))?;
+    let command = argv(&["sudo", "-n", &exe.to_string_lossy(), "setup", "repair", "--no-venv"]);
+    let ran = SystemRunner.run(&command, Duration::from_secs(600));
     if ran.is_ok_and(|out| out.success()) {
         Ok(())
     } else {
-        Err(format!("needs root — run: sudo python3 {setup} repair"))
+        Err("needs root — run: sudo soc-wall setup repair --no-venv".into())
     }
 }
 

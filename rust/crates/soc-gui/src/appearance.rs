@@ -322,11 +322,50 @@ fn matching_preset(colors: &Colors) -> Option<u32> {
 
 /// Run the editor (`soc-wall appearance`). Returns the exit code.
 pub fn run(args: &[String]) -> i32 {
+    if args == ["--check"] {
+        return i32::from(!PRESETS.iter().all(|p| preset_colors(p).values().all(|s| soc_brand::is_hex_color(s))));
+    }
+    if args == ["--help"] || args == ["-h"] {
+        println!("usage: soc-wall appearance [--list-presets | --check | --preset NAME --output FILE]");
+        return 0;
+    }
     if args.iter().any(|a| a == "--list-presets") {
         for preset in &PRESETS {
             println!("{}\t{}", preset.0, preset.1);
         }
         return 0;
+    }
+    if !args.is_empty() {
+        let value = |key: &str| {
+            args.iter().enumerate().find_map(|(i, arg)| {
+                if arg == key {
+                    args.get(i + 1).map(String::as_str)
+                } else {
+                    arg.strip_prefix(key).and_then(|s| s.strip_prefix('='))
+                }
+            })
+        };
+        let (Some(name), Some(output)) = (value("--preset"), value("--output")) else {
+            eprintln!("appearance: use --preset NAME --output FILE");
+            return 2;
+        };
+        let Some(preset) = PRESETS.iter().find(|p| p.0 == name) else {
+            eprintln!("appearance: unknown preset {name:?}");
+            return 2;
+        };
+        let path = std::path::Path::new(output);
+        let mut branding = soc_brand::Locations { explicit: Some(path.to_path_buf()), ..Default::default() }.load();
+        branding.colors.extend(preset_colors(preset));
+        return match soc_brand::save_colors(path, &branding, &soc_brand::Locations::default()) {
+            Ok(()) => {
+                println!("wrote preset {name:?} to {}", path.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("appearance: could not write {}: {e}", path.display());
+                1
+            }
+        };
     }
     if !crate::style::init() {
         eprintln!("[soc-wall] appearance: no graphical display (run this from your desktop session)");

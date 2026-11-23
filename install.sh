@@ -76,7 +76,7 @@ set -euo pipefail
 # Bump whenever the package lists below change. A redeploy only runs the package
 # manager when this differs from what the box last installed, so an ordinary update
 # never touches apt.
-DEPS_REV=2
+DEPS_REV=3
 
 SESSION_WAS_SET="${SESSION+yes}"
 # Note which knobs were set for this run: the rest keep their recorded value.
@@ -111,17 +111,30 @@ SOC_SKIP_PACKAGES="${SOC_SKIP_PACKAGES:-0}"
 DEPS_ONLY=0
 DEPS_IF_CHANGED=0
 ACTIVATE=0
+USERS_ONLY=0
 FRESH="${SOC_FRESH:-0}"
 for _a in "$@"; do
   [ "$_a" = "--deps-only" ] && DEPS_ONLY=1
   [ "$_a" = "--deps-if-changed" ] && { DEPS_ONLY=1; DEPS_IF_CHANGED=1; }
   [ "$_a" = "--activate" ] && ACTIVATE=1
   [ "$_a" = "--fresh" ] && FRESH=1
+  [ "$_a" = "--users-only" ] && USERS_ONLY=1
 done
 SOC_ROOT="${SOC_ROOT:-/opt/soc-display}"
 RELEASES="${SOC_RELEASES:-/opt/soc-releases}"
 ETC="${SOC_ETC:-/etc/soc-display}"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+# The desktop tools export their checkout as SOC_ROOT for resource lookup.
+# A source checkout is an input to deployment, never the live release tree.
+if [ "$ACTIVATE" != 1 ] && [ "$SOC_ROOT" = "$SRC_DIR" ] && [ -e "$SRC_DIR/.git" ]; then
+  SOC_ROOT=/opt/soc-display
+fi
+. "$SRC_DIR/scripts/soc-native.sh"
+NATIVE_SOURCE="$(soc_native_path "$SRC_DIR" || true)"
+NATIVE_BUILD=0
+if [ -z "$NATIVE_SOURCE" ] && [ -f "$SRC_DIR/rust/Cargo.toml" ] && [ "${SOC_LEGACY_PYTHON:-0}" != 1 ]; then
+  NATIVE_BUILD=1
+fi
 ARCH="$(uname -m)"
 
 # `sudo ./install.sh` from a clone owned by a normal user is the usual case, and git
@@ -146,6 +159,32 @@ docker_pull_retry(){ # $1=image
 }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo ./install.sh)"
+
+create_users() {
+  log "Creating users ($KIOSK_USER kiosk, $DESKTOP_USER desktop, $SVC_USER service)"
+  if ! id "$KIOSK_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$KIOSK_USER"
+  fi
+  for grp in video render input tty audio seat; do
+    getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" "$KIOSK_USER" || true
+  done
+  if ! id "$DESKTOP_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$DESKTOP_USER"
+  fi
+  for grp in video render input audio; do
+    getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" "$DESKTOP_USER" || true
+  done
+  if ! id "$SVC_USER" >/dev/null 2>&1; then
+    useradd -r -m -s "$(command -v nologin || echo /usr/sbin/nologin)" "$SVC_USER"
+  fi
+  if ! id "$UPDATE_USER" >/dev/null 2>&1; then
+    useradd -r -M -d /nonexistent -s "$(command -v nologin || echo /usr/sbin/nologin)" "$UPDATE_USER"
+  fi
+}
+if [ "$USERS_ONLY" = "1" ]; then
+  create_users
+  exit 0
+fi
 
 # Rows from the previous run's manifest (empty on a first install).
 manifest_row(){ # $1=TYPE $2=key
@@ -404,6 +443,27 @@ case "$FAMILY" in
     PK_SECRETTOOL=()
     ;;
 esac
+if [ -n "$NATIVE_SOURCE" ] || [ "$NATIVE_BUILD" = 1 ]; then
+  NATIVE_PK_CORE=()
+  for package in "${PK_CORE[@]}"; do
+    case "$package" in
+      python|python3|python3-venv|python3-gi|python-gobject|python3-gobject|py3-gobject3|gir1.2-gtk-3.0|gir1.2-webkit2-4.?) ;;
+      *) NATIVE_PK_CORE+=("$package") ;;
+    esac
+  done
+  PK_CORE=("${NATIVE_PK_CORE[@]}")
+  [ "$FAMILY" != debian ] || PK_CORE+=(libgtk-3-0 libwebkit2gtk-4.1-0)
+fi
+if [ "$NATIVE_BUILD" = 1 ]; then
+  case "$FAMILY" in
+    debian) PK_CORE+=(build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev) ;;
+    fedora) PK_CORE+=(gcc pkgconf-pkg-config gtk3-devel webkit2gtk4.1-devel) ;;
+    arch)   PK_CORE+=(base-devel pkgconf gtk3 webkit2gtk-4.1) ;;
+    suse)   PK_CORE+=(gcc pkg-config gtk3-devel webkit2gtk3-devel) ;;
+    alpine) PK_CORE+=(build-base pkgconf gtk+3.0-dev webkit2gtk-4.1-dev) ;;
+    void)   PK_CORE+=(base-devel pkg-config gtk+3-devel webkit2gtk-devel) ;;
+  esac
+fi
 # The chosen compositor (default labwc) leads the Wayland set unless skipping.
 [ -n "$COMPOSITOR" ] && PK_WAYLAND=("$COMPOSITOR" "${PK_WAYLAND[@]}")
 
@@ -432,7 +492,8 @@ install_x_server(){   # honour an existing X.Org/XLibre; else install one
 # package step unless --fresh / SOC_FRESH=1. The slow part is the package-manager
 # metadata refresh + re-resolution; the deploy/config/service steps below still
 # run (they are idempotent and pick up code changes).
-if [ "$DEPS_IF_CHANGED" = "1" ] && [ "$(cat "$ETC/.deps-rev" 2>/dev/null)" = "$DEPS_REV" ]; then
+if [ "$DEPS_IF_CHANGED" = "1" ] && [ "$(cat "$ETC/.deps-rev" 2>/dev/null)" = "$DEPS_REV" ] \
+   && { [ "$NATIVE_BUILD" != 1 ] || pkg-config --exists gtk+-3.0 webkit2gtk-4.1; }; then
   exit 0           # the common case: this update needs no OS packages
 fi
 # A redeploy never runs the package manager here: --deps-if-changed already did,
@@ -448,7 +509,7 @@ fi
 log "Refreshing package metadata"
 pm_refresh
 
-log "Installing core dependencies (python/GTK/WebKit, autossh, openfortivpn)"
+log "Installing core dependencies (GTK/WebKit, autossh, openfortivpn)"
 pm_install "${PK_CORE[@]}"
 
 case "$SESSION" in
@@ -499,32 +560,18 @@ if [ "$DEPS_ONLY" = "1" ]; then
   exit 0
 fi
 
+if [ "$NATIVE_BUILD" = 1 ]; then
+  command -v cargo >/dev/null 2>&1 || die "a current Rust toolchain is required to build the wall; run make rust-release or use a binary package"
+  log "Building the native SOC Wall"
+  if [ "$FAMILY" = alpine ]; then
+    export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
+  fi
+  (cd "$SRC_DIR/rust" && cargo build --locked --release --bin soc-wall --jobs "${CARGO_BUILD_JOBS:-1}")
+  NATIVE_SOURCE="$SRC_DIR/rust/target/release/soc-wall"
+fi
+
 # --------------------------------------------------------------------------- #
-log "Creating users ($KIOSK_USER kiosk, $DESKTOP_USER desktop, $SVC_USER service)"
-# Both the kiosk + desktop users are created REGARDLESS of INSTALL_MODE so a box
-# can switch modes later without re-provisioning; only the mode's user gets the
-# tty1-autologin/session wiring (below). All three are unprivileged.
-if ! id "$KIOSK_USER" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "$KIOSK_USER"
-fi
-# kiosk user needs video/render/input/tty/seat — it OWNS tty1 (its own session).
-for grp in video render input tty audio seat; do
-  getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" "$KIOSK_USER" || true
-done
-if ! id "$DESKTOP_USER" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "$DESKTOP_USER"
-fi
-# desktop user runs the wall windowed INSIDE the operator's already-running DE
-# session, so it needs GPU/input access but NOT tty/seat takeover.
-for grp in video render input audio; do
-  getent group "$grp" >/dev/null 2>&1 && usermod -aG "$grp" "$DESKTOP_USER" || true
-done
-if ! id "$SVC_USER" >/dev/null 2>&1; then
-  useradd -r -m -s "$(command -v nologin || echo /usr/sbin/nologin)" "$SVC_USER"
-fi
-if ! id "$UPDATE_USER" >/dev/null 2>&1; then
-  useradd -r -M -d /nonexistent -s "$(command -v nologin || echo /usr/sbin/nologin)" "$UPDATE_USER"
-fi
+create_users
 
 # Debian's Xorg wrapper restricts who may start X. The kiosk starts X from the
 # console VT, so `console` is enough; `anybody` would let any account spawn a
@@ -553,6 +600,9 @@ if [ "$IN_PLACE" = "1" ]; then
   # release), or a package install, whose payload is managed by dpkg/rpm.
   REL_DIR="$ROOT_REAL"
   log "Using the tree already at $REL_DIR"
+  if [ -n "$NATIVE_SOURCE" ] && [ ! -x "$REL_DIR/bin/soc-wall" ]; then
+    install -D -m 0755 "$NATIVE_SOURCE" "$REL_DIR/bin/soc-wall"
+  fi
 else
   log "Installing project under $RELEASES"
   src_commit="$(src_git rev-parse HEAD 2>/dev/null || true)"
@@ -576,8 +626,13 @@ else
   tar -C "$SRC_DIR" \
       --exclude='./.git' --exclude='./.venv' --exclude='./dev' --exclude='__pycache__' \
       --exclude='./kiosk-host/tests' --exclude='./.github' --exclude='./.githooks' \
+      --exclude='./rust/target' --exclude='./rust/fuzz/target' --exclude='./rust/crates/*/tests' \
       --exclude='./.pre-commit-config.yaml' --exclude='./CONTRIBUTING.md' \
       -cf - . | tar -C "$STAGE" -xf -
+  if [ -n "$NATIVE_SOURCE" ]; then
+    install -D -m 0755 "$NATIVE_SOURCE" "$STAGE/bin/soc-wall"
+    ln -sfn soc-wall "$STAGE/bin/soc-vpn-pinentry"
+  fi
   [ -n "$src_commit" ] && printf '%s\n' "$src_commit" > "$STAGE/.commit"
   mv "$STAGE" "$REL_DIR"
 fi
@@ -592,7 +647,8 @@ chmod +x "$REL_DIR"/vendor/iNode-VPN-Client/svpn-connect.sh \
 # inode-svpn-helper also refuses to load a group/other-writable backend.
 chmod -R go-w "$REL_DIR/" 2>/dev/null || true
 
-log "Preparing the Python venv"
+if [ ! -x "$REL_DIR/bin/soc-wall" ]; then
+log "Preparing the Python venv for the compatibility runtime"
 crypto_distro_pkg(){
   case "$FAMILY" in
     debian|fedora|suse|void) echo python3-cryptography ;;
@@ -626,6 +682,7 @@ fi
 "$REL_DIR/.venv/bin/python" -m compileall -q \
   "$REL_DIR/kiosk-host/host" "$REL_DIR/scripts" "$REL_DIR/setup.py" "$REL_DIR/provision.py" \
   >/dev/null 2>&1 || warn "bytecode precompile reported problems (harmless at runtime)"
+fi
 
 # Switch the live link. A pre-release-layout install has a real directory here:
 # move it aside first (it is removed once this install has succeeded).
@@ -645,15 +702,21 @@ fi
 # It execs `python -m host.litebw` from $SOC_ROOT; deployed under scripts/.
 install -d -m 0755 /usr/local/bin
 install -m 0755 "$SOC_ROOT/scripts/litebw" /usr/local/bin/litebw
+if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+  ln -sfn soc-wall "$SOC_ROOT/bin/soc-vpn-pinentry"
+  ln -sfn "$SOC_ROOT/bin/soc-wall" /usr/local/bin/soc-wall
+fi
 # `soc-update status`, `soc-update rollback`, ... for an operator at a shell.
-ln -sfn "$SOC_ROOT/scripts/soc-update.py" /usr/local/bin/soc-update
+ln -sfn "$SOC_ROOT/scripts/soc-update.sh" /usr/local/bin/soc-update
 
 # Deploy-time manifest: record every shipped file's sha256 + the source commit.
 # The wall warns in the top bar if anything has drifted (tampered install, ad-hoc
 # edit), and soc-update uses it to find and repair damage. Best-effort: without
 # python3 the wall just won't show the warning.
 log "Recording deploy manifest (file hashes + source commit)"
-if command -v python3 >/dev/null 2>&1; then
+if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+  "$SOC_ROOT/bin/soc-wall" manifest "$SOC_ROOT" "$ETC/manifest.json" || warn "could not write deploy manifest"
+elif command -v python3 >/dev/null 2>&1; then
   install -d -m 0755 "$ETC"
   PYTHONPATH="$SOC_ROOT/kiosk-host" python3 -c "
 from host import manifest
@@ -715,14 +778,12 @@ mkdir -p "$ETC/webdata"; chmod 0700 "$ETC/webdata"; chown "$KIOSK_USER:$KIOSK_US
 # vault" (the launcher silently skips an unreadable env -> empty SOC_VAULT_EMAIL).
 # The actual secret (the sealed master) stays 0700/0600, so this exposes no creds.
 chmod 0644 "$ETC/soc.env"; chown root:root "$ETC/soc.env"
+if ! grep -q '^SOC_KIOSK_USER=' "$ETC/soc.env"; then
+  printf '\nSOC_KIOSK_USER=%s\n' "$KIOSK_USER" >> "$ETC/soc.env"
+fi
 
-# default the vault backend to litebw (pure-Python; rbw/dev stay selectable).
-# The shipped soc.env.example already defaults to litebw; this only migrates a
-# legacy 'rbw' default left in an existing soc.env (pre-litebw installs) and
-# backfills a missing key — never clobbering an operator's explicit choice.
-if grep -q '^SOC_VAULT_BACKEND=rbw[[:space:]]*$' "$ETC/soc.env"; then
-  sed -i 's/^SOC_VAULT_BACKEND=rbw[[:space:]]*$/SOC_VAULT_BACKEND=litebw/' "$ETC/soc.env"
-elif ! grep -q '^SOC_VAULT_BACKEND=' "$ETC/soc.env"; then
+# Backfill the default for older installations that lack the backend key.
+if ! grep -q '^SOC_VAULT_BACKEND=' "$ETC/soc.env"; then
   printf '\n# vault backend: litebw (default) | rbw | dev\nSOC_VAULT_BACKEND=litebw\n' >> "$ETC/soc.env"
 fi
 
@@ -775,14 +836,19 @@ if [ "$VW_MODE" = "docker" ]; then
 else
   VW_BIN=/usr/local/bin/vaultwarden
   VW_DB=/var/lib/vaultwarden/db.sqlite3
-  if python3 "$SOC_ROOT/scripts/fetch-vaultwarden.py" --lock "$VW_LOCK" --dest "$VW_BIN" --check; then
+  if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+    VW_FETCH=("$SOC_ROOT/bin/soc-wall" fetch-vaultwarden)
+  else
+    VW_FETCH=(python3 "$SOC_ROOT/scripts/fetch-vaultwarden.py")
+  fi
+  if "${VW_FETCH[@]}" --lock "$VW_LOCK" --dest "$VW_BIN" --check; then
     # Migrations run forwards only, so keep a copy of the database across an
     # upgrade. Stopped first: a copy of a live SQLite file can be inconsistent.
     if [ -x "$VW_BIN" ] && [ -f "$VW_DB" ]; then
       [ "$HAS_SYSTEMD" = "1" ] && systemctl stop vaultwarden.service 2>/dev/null || true
       cp -a "$VW_DB" "$VW_DB.pre-upgrade"
     fi
-    if python3 "$SOC_ROOT/scripts/fetch-vaultwarden.py" --lock "$VW_LOCK" --dest "$VW_BIN"; then
+    if "${VW_FETCH[@]}" --lock "$VW_LOCK" --dest "$VW_BIN"; then
       VW_RESTART=1
     elif [ -x "$VW_BIN" ]; then
       warn "could not fetch the pinned Vaultwarden; keeping the installed one"
@@ -790,6 +856,8 @@ else
     else
       die "could not fetch the Vaultwarden binary — check network/DNS (Pi Wi-Fi may still be coming up), then re-run ./install.sh (it is idempotent). To supply your own, place it at $VW_BIN."
     fi
+  elif [ ! -x "$VW_BIN" ]; then
+    die "Vaultwarden is missing and its install check failed. Check $VW_LOCK and the native executable's shared libraries."
   fi
   id vaultwarden >/dev/null 2>&1 || \
     useradd -r -s "$(command -v nologin || echo /usr/sbin/nologin)" vaultwarden
@@ -802,6 +870,10 @@ fi
 # Exit 0 yes, 1 no, 2 can't tell. The third must stay distinct: a config that doesn't
 # load is no reason to switch off a tunnel or VPN that is working right now.
 config_wants(){ # $1=tunnel|vpn
+  if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+    "$SOC_ROOT/bin/soc-wall" config-wants "$1" "$ETC/panels.yaml"
+    return
+  fi
   "$SOC_ROOT/.venv/bin/python" - "$1" "$ETC/panels.yaml" "$SOC_ROOT/kiosk-host" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[3])
@@ -1040,7 +1112,12 @@ cp "$SOC_ROOT/openbox/menu.xml" "$SOC_ROOT/openbox/autostart" "$HOME/.config/ope
 cp "$SOC_ROOT/scripts/xinitrc" "$HOME/.xinitrc"
 # Only a default for the first boot, so a config that doesn't load must not stop a
 # redeploy: the session regenerates this file when it starts.
-"$SOC_ROOT/.venv/bin/python" "$SOC_ROOT/scripts/gen-openbox-rc.py" \
+if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+  set -- "$SOC_ROOT/bin/soc-wall" wm-rc openbox
+else
+  set -- "$SOC_ROOT/.venv/bin/python" "$SOC_ROOT/scripts/gen-openbox-rc.py"
+fi
+"$@" \
   --panels "$PANELS" --template "$SOC_ROOT/openbox/rc.xml.tmpl" \
   --out "$HOME/.config/openbox/rc.xml" --width 1920 --height 1080 \
   || echo "could not generate openbox rc.xml from $PANELS (the session retries)" >&2
@@ -1108,6 +1185,11 @@ ICON_FILE=""
 BRANDING_FILE=""
 VENV_PY="$SOC_ROOT/.venv/bin/python"
 DESKTOP_DST="/usr/share/applications/soc-wall.desktop"
+if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+  BRANDING_CMD=("$SOC_ROOT/bin/soc-wall" branding)
+else
+  BRANDING_CMD=("$VENV_PY" -m host.branding)
+fi
 
 # Install the branding source so operators can rebrand in place — but NEVER
 # clobber an edited branding.yaml on re-install (idempotent).
@@ -1122,13 +1204,13 @@ if [ -f "$SOC_ROOT/branding/branding.yaml" ]; then
   fi
 fi
 
-if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
+if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "${BRANDING_CMD[0]}" ]; then
   log "Installing desktop launcher (rebrand-aware app entry + icon)"
   install -d -m 0755 /usr/share/applications
   # GENERATE the entry from branding (run from kiosk-host so `host` is importable;
   # SOC_BRANDING_FILE points at the just-installed source so operator edits win).
-  if [ -x "$VENV_PY" ] && SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
-       PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -m host.branding desktop \
+  if [ -x "${BRANDING_CMD[0]}" ] && SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
+       PYTHONPATH="$SOC_ROOT/kiosk-host" "${BRANDING_CMD[@]}" desktop \
        "$SOC_ROOT/scripts/soc-wall-menu" soc-wall > "$DESKTOP_DST" 2>/dev/null \
      && [ -s "$DESKTOP_DST" ]; then
     log "generated $DESKTOP_DST from branding"
@@ -1146,10 +1228,14 @@ if [ -f "$SOC_ROOT/soc-wall.desktop" ] || [ -x "$VENV_PY" ]; then
   # name the generated entry references.
   if [ -n "$DESKTOP_FILE" ]; then
     BRAND_ICON=""
-    [ -x "$VENV_PY" ] && BRAND_ICON="$(SOC_ROOT="$SOC_ROOT" \
-      SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
-      PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -c \
-      'from host import branding; print(branding.icon_path())' 2>/dev/null || true)"
+    if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+      BRAND_ICON="$(SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
+        "${BRANDING_CMD[@]}" icon-path 2>/dev/null || true)"
+    elif [ -x "$VENV_PY" ]; then
+      BRAND_ICON="$(SOC_ROOT="$SOC_ROOT" SOC_BRANDING_FILE="${BRANDING_FILE:-$SOC_ROOT/branding/branding.yaml}" \
+        PYTHONPATH="$SOC_ROOT/kiosk-host" "$VENV_PY" -c \
+        'from host import branding; print(branding.icon_path())' 2>/dev/null || true)"
+    fi
     if [ -z "$BRAND_ICON" ] || [ ! -f "$BRAND_ICON" ]; then
       BRAND_ICON="$SOC_ROOT/share/icons/soc-wall.svg"
     fi
@@ -1340,12 +1426,15 @@ if [ "$INSTALL_MODE" = "kiosk" ]; then
     mkdir -p /etc/systemd/system/getty@tty1.service.d
     sed "s/--autologin soc /--autologin $KIOSK_USER /" \
       "$SOC_ROOT/systemd/getty-autologin.conf" > /etc/systemd/system/getty@tty1.service.d/override.conf
+    sed -e "s|@SOC_ROOT@|$SOC_ROOT|g" -e "s|@ETC@|$ETC|g" \
+      "$SOC_ROOT/systemd/soc-firstboot.service" > /etc/systemd/system/soc-firstboot.service
     if [ "$(systemctl get-default 2>/dev/null)" != "multi-user.target" ]; then
       systemctl set-default multi-user.target  # no desktop env; we run our own session
       DID_SET_DEFAULT=1
       SET_DEFAULT_NOW=1
     fi
     systemctl daemon-reload
+    systemctl enable soc-firstboot.service
   else
     warn "no systemd — set up tty1 autologin for '$KIOSK_USER' with your init."
     warn "  agetty:  agetty --autologin $KIOSK_USER --noclear tty1 (in inittab/respawn)"
@@ -1420,6 +1509,9 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
 
   # files on PATH / shared trees
   printf 'FILE|/usr/local/bin/litebw|litebw launcher (remove on uninstall)\n'
+  if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+    printf 'FILE|/usr/local/bin/soc-wall|native wall launcher (remove on uninstall)\n'
+  fi
   printf 'FILE|/usr/local/bin/soc-update|redeploy command link (remove on uninstall)\n'
   [ "$VW_MODE" = "native" ] && \
     printf 'FILE|/usr/local/bin/vaultwarden.lock-stamp|pinned Vaultwarden record (remove on uninstall)\n'
@@ -1449,6 +1541,7 @@ HOME_DIR_M="$(getent passwd "$KIOSK_USER" 2>/dev/null | cut -d: -f6)"
     printf 'UNIT|soc-update.service|/etc/systemd/system/soc-update.service\n'
     printf 'FILE|/etc/tmpfiles.d/soc-wall.conf|heartbeat run dir (remove on uninstall)\n'
     if [ "$INSTALL_MODE" = "kiosk" ]; then
+      printf 'UNIT|soc-firstboot.service|/etc/systemd/system/soc-firstboot.service\n'
       printf 'FILE|/etc/systemd/system/getty@tty1.service.d/override.conf|tty1 autologin drop-in (kiosk)\n'
       printf 'FILE|/etc/systemd/system.conf.d/10-soc-watchdog.conf|hardware watchdog (kiosk)\n'
     fi
@@ -1515,17 +1608,23 @@ if [ "$ACTIVATE" = "1" ]; then
   exit 0
 fi
 
+if [ -x "$SOC_ROOT/bin/soc-wall" ]; then
+  SETUP_CMD="$SOC_ROOT/bin/soc-wall setup"
+else
+  SETUP_CMD="python3 $SOC_ROOT/setup.py"
+fi
+
 cat <<EOF
 
 $(printf '\033[32mInstall complete.\033[0m')  One step left:
 
-  sudo python3 $SOC_ROOT/setup.py deploy
+  sudo $SETUP_CMD deploy
 
 It asks for your panels and logins once, creates the vault account, seals the
 master password and brings the wall up. After that nothing needs a person: the
 wall starts at boot, repairs itself, and redeploys itself from the tracked branch
 (see $SOC_ROOT/docs/AUTO_UPDATE.md). For a scripted install, use
-  setup.py deploy --unattended --master-fd N    (see docs/DEPLOY.md).
+  sudo $SETUP_CMD deploy --unattended --master-fd N    (see docs/DEPLOY.md).
 
 $(if [ "$INSTALL_MODE" = "kiosk" ]; then printf 'INSTALL_MODE=kiosk: the wall owns tty1 from the next boot.'; else printf 'INSTALL_MODE=desktop: your DE/login manager is untouched. Launch the wall from the\n  "SOC Video Wall" desktop icon, or %s.\n  Re-run with INSTALL_MODE=kiosk for a dedicated tty1-autologin appliance.' "$([ "$HAS_SYSTEMD" = 1 ] && echo "systemctl start soc-wall" || echo "$SOC_ROOT/scripts/launcher.sh")"; fi)
 $([ "$HAS_SYSTEMD" = 1 ] || printf '%s\n' "NOTE: no systemd here — see the warnings above for service supervision and tty1

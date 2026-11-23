@@ -19,3 +19,4 @@ dist/
 
 # Site-specific config
 config/panels.local.yaml
+/native/

@@ -8,12 +8,11 @@ means and exactly what to type — with a worked example.
 Run the configuration questions any time:
 
 ```bash
-sudo python3 setup.py wizard        # just the configuration wizard
+sudo soc-wall setup wizard        # just the configuration wizard
 ```
 
-The same questions also run **once automatically** the first time the wall boots
-(or the first `./launch.sh`). Re-run that first-time page with
-`./launch.sh --reconfigure`.
+A kiosk without a configured marker runs first-boot setup on tty1.
+Run `soc-wall setup-gui` from a desktop session for the graphical wizard.
 
 A few things that are true at every prompt:
 
@@ -21,8 +20,8 @@ A few things that are true at every prompt:
 - Re-running loads your previous answers as those defaults, so a second pass is
   mostly just Enter, Enter, Enter.
 - **Nothing is saved until the very end.** The wizard collects every answer,
-  prints a summary, and only writes files after you confirm **“Write these files
-  now?”**. Press **Ctrl-C** at any point to abort with nothing changed.
+  validates the configuration, and writes files after you confirm **“Write this
+  configuration”**. Press **Ctrl-C** at any point to abort with nothing changed.
 
 ---
 
@@ -55,7 +54,7 @@ never type a selector at all — you just confirm.
 
 ---
 
-## Section 1 of 7 — Display geometry
+## Display geometry
 
 How the screen is divided into a grid of panels.
 
@@ -69,19 +68,11 @@ How the screen is divided into a grid of panels.
 
 ---
 
-## Section 2 of 7 — Panels (the important one)
+## Panels
 
-**Panels are optional at install time.** The first question is **“Configure
-panels now?”** — answer **n** to fill the grid with blank *click-to-configure*
-tiles and set everything (URL, vault login, **and credentials**) later from the
-running wall’s **⚙ settings window** — no SSH, no file editing (see
-[Configure at the glass](#configure-at-the-glass-no-wizard-needed)). Answer **y**
-to set them up here now.
-
-If you configure now, you’re asked how many panels (the grid cap is
-`cols × rows`), then a block of questions **per panel** — and each panel also
-starts with **“Configure this panel now? (n = leave a blank tile)”**, so you can
-fill in the ones you know and leave the rest blank.
+Enter a number of panels up to the grid size. Zero leaves an empty wall for
+configuration in [Settings](#configure-at-the-glass-no-wizard-needed). For each
+panel, give a unique ID and pick the grid cell, browser engine and connection.
 
 ### Per-panel prompts, in order
 
@@ -91,38 +82,22 @@ fill in the ones you know and leave the rest blank.
 | `engine` | renderer | **`webkit`** (light, default). Use `chromium` only if WebKit can’t render the page |
 | `grid column / row (0-based)` | which cell | `0,0` = top-left, `1,0` = top-right, `0,1` = bottom-left… |
 | `mode` | how it’s reached | **`direct`** (a reachable URL) or `tunnel` (via the SSH jump host) |
-| `login URL` *(direct)* | the page to open | the panel’s login page, e.g. `http://10.14.0.2/zabbix/index.php`. A bare host like `10.14.0.2` is accepted too — it’s turned into `http://10.14.0.2` |
+| `login URL` *(direct)* | the page to open | the panel’s login page, e.g. `http://10.14.0.2/zabbix/index.php`. Include the URL scheme |
 | *(tunnel fields)* | for `mode: tunnel` | local port, remote host/port (as seen from the jump host), path, scheme — see below |
-| `vault item name` | **the Vaultwarden login this panel uses** | a name, e.g. `zabbix`. This is **where the real username/password live** — store them later with `setup.py creds`. Leave blank for a display-only tile (no login) |
+| `vault item name` | **the Vaultwarden login this panel uses** | a name, e.g. `zabbix`. This is **where the real username/password live** — store them later with `soc-wall setup creds`. Leave blank for a display-only tile (no login) |
 
 Then the wizard probes the URL and either auto-fills the selectors or asks you
 for them. That’s the next part.
 
 ### Auto-detect: the happy path
 
-For a **direct** panel, after you enter the URL the wizard fetches that page and
-works out the selectors and the login type for you:
+For a direct panel, answer **yes** to **Detect the login form**. The wizard
+reads the page and suggests selectors for the username, password and submit
+controls. Press Enter at each selector prompt to keep the suggestion. Pages
+that render their controls with JavaScript may require manual selectors or
+login-zone calibration in the running wall.
 
-```
- probing http://10.14.0.2/zabbix/index.php to auto-detect the login form …
-✓ detected a Zabbix login form at http://10.14.0.2/zabbix/index.php
-   suggested selectors (auto-detected):
-      username field : #name
-      password field : #password
-      submit button  : #enter
-      login marker   : #password   (how the wall spots the login page)
-   These say WHERE the login boxes are on the page — they are NOT your
-   username/password. Your real login goes in the Vaultwarden item named at
-   the 'vault item name' prompt (store it with:  setup.py creds).
-   Use these detected selectors? [Y]:        ←  just press Enter
-✓ selectors + login_marker set from auto-detect
-```
-
-**When you see this, press Enter.** You’re done with selectors for that panel —
-no need to understand the individual fields. Say `n` only if you want to set them
-by hand (the next section explains each one).
-
-### What each selector means (only needed if you answer “n”, or detection fails)
+### What each selector means
 
 | Prompt | Plain meaning | Typical value |
 |---|---|---|
@@ -241,7 +216,7 @@ keep-alive    : reload, 600
 ```
 
 Your Zabbix **username (`Admin`) and password** are **not** entered above —
-they go into the `zabbix` vault item with `setup.py creds`.
+they go into the `zabbix` vault item with `soc-wall setup creds`.
 
 ### Tunneled panels (`mode: tunnel`)
 
@@ -260,7 +235,7 @@ selectors by hand — use the “find a selector” steps above.
 
 ---
 
-## Section 3 of 7 — autossh SSH jump-host tunnel
+## SSH jump-host tunnel
 
 Only relevant if a panel uses `mode: tunnel` (you’re asked anyway, default off).
 
@@ -271,7 +246,7 @@ Only relevant if a panel uses `mode: tunnel` (you’re asked anyway, default off
 
 ---
 
-## Section 4 of 7 — VPN
+## VPN
 
 “Enable a VPN?” → `n` if your panels are directly reachable. If `y`, pick the
 **type** (`fortinet` / `openvpn` / `wireguard` / `inode`) and answer its fields.
@@ -344,7 +319,7 @@ to a 0600 temp file in the soc-vpn dir for the duration of the connection.
 
 ---
 
-## Section 5 of 7 — Outbound proxy
+## Outbound proxy
 
 “Use an outbound proxy?” → `n` unless your network forces one.
 
@@ -356,7 +331,7 @@ to a 0600 temp file in the soc-vpn dir for the duration of the connection.
 
 ---
 
-## Section 6 of 7 — Secrets vault (rbw / Vaultwarden)
+## Vault
 
 Where the wall reads every login (and its own config) from.
 
@@ -364,32 +339,31 @@ Where the wall reads every login (and its own config) from.
 |---|---|
 | `vault account email` | the kiosk Vaultwarden account, e.g. `kiosk@soc.local` |
 | `Vaultwarden URL` | usually `http://127.0.0.1:8222` (a bare `127.0.0.1:8222` is accepted) |
-| `display stack` | **`auto`** (tries Wayland → XWayland → XLibre → Xorg) unless you must force one |
+| `Vault backend` | `litebw` or `native` uses the native Vaultwarden client, `rbw` uses the external client, and `dev` reads a JSON fixture. |
+| `Vault configuration item` | The vault note that stores the wall configuration. |
 
 The **master password is not entered here.** It’s sealed host-bound later by
-`setup.py first-run` (or `deploy`), which mints a one-time PIN — no plaintext on
+`soc-wall setup first-run` (or `deploy`), which mints a one-time PIN — no plaintext on
 disk.
 
 ---
 
-## Section 7 of 7 — Vaultwarden server
+## Kiosk session and Vaultwarden
 
-Informational. Vaultwarden’s own config lives in its systemd unit (binds
-localhost, signups off, `/admin` disabled). The wizard prints the exact
-`systemctl edit` steps to temporarily allow signups so you can create the kiosk
-account, then turn them back off.
+Choose `auto` for the display stack, or select Wayland, XWayland, XLibre, Xorg or
+X11 explicitly. Vaultwarden uses the settings in its systemd unit, with a
+loopback listener and signups disabled. `soc-wall setup deploy` can create the
+local account using a temporary runtime drop-in.
 
 ---
 
 ## Review & write
 
-The wizard prints a summary (panels, tunnel/VPN/proxy on/off, each panel’s
-target ← vault item) and asks **“Write these files now?”**:
-
-- **Yes** → writes `panels.yaml` + `soc.env` (backing up any existing file to
-  `*.bak.<timestamp>`), then runs a parse + geometry check so you know
-  immediately if something’s off.
-- **No** (or **Ctrl-C**) → nothing is written.
+The terminal wizard writes `panels.yaml` and `soc.env` after confirmation.
+Use `--dry-run` to print the generated files. On a desktop the Review step
+shows the output paths, configuration, and any validation warnings. Installed
+hosts with polkit can request authorization to save system configuration.
+The wizard can also save for the current login.
 
 ---
 
@@ -404,13 +378,13 @@ bar, or press **Ctrl+Shift+C**. Its tabs:
 
 | Tab | What you do there |
 |---|---|
-| **Panels** | per tile: set the **URL**, **title**, **vault login** (the vault item), **engine**, and — under *Advanced* — the auto-login selectors. Changes apply live and are saved to `overrides.json` (they layer on top of `panels.yaml`) |
-| **Credentials** | for each panel/VPN/proxy vault item, type the **username + password** and click **Save to vault** — stored straight into Vaultwarden (the wall reads it via rbw). If the wall isn’t host-sealed, it asks for the vault master password right here |
+| **Panels** | Set URL, title, vault item and engine for each tile. Use the advanced fields for selectors or open login-zone calibration for WebKit and Chromium. Changes apply live and are saved to `overrides.json` (they layer on top of `panels.yaml`) |
+| **Credentials** | for each panel/VPN/proxy vault item, type the **username + password** and click **Save to vault** — stored straight into Vaultwarden (the wall reads it through its configured vault backend). If the wall isn’t host-sealed, it asks for the vault master password right here |
 | **Display** | layout, gap, **grid size (cols × rows)**, and **resolution (width × height + auto-detect)**. Gap applies live; layout / grid / resolution take effect on the next restart. **Growing the grid auto-creates blank click-to-configure tiles for the new cells** — so adding a 5th panel is just bumping `rows` from 2 to 3 and restarting |
 | **VPN** | type + gateway + vault item + cert pin; Apply pushes it to the vault config note and restarts the VPN |
 | **Proxy** | outbound HTTP(S)/SOCKS proxy for the panel browsers: **enabled**, **URL**, **vault login** (proxy creds), **ignore hosts**. Applies on the next restart |
 | **Tunnel** | the SSH **jump host** used by panels in *tunnel* mode: jump host, identity (private-key path), `known_hosts` file, host-key-checking mode, and **extra forwards** (one `bindaddr:port:host:port` per line). Apply restarts `autossh-tunnel` |
-| **Actions** | one-click **Reload panels** (no restart) · **Restart wall** (soft, ~3 s via systemd respawn — applies layout/grid/resolution changes without a reboot) · **🔒 Lock the wall now** (same as the toolbar lock and Ctrl+Alt+L; panels stay visible, input is inert until PIN/TOTP) · **Reboot machine** · **Repair install** (runs `setup.py repair`) |
+| **Actions** | one-click **Reload panels** (no restart) · **Restart wall** (soft, ~3 s via systemd respawn — applies layout/grid/resolution changes without a reboot) · **🔒 Lock the wall now** (same as the toolbar lock and Ctrl+Alt+L; panels stay visible, input is inert until PIN/TOTP) · **Reboot machine** · **Repair install** (runs `soc-wall setup repair`) |
 | **Security** | enrol / clear / change the PIN that gates this Settings window AND the panel-lock PIN. Optionally enrol a TOTP (RFC 6238) — the unlock prompt accepts either. Live complexity validation for both (min length, character classes, common-bad rejection). The panel-lock secret is separate from the Settings secret — typically operators choose one PIN for both, but they can be different |
 | **Status** | live health of the panels and VPN |
 
@@ -432,6 +406,7 @@ Tray menu:
 |---|---|
 | Show wall | bring the hidden window back |
 | Lock panel | same as Ctrl+Alt+L / the toolbar 🔒 button |
+| View wall log | open the wall log |
 | Open Settings | open the ⚙ window |
 | Restart wall | soft restart (systemd respawn ~3 s) |
 | Reboot machine | `systemctl reboot` (needs root) |
@@ -442,11 +417,11 @@ skipped in that path — close-button behaviour is unchanged there.
 
 **Two prerequisites for storing credentials at the glass:** Vaultwarden must be
 running with the kiosk account created, and the vault must be unlockable — either
-host-sealed via `setup.py first-run`, or by typing the master password into the
+host-sealed via `soc-wall setup first-run`, or by typing the master password into the
 Credentials tab.
 
-So the minimal install is: run the installer → at the wizard answer **n** to
-“Configure panels now?” → boot → set each tile and its login from **⚙**.
+For an empty wall, choose zero panels in the terminal setup or load the Empty
+preset in the desktop wizard. Set the tiles and credentials from **Settings**.
 
 ## After the wizard: store the credentials
 
@@ -454,7 +429,7 @@ This is the step that completes a panel — and the home for the username/passwo
 you did **not** type into the selector prompts:
 
 ```bash
-sudo python3 setup.py creds
+sudo soc-wall setup creds
 ```
 
 For each panel’s `vault_item` (e.g. `zabbix`), enter the real **username**

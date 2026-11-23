@@ -5,18 +5,22 @@ pub mod check;
 pub mod cli;
 pub mod config;
 pub mod deploy;
+pub mod discovery;
 pub mod doctor;
 pub mod envfile;
 pub mod error;
 pub mod firstrun;
 pub mod host;
 pub mod paths;
+mod reinstall;
 pub mod repair;
+mod reset;
 pub mod seal;
 pub mod step;
 pub mod unit;
 pub mod util;
 pub mod vault;
+mod wizard;
 
 /// How hints name this tool.
 pub const CLI: &str = "soc-wall setup";

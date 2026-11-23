@@ -24,6 +24,10 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 # that doesn't already export SOC_ROOT. Mirrors scripts/soc-wall-menu et al.
 [ -d "$ROOT/kiosk-host" ] || ROOT="${SOC_ROOT:-/opt/soc-display}"
 [ -d "$ROOT/kiosk-host" ] || { echo "litebw: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  exec "$NATIVE" vault "$@"
+fi
 
 # Pick the venv python if present, else system python3.
 PYBIN="$ROOT/.venv/bin/python"

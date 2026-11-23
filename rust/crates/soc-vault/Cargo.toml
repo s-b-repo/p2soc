@@ -21,6 +21,7 @@ backup = ["dep:aes-gcm", "dep:scrypt", "dep:tar", "dep:flate2"]
 
 [dependencies]
 soc-core.workspace = true
+soc-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true

@@ -16,6 +16,17 @@ else
 fi
 [ -d "$ROOT/kiosk-host" ] || { echo "launcher.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
+if [ -r "$ROOT/scripts/soc-native.sh" ]; then
+  . "$ROOT/scripts/soc-native.sh"
+  if NATIVE="$(soc_native_path "$ROOT")"; then
+    export SOC_ROOT="$ROOT" MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+    if [ "${SOC_NO_JOURNAL:-0}" != "1" ] && command -v systemd-cat >/dev/null 2>&1; then
+      exec > >(systemd-cat -t soc-kiosk) 2>&1
+    fi
+    exec "$NATIVE" with-env supervise
+  fi
+fi
+
 # Resolve which soc.env / panels.yaml the wall reads through the SAME resolver the
 # wizard writes with (host.configpaths), so the shell and Python can never drift.
 # PYBIN/PYTHONPATH are needed for the module import — set them early.

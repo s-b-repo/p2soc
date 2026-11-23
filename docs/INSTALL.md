@@ -27,7 +27,7 @@ Package install is automatic on:
 
 Any other distro: install the dependencies from the package lists in
 `install.sh` by hand, then run with **`SOC_SKIP_PACKAGES=1`** — everything else
-(deploy, venv, config, services) is distro-agnostic.
+(deploy, config, services) is distro-agnostic.
 
 - **CPU**: 64-bit ARM (`aarch64`, e.g. Pi 5) and x86-64 are both first-class; the
   installer detects the arch and warns on 32-bit ARM (WebKitGTK is heavy there).
@@ -55,6 +55,10 @@ cd p2soc
 sudo ./install.sh
 ```
 
+For a source install, put Rust 1.87 or newer on the build user's PATH. The
+installer can build the executable when Cargo is available to root. You can
+also run `make rust-release` first or use a published package.
+
 Knobs (env vars):
 
 | Var | Default | Meaning |
@@ -69,7 +73,7 @@ Knobs (env vars):
 | `SOC_SKIP_PACKAGES` | `0` | `1` to skip all OS-package installs (deps already present / unknown distro) |
 
 The installer is **idempotent** — safe to re-run. It installs deps, creates the
-users, deploys to `/opt/soc-display`, builds the venv, lays down
+users, deploys the Rust binary to `/opt/soc-display/bin/soc-wall`, lays down
 `/etc/soc-display`, installs the systemd units (or prints the manual equivalents
 without systemd), configures zram, generates the 2×2 layout, and installs the
 "SOC Wall" menu launcher. In **kiosk** mode it additionally enables tty1
@@ -78,7 +82,7 @@ autologin and sets `multi-user.target` as the default; in the default
 written to `soc.env` as `SOC_SESSION` and can be changed there any time.
 
 The installer records every file it lays down and every system change it makes
-in a manifest at `/etc/soc-display/install-manifest` — that is what
+in a manifest at `/etc/soc-display/.install-manifest` — that is what
 [`uninstall.sh`](#uninstall) replays to revert cleanly.
 
 ### Launching the wall (desktop mode)
@@ -91,23 +95,24 @@ way with `/opt/soc-display/scripts/soc-wall-desktop.sh`. Close the windows to
 stop the wall; it leaves your desktop session as it was.
 
 > Easiest path: after the installer, run the guided wizard
-> `python3 /opt/soc-display/setup.py` to write `panels.yaml`, `soc.env`, and
-> the config interactively (Vaultwarden's own config is in its systemd unit).
+> `sudo /opt/soc-display/bin/soc-wall setup deploy` to configure the wall and vault.
+> On a desktop, **Setup** offers a per-user configuration and an administrator
+> authorization prompt for saving system-wide on an installed host.
 
 ## 3. Configure (the installer prints this list)
 
 1. **`/etc/soc-display/panels.yaml`** — your 4 panels: IPs/ports, **selectors**,
    `vault_item` names, and any `tunnel`. See [CONFIGURATION.md](CONFIGURATION.md).
 2. **`/etc/soc-display/soc.env`** — `SOC_VAULT_EMAIL`, `SOC_VAULT_URL`,
-   `SOC_SECRET_DIR`, `SOC_CONFIG_VAULT_ITEM` (**non-secret**; `chmod 0640`). The
+   `SOC_SECRET_DIR`, `SOC_CONFIG_VAULT_ITEM` (**non-secret**; `chmod 0644`). The
    master password is sealed separately — see step 4b.
 3. **Vaultwarden** — config is inline in its systemd unit (no `.env`); `/admin` off.
 
 ## 4. Create the vault + add logins
 
-`sudo python3 setup.py deploy` does this for you: it creates the account, then stores
+`sudo /opt/soc-display/bin/soc-wall setup deploy` creates the account, then stores
 each panel's login under its `vault_item` name, and `vpn.vault_item` too if you enabled
-a VPN. To add or change a login later, run `python3 setup.py creds`.
+a VPN. To add or change a login later, run `/opt/soc-display/bin/soc-wall setup creds`.
 
 Native Vaultwarden runs without its web interface: the binary is installed alone, and
 the kiosk has no use for that surface. Signups stay off except for the moment `deploy`
@@ -116,15 +121,15 @@ creates the account.
 ## 4b. Seal the master password (no plaintext .env)
 
 ```bash
-sudo python3 setup.py first-run
+sudo /opt/soc-display/bin/soc-wall setup first-run
 ```
 
 Generates a **one-time PIN** and seals the vault master password host-bound under
-`/etc/soc-display/secret/` (AES-256-GCM, key = scrypt(machine-id + PIN)); the
-default `litebw` backend (and the legacy `rbw` via `pinentry-vault.py`) unseal it
+`/etc/soc-display/secret/` (AES-256-GCM with the private host key, machine ID and PIN); the
+default `litebw` backend (and the legacy `rbw` via `pinentry-vault.sh`) unseal it
 in memory. Record the PIN — you need it only to re-seal
 (re-deploy, new hardware, or changing the password). The wall then self-unlocks at
-boot with no prompt and no secret in any `.env`. (`setup.py deploy` runs this as
+boot with no prompt and no secret in any `.env`. (`soc-wall setup deploy` runs this as
 part of the whole flow.) See [SECURITY.md](SECURITY.md).
 
 ## 5. Tunnel key (if any panel uses `mode: tunnel`)
@@ -140,17 +145,16 @@ Set the `vpn` section of `panels.yaml` (gateway, `vault_item`, and ideally
 installer enables `forti-vpn.service` automatically when `vpn.enabled` has a
 gateway. The service runs a **supervisor** that classifies openfortivpn's output,
 reconnects with backoff, and holds for ~5 min on an auth failure (so a bad
-password can't lock the FortiGate account). On first start it registers root's
-`rbw` to the kiosk account, unlocking via the same host-bound sealed secret +
-`pinentry-vault.py` as the kiosk host (no plaintext password). Check it:
+password can't lock the FortiGate account). It reads the login from Vaultwarden
+and supplies the password through pinentry. Check it:
 
 ```bash
 sudo systemctl status forti-vpn    # the STATUS= line shows the live state
 journalctl -u forti-vpn -f         # classified events: "Tunnel is up", auth/cert errors
 ```
 
-(No systemd? Run `sudo /opt/soc-display/.venv/bin/python
-/opt/soc-display/scripts/forti-vpn-connect.py` under your init — it self-supervises.)
+(No systemd? Run `sudo /opt/soc-display/scripts/forti-vpn.sh` under your init.
+It supervises its VPN clients.)
 
 ## 5c. Proxy (if `proxy.enabled`)
 
@@ -168,7 +172,7 @@ size directly. Just plug in any HDMI monitor.
 
 ## 7. Start it
 
-`setup.py deploy` starts the wall when it finishes, so there is nothing to do here.
+`soc-wall setup deploy` starts the wall on a kiosk installation.
 To run the steps by hand instead, finish with a reboot:
 
 ```bash
@@ -233,8 +237,9 @@ the box — sealed vault credentials are gone after a purge.
 
 ## Verifying a change
 
-After editing `panels.yaml`, restart the host without rebooting:
+After editing `panels.yaml`, choose **Restart wall** in Settings or restart the
+service that owns the kiosk session. For a tty1 installation:
 
 ```bash
-sudo pkill -f host.main      # launcher.sh restarts it automatically
+sudo systemctl restart getty@tty1.service
 ```

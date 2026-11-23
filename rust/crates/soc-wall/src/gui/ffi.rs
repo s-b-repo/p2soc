@@ -11,10 +11,100 @@
 #![allow(unsafe_code)] // audit-allow: irreducible FFI — gtk-rs exposes no safe wrapper, see SAFETY
 
 use glib::translate::{ToGlibPtr, ToGlibPtrMut, from_glib_full};
+use gtk::prelude::*;
 use std::ffi::{CString, c_void};
 use std::path::Path;
 use webkit2gtk::ffi as wk;
 use webkit2gtk::{AuthenticationRequest, Credential, UserContentManager};
+
+/// Optional GTK 3 system tray. StatusNotifier support is loaded at runtime
+/// because an appliance without a desktop has no use for the library.
+pub struct TrayIcon {
+    obj: glib::Object,
+    indicator: bool,
+}
+
+impl TrayIcon {
+    pub fn new(menu: &gtk::Menu, show: impl Fn() + 'static) -> Option<Self> {
+        if let Some(obj) = app_indicator(menu) {
+            return Some(Self { obj, indicator: true });
+        }
+        // SAFETY: GTK is initialized on this thread and returns an owned
+        // GtkStatusIcon GObject for a static NUL-terminated icon name.
+        let raw = unsafe { gtk::ffi::gtk_status_icon_new_from_icon_name(c"video-display".as_ptr()) }; // audit-allow: GTK status icon has no safe wrapper, see SAFETY
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is a non-null, owned GtkStatusIcon, a GObject.
+        let obj: glib::Object = unsafe { from_glib_full(raw.cast::<glib::gobject_ffi::GObject>()) }; // audit-allow: GTK status icon has no safe wrapper, see SAFETY
+        obj.set_property("title", "SOC Wall");
+        obj.set_property("tooltip-text", "SOC Wall");
+        obj.set_property("visible", true);
+        obj.connect_local("activate", false, move |_| {
+            show();
+            None
+        });
+        let menu = menu.clone();
+        obj.connect_local("popup-menu", false, move |_| {
+            menu.popup_at_pointer(None);
+            None
+        });
+        Some(Self { obj, indicator: false })
+    }
+
+    pub fn available(&self) -> bool {
+        let name = if self.indicator { "connected" } else { "embedded" };
+        self.obj.find_property(name).is_some() && self.obj.property(name)
+    }
+}
+
+fn app_indicator(menu: &gtk::Menu) -> Option<glib::Object> {
+    type New =
+        unsafe extern "C" fn(*const libc::c_char, *const libc::c_char, libc::c_int) -> *mut glib::gobject_ffi::GObject; // audit-allow: appindicator has no safe wrapper, see SAFETY below
+    type SetMenu = unsafe extern "C" fn(*mut glib::gobject_ffi::GObject, *mut gtk::ffi::GtkMenu); // audit-allow: appindicator has no safe wrapper, see SAFETY below
+    type SetStatus = unsafe extern "C" fn(*mut glib::gobject_ffi::GObject, libc::c_int); // audit-allow: appindicator has no safe wrapper, see SAFETY below
+    for library in [c"libayatana-appindicator3.so.1", c"libappindicator3.so.1"] {
+        // SAFETY: load the GTK 3 indicator ABI from a fixed system soname.
+        // Do not unload successful libraries: the constructors register a GType.
+        let handle = unsafe { libc::dlopen(library.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) }; // audit-allow: optional desktop library, see SAFETY
+        if handle.is_null() {
+            continue;
+        }
+        // SAFETY: `handle` is live. These are the three exported API functions
+        // from app-indicator.h, cast to their matching C signatures below.
+        let (ctor, set_menu, set_status) = unsafe {
+            // audit-allow: optional desktop library, see SAFETY
+            (
+                libc::dlsym(handle, c"app_indicator_new".as_ptr()),
+                libc::dlsym(handle, c"app_indicator_set_menu".as_ptr()),
+                libc::dlsym(handle, c"app_indicator_set_status".as_ptr()),
+            )
+        };
+        if ctor.is_null() || set_menu.is_null() || set_status.is_null() {
+            // SAFETY: no API function was called, so this handle is unused.
+            unsafe { libc::dlclose(handle) }; // audit-allow: optional desktop library, see SAFETY
+            continue;
+        }
+        // SAFETY: dlsym returned non-null functions with the declared ABI.
+        // Both strings are static and the menu is a live GtkMenu. The category
+        // and status integers are APPLICATION_STATUS and ACTIVE respectively.
+        let obj = unsafe {
+            // audit-allow: optional desktop library, see SAFETY
+            let ctor: New = std::mem::transmute(ctor); // audit-allow: matching C signature, see SAFETY above
+            let set_menu: SetMenu = std::mem::transmute(set_menu); // audit-allow: matching C signature, see SAFETY above
+            let set_status: SetStatus = std::mem::transmute(set_status); // audit-allow: matching C signature, see SAFETY above
+            let obj = ctor(c"soc-wall".as_ptr(), c"video-display".as_ptr(), 0);
+            if obj.is_null() {
+                continue;
+            }
+            set_menu(obj, menu.to_glib_none().0);
+            set_status(obj, 1);
+            from_glib_full::<_, glib::Object>(obj)
+        };
+        return Some(obj);
+    }
+    None
+}
 
 /// A compiled rule list, reference-counted by WebKit.
 pub struct Filter(std::ptr::NonNull<wk::WebKitUserContentFilter>);

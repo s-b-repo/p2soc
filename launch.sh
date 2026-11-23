@@ -2,21 +2,11 @@
 # =============================================================================
 # launch.sh — first-time bring-up + launch of the SOC video wall.
 #
-# One command from a fresh checkout to a running wall. Idempotent: it sets up
-# only what is missing (Python venv, dev vault), then launches. Safe to re-run.
-#
-#   ./launch.sh              # DEV: set up + show the wall in a window (Xephyr),
-#                            #      or the headless check if there is no display
-#   ./launch.sh --headless   # DEV: set up + headless end-to-end check (Xvfb + screenshot)
-#   ./launch.sh --setup      # run the guided setup.py menu, then exit (no launch)
-#   ./launch.sh --pi         # PRODUCTION: hand off to `sudo python3 setup.py deploy`
-#                            #      (OS install -> configure -> seal PIN -> creds -> doctor)
-#   ./launch.sh --help
-#
-# Dev uses the bundled dummy panels + the JSON "dev" vault backend, so it runs
-# with no Vaultwarden and no root. To use a real Vaultwarden vault in dev, run:
-# SOC_VAULT_BACKEND=litebw ./launch.sh   (litebw is pure-Python; the legacy rbw
-# also works if configured). For a real install, use --pi.
+#   ./launch.sh              Open the wall in a desktop window.
+#   ./launch.sh --headless   Run the WebKit and Settings smoke tests in Xvfb.
+#   ./launch.sh --setup      Open the terminal setup menu.
+#   ./launch.sh --pi         Install the wall and open the configuration wizard.
+#   ./launch.sh --help       Show these commands.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -28,13 +18,40 @@ for a in "$@"; do
     --headless)               MODE="headless" ;;
     --setup)                  MODE="setup" ;;
     --pi|--prod|--production)  MODE="pi" ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '5,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
   esac
 done
 
 log(){  printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn(){ printf '\033[33m!!\033[0m %s\n' "$*"; }
+
+. "$ROOT/scripts/soc-native.sh"
+if [ "${SOC_LEGACY_PYTHON:-0}" != 1 ]; then
+  if ! NATIVE="$(soc_native_path "$ROOT")"; then
+    log "Building the native SOC Wall"
+    make rust-release
+    NATIVE="$(soc_native_path "$ROOT")"
+  fi
+  export SOC_ROOT="$ROOT"
+  case "$MODE" in
+    pi)
+      if [ "$(id -u)" -eq 0 ]; then
+        exec "$NATIVE" setup install --target pi
+      fi
+      exec sudo "$NATIVE" setup install --target pi ;;
+    setup) exec "$NATIVE" setup ;;
+  esac
+  if [ "$MODE" = headless ] || { [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; }; then
+    if [ -d "$ROOT/rust/crates/soc-wall/tests" ]; then
+      exec xvfb-run -a cargo test --manifest-path rust/Cargo.toml --locked -p soc-wall --test gui_smoke --test settings_smoke
+    fi
+    exec "$NATIVE" check "$ROOT/config/panels.yaml"
+  fi
+  export SOC_VAULT_BACKEND="${SOC_VAULT_BACKEND:-dev}" SOC_WINDOW_MODE=window
+  export SOC_PANELS_FILE="${SOC_PANELS_FILE:-$ROOT/config/presets/empty.yaml}"
+  exec "$NATIVE" with-env run
+fi
 
 # ---- production: delegate to the full deploy flow --------------------------
 if [ "$MODE" = "pi" ]; then

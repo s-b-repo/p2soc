@@ -31,6 +31,7 @@ pub mod sha256;
 pub mod sysaction;
 pub mod tarpit;
 pub mod tunnel;
+pub mod update;
 pub mod watchdog;
 pub mod wmrules;
 

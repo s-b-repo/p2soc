@@ -16,6 +16,12 @@ SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
 ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)}"
 [ -d "$ROOT/kiosk-host" ] || { echo "soc-wall-credentials: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  APP=("$NATIVE" with-env credentials)
+  SHOW_ERROR=("$NATIVE" guierror)
+fi
+
 # Cap GLib/GTK per-thread malloc arenas (default 8*ncpu) — the single biggest RSS
 # cut on the 1GB Pi (same rationale as launcher.sh). Trim the GTK runtime too.
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
@@ -37,7 +43,9 @@ if [ "$HEADLESS" -eq 0 ]; then
 fi
 
 # Load the (non-secret) env if present (non-secret knobs). Absent in dev checkouts.
-if [ -r "$ENV_FILE" ]; then
+if [ -n "${NATIVE:-}" ]; then
+  :
+elif [ -r "$ENV_FILE" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
@@ -59,14 +67,18 @@ fi
 export SOC_ROOT="$ROOT"
 export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
 
-PYBIN="$ROOT/.venv/bin/python"
-[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+if [ -z "${NATIVE:-}" ]; then
+  PYBIN="$ROOT/.venv/bin/python"
+  [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+  APP=("$PYBIN" -m host.configcenter)
+  SHOW_ERROR=("$PYBIN" -m host.guierror)
+fi
 
 cd "$ROOT" 2>/dev/null || true
 
 # Headless / discovery runs (CI): let output flow and exec.
 if [ "$HEADLESS" -eq 1 ]; then
-  exec "$PYBIN" -m host.configcenter "$@"
+  exec "${APP[@]}" "$@"
 fi
 
 # GUI run: don't exec — a clickable .desktop launch discards stderr, so surface a
@@ -77,7 +89,7 @@ ERRLOG="$(mktemp 2>/dev/null || echo "/tmp/soc-wall-credentials.$$.log")"
 # Single-quoted so $ERRLOG expands at trap-fire time. (Same idiom as dev/run-wall.sh.)
 trap 'rm -f "$ERRLOG" 2>/dev/null' EXIT INT TERM
 set +e
-"$PYBIN" -m host.configcenter "$@" 2>"$ERRLOG"
+SOC_RETURN_TO_MENU=0 "${APP[@]}" "$@" 2>"$ERRLOG"
 rc=$?
 set -e
 
@@ -85,7 +97,7 @@ if [ "$rc" -ne 0 ]; then
   cat "$ERRLOG" >&2 2>/dev/null || true
   detail="$(tail -n 15 "$ERRLOG" 2>/dev/null)"
   [ -n "$detail" ] || detail="The credentials center exited with status $rc and produced no message."
-  "$PYBIN" -m host.guierror "SOC Wall credentials couldn't start (exit $rc)" "$detail" 2>/dev/null || true
+  "${SHOW_ERROR[@]}" "SOC Wall credentials couldn't start (exit $rc)" "$detail" 2>/dev/null || true
   rm -f "$ERRLOG" 2>/dev/null || true
   exit "$rc"
 fi

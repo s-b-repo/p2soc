@@ -6,6 +6,7 @@
 //! argv (never a shell), no stdin, bounded output and a hard timeout.
 
 use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -62,12 +63,22 @@ impl Runner for SystemRunner {
     fn run(&self, argv: &[String], timeout: Duration) -> io::Result<Output> {
         let (program, args) =
             argv.split_first().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut command = Command::new(program);
+        command.args(args).stdin(Stdio::null());
+        self.run_command(&mut command, timeout)
+    }
+}
+
+impl SystemRunner {
+    /// Run a command with caller-selected stdin, environment and working directory.
+    pub fn run_command(&self, command: &mut Command, timeout: Duration) -> io::Result<Output> {
+        self.run_with_stdout(command, Stdio::piped(), timeout)
+    }
+
+    /// Stream binary stdout directly to a caller-owned file.
+    pub fn run_with_stdout(&self, command: &mut Command, stdout: Stdio, timeout: Duration) -> io::Result<Output> {
+        let program = command.get_program().to_string_lossy().into_owned();
+        let mut child = command.process_group(0).stdout(stdout).stderr(Stdio::piped()).spawn()?;
         let out = child.stdout.take().map(drain);
         let err = child.stderr.take().map(drain);
         let deadline = Instant::now() + timeout;
@@ -76,6 +87,9 @@ impl Runner for SystemRunner {
                 break status;
             }
             if Instant::now() >= deadline {
+                if let Some(group) = i32::try_from(child.id()).ok().and_then(rustix::process::Pid::from_raw) {
+                    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL); // audit-allow: best-effort shutdown of command and its descendants
+                }
                 let _ = child.kill(); // audit-allow: best-effort, the child may already be gone
                 let _ = child.wait(); // audit-allow: best-effort reap after kill
                 return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{program} timed out")));

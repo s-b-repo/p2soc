@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 soc-core.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 # Safe wrappers for the syscalls the system tools need, so the crate carries

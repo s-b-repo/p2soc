@@ -184,7 +184,10 @@ def test_nfpm_ships_only_files_that_exist():
     missing = []
     for entry in doc["contents"]:
         src = entry.get("src")
-        if src and "*" not in src and not os.path.exists(os.path.join(_REPO, src)):
+        if src == "./native/soc-wall" and entry.get("dst") == "/opt/soc-display/bin/soc-wall":
+            # release.yml provides a different native artifact per architecture.
+            assert 'install -m 0755 "$binary" native/soc-wall' in read(".github/workflows/release.yml")
+        elif src and "*" not in src and entry.get("type") != "symlink" and not os.path.exists(os.path.join(_REPO, src)):
             missing.append(src)
     assert not missing
 
@@ -392,11 +395,14 @@ def test_timer_is_calendar_based_so_a_failed_run_cannot_stop_updates():
     assert not any(ln.startswith("OnUnitActiveSec") for ln in lines)
 
 
-def test_updater_runs_on_the_system_python_not_the_venv():
+def test_updater_runs_independently_of_the_venv():
     """A release that breaks the venv must not also break what recovers from it."""
     exec_line = next(ln for ln in read("systemd/soc-update.service").splitlines()
                      if ln.startswith("ExecStart="))
-    assert exec_line.startswith("ExecStart=/usr/bin/python3 ")
+    assert exec_line == "ExecStart=/opt/soc-display/scripts/soc-update.sh run"
+    wrapper = read("scripts/soc-update.sh")
+    assert 'exec "$NATIVE" update "$@"' in wrapper
+    assert '.venv' not in wrapper
     assert ".venv" not in exec_line
 
 

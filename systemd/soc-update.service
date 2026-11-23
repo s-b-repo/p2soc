@@ -6,9 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# The system python, deliberately: a release that breaks the venv must not also
-# break the thing that recovers from it.
-ExecStart=/usr/bin/python3 /opt/soc-display/scripts/soc-update.py run
+ExecStart=/opt/soc-display/scripts/soc-update.sh run
 # Long enough for a dependency change plus the health wait.
 TimeoutStartSec=45min
 # Stay out of the wall's way on a 1 GB board: it must never starve the panels.

@@ -159,7 +159,7 @@ pub fn log_repeat(n: u64) -> bool {
 /// lives on the SD card and a panel that stays down retries for as long as it
 /// takes: tell the story of the first few, then one line in `every`.
 pub fn log_repeat_with(n: u64, first: u64, every: u64) -> bool {
-    n <= first || (every != 0 && n % every == 0)
+    n <= first || (every != 0 && n.is_multiple_of(every))
 }
 
 /// True when available memory is known and below the floor.

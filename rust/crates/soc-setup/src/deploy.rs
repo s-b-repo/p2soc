@@ -8,7 +8,7 @@
 
 use crate::check::Report;
 use crate::config::{render_panels_yaml, vault_items};
-use crate::doctor::{Doctor, DoctorInputs, is_real_vault};
+use crate::doctor::{Doctor, DoctorInputs, is_real_vault, kiosk_user};
 use crate::envfile::{SocEnv, load_env_file, render_soc_env};
 use crate::error::TextResult;
 use crate::host::Host;
@@ -17,7 +17,7 @@ use crate::seal::{SealRequest, already_sealed, seal_master};
 use crate::step::StepResult;
 use crate::unit::{UnitOpts, render_wall_unit};
 use crate::vault::{Creds, LoginJob, ensure_account, push_config_to_vault, write_logins};
-use soc_core::Config;
+use soc_core::{Config, DictExt, Mode};
 use soc_seal::MasterSource;
 use soc_sys::paths::PathEnv;
 use soc_sys::run::argv;
@@ -108,6 +108,8 @@ pub struct DeployPlan {
     pub seed: bool,
     pub soc_env: SocEnv,
     pub cfg: Config,
+    /// An explicitly supplied, validated YAML document. Preserve its comments and keys.
+    pub config_source: Option<String>,
     /// Render and write `soc.env` / the unit (and `panels.yaml` unless
     /// `keep_panels`). Off when the files were installed by other means.
     pub write_config: bool,
@@ -145,6 +147,7 @@ impl DeployPlan {
             seed: true,
             soc_env,
             cfg,
+            config_source: None,
             write_config: false,
             keep_panels: false,
             check_venv: false,
@@ -333,10 +336,38 @@ impl DeployPlan {
                 Ok(()) if self.dry_run => {
                     StepResult::ok(format!("would mark configured: {}", self.paths.configured_marker.display()))
                 }
-                Ok(()) => StepResult::changed(format!("marked configured: {}", self.paths.configured_marker.display())),
+                Ok(()) => {
+                    let mut result =
+                        StepResult::changed(format!("marked configured: {}", self.paths.configured_marker.display()));
+                    self.sync_network_units(host, &mut result);
+                    result
+                }
                 Err(e) => StepResult::failed(e.to_string()),
             },
             DeployStep::Activate => self.activate(host),
+        }
+    }
+
+    fn sync_network_units(&self, host: &Host<'_>, result: &mut StepResult) {
+        if self.target != Target::Pi
+            || self.paths.via == "user"
+            || !host.probe.is_root()
+            || !host.probe.systemd_running()
+            || !self.installed(host)
+        {
+            return;
+        }
+        let tunnel = self.cfg.tunnel.flag("enabled", true) && self.cfg.panels.iter().any(|p| p.mode == Mode::Tunnel);
+        let vpn = self.cfg.enabled_vpns().any(|v| !soc_vpn::vpn_incomplete(v));
+        for (unit, enabled) in [("autossh-tunnel.service", tunnel), ("forti-vpn.service", vpn)] {
+            let verb = if enabled { "enable" } else { "disable" };
+            let cmd = argv(&["systemctl", "--no-block", verb, "--now", unit]);
+            match host.runner.run(&cmd, CMD) {
+                Ok(output) if output.success() => {}
+                Ok(output) => result.lines.push(format!("Could not {verb} {unit}: {}", output.stderr.trim())),
+                Err(error) => result.lines.push(format!("Could not {verb} {unit}: {error}")),
+            }
+            result.cmds.push(cmd);
         }
     }
 
@@ -361,6 +392,9 @@ impl DeployPlan {
         match host.runner.run(&cmd, INSTALL_TIMEOUT) {
             Ok(o) if o.success() => {
                 st.install_changed = true;
+                let mut installed = load_env_file(&self.paths.soc_env);
+                installed.append(&mut st.soc_env);
+                st.soc_env = installed;
                 StepResult::changed("OS packages + units installed").with_cmds(vec![cmd])
             }
             Ok(o) => StepResult::failed(format!(
@@ -373,6 +407,11 @@ impl DeployPlan {
     }
 
     fn write_config_step(&self, st: &mut DeployState) -> StepResult {
+        let mut env = st.soc_env.clone();
+        env.extend(self.soc_env.clone());
+        if self.unattended {
+            env.insert("SOC_UNATTENDED".to_string(), "1".to_string());
+        }
         let mut res = StepResult::ok(format!("config written to {}", self.paths.panels_out.display()));
         let write = |path: &std::path::Path, text: &str, mode: u32, res: &mut StepResult| -> TextResult<()> {
             if self.dry_run {
@@ -385,12 +424,16 @@ impl DeployPlan {
         };
         let outcome = (|| {
             if !self.keep_panels {
-                write(&self.paths.panels_out, &render_panels_yaml(&self.cfg), self.paths.panels_mode, &mut res)?;
+                let panels = self.config_source.clone().unwrap_or_else(|| render_panels_yaml(&self.cfg));
+                write(&self.paths.panels_out, &panels, self.paths.panels_mode, &mut res)?;
             }
-            write(&self.paths.soc_env, &render_soc_env(&self.soc_env), self.paths.env_mode, &mut res)?;
+            write(&self.paths.soc_env, &render_soc_env(&env), self.paths.env_mode, &mut res)?;
             if let Some(unit) = &self.paths.wall_unit {
-                let opts = UnitOpts { user: self.user.clone(), soc_root: self.paths.soc_root.display().to_string() };
-                write(unit, &render_wall_unit(&self.soc_env, &opts), 0o644, &mut res)?;
+                let opts = UnitOpts {
+                    user: kiosk_user(&env, Some(&self.user)),
+                    soc_root: self.paths.soc_root.display().to_string(),
+                };
+                write(unit, &render_wall_unit(&env, &opts), 0o644, &mut res)?;
             }
             drop_marker(&self.paths, self.dry_run).map_err(|e| e.to_string())?;
             Ok::<(), String>(())
@@ -400,7 +443,7 @@ impl DeployPlan {
         }
         if !self.dry_run {
             res.changed = true;
-            st.soc_env = self.soc_env.clone();
+            st.soc_env = env;
         }
         res
     }
@@ -410,9 +453,19 @@ impl DeployPlan {
         if !self.is_vault() {
             return StepResult::ok("dev vault backend; no Vaultwarden server needed");
         }
+        if !crate::host::is_local_vault(url) {
+            return if self.dry_run || host.probe.alive(url) {
+                StepResult::ok(format!("using external Vaultwarden at {url}"))
+            } else {
+                StepResult::failed(format!("external Vaultwarden is not responding at {url}/alive"))
+            };
+        }
         if self.dry_run {
             return StepResult::ok(format!("would start Vaultwarden ({url})"))
                 .with_cmds(vec![self.sudo(host, argv(&["systemctl", "start", "vaultwarden"]))]);
+        }
+        if host.probe.alive(url) {
+            return StepResult::ok(format!("Vaultwarden answering at {url}"));
         }
         if !host.probe.systemd_running() {
             return StepResult::ok("no systemd — start Vaultwarden via your init manager");
@@ -508,12 +561,20 @@ impl DeployPlan {
         if dm == "active" {
             // A running desktop holds the display: only a reboot hands it over cleanly.
             let cmd = argv(&["shutdown", "-r", "+1", "SOC wall: rebooting into the kiosk"]);
-            let _ = host.runner.run(&cmd, CMD); // audit-allow: the outcome is reported through the detail line
-            return StepResult::changed("rebooting in 1 minute to hand the display to the wall").with_cmds(vec![cmd]);
+            return match host.runner.run(&cmd, CMD) {
+                Ok(result) if result.success() => {
+                    StepResult::changed("rebooting in 1 minute to hand the display to the wall")
+                }
+                _ => StepResult::failed("could not schedule the reboot to start the wall"),
+            }
+            .with_cmds(vec![cmd]);
         }
         let cmd = argv(&["systemctl", "restart", "getty@tty1.service"]);
-        let _ = host.runner.run(&cmd, CMD); // audit-allow: the outcome is reported through the detail line
-        StepResult::changed("wall starting on tty1").with_cmds(vec![cmd])
+        match host.runner.run(&cmd, CMD) {
+            Ok(result) if result.success() => StepResult::changed("wall starting on tty1"),
+            _ => StepResult::failed("could not restart tty1 to start the wall"),
+        }
+        .with_cmds(vec![cmd])
     }
 
     /// Run the whole plan, reporting each step as it finishes. Stops at the

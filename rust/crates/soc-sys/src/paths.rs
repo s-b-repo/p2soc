@@ -185,7 +185,7 @@ fn discover_root() -> Option<PathBuf> {
     exe.ancestors()
         .skip(1)
         .take(6)
-        .find(|d| d.join("config").join(PANELS_BASENAME).is_file() && d.join("rust").is_dir())
+        .find(|d| d.join("config").join(PANELS_BASENAME).is_file() && d.join("install.sh").is_file())
         .map(Path::to_path_buf)
 }
 

@@ -41,13 +41,12 @@ pub fn parse_env_file(text: &str) -> Vec<(String, String)> {
             continue;
         }
         let value = value.trim();
-        let unquoted = [('"', '"'), ('\'', '\'')]
-            .into_iter()
-            .find_map(|(open, close)| value.strip_prefix(open).and_then(|v| v.strip_suffix(close)));
-        let value = match unquoted {
-            Some(inner) => inner.to_string(),
-            // Unquoted: an inline ` # comment` ends the value.
-            None => value.split(" #").next().unwrap_or("").trim_end().to_string(),
+        let value = if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+            inner.replace("'\\''", "'")
+        } else if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            inner.to_string()
+        } else {
+            value.split(" #").next().unwrap_or("").trim_end().to_string()
         };
         if value.contains('\0') {
             continue;
@@ -209,9 +208,9 @@ fn run_once(
         }
     };
     let mut watch = BeatWatch::default();
+    let mut last_check = Instant::now();
     loop {
-        let tick_start = Instant::now();
-        sleep_unless(stop, policy.tick);
+        sleep_unless(stop, policy.tick.min(Duration::from_millis(200)));
         if stop.load(Ordering::Relaxed) {
             stop_child(&mut child);
             return None;
@@ -224,10 +223,14 @@ fn run_once(
                 return Some(1);
             }
         }
-        if watch.tick(mtime(heartbeat), tick_start.elapsed(), policy) {
-            log(&format!("wall {} silent for too long (main loop hung?); killing it", child.id()));
-            stop_child(&mut child);
-            return Some(1);
+        let elapsed = last_check.elapsed();
+        if elapsed >= policy.tick {
+            last_check = Instant::now();
+            if watch.tick(mtime(heartbeat), elapsed, policy) {
+                log(&format!("wall {} silent for too long (main loop hung?); killing it", child.id()));
+                stop_child(&mut child);
+                return Some(1);
+            }
         }
     }
 }
@@ -271,9 +274,116 @@ pub fn supervise(
 
 /// Where the env file lives: `$SOC_ENV_FILE`, else the system default.
 pub fn env_file() -> PathBuf {
-    std::env::var_os("SOC_ENV_FILE")
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| PathBuf::from("/etc/soc-display/soc.env"), PathBuf::from)
+    let paths = soc_sys::paths::PathEnv::from_process();
+    paths.resolve_env().unwrap_or_else(|| paths.etc_dir().join(soc_sys::paths::ENV_BASENAME))
+}
+
+/// Start a second invocation with the resolved kiosk environment. Set the
+/// environment on the child so no process-global state is mutated by the app.
+pub fn with_env(args: &[String]) -> i32 {
+    use std::os::unix::process::CommandExt;
+    if args.is_empty() {
+        eprintln!("usage: soc-wall with-env <subcommand> [args]");
+        return 2;
+    }
+    let script = if args.first().is_some_and(|arg| arg == "--script") {
+        let Some(file) =
+            args.get(1).filter(|file| matches!(file.as_str(), "start-session.sh" | "wayland-session.sh" | "xinitrc"))
+        else {
+            eprintln!("soc-wall with-env: unknown session script");
+            return 2;
+        };
+        Some(soc_sys::paths::PathEnv::from_process().repo_root().join("scripts").join(file))
+    } else if args.first().is_some_and(|arg| arg == "with-env") {
+        return 2;
+    } else {
+        None
+    };
+    let path = env_file();
+    let contents = match soc_sys::fsutil::read_capped(&path, 1 << 20) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!("[soc-wall] could not read {}: {e}", path.display());
+            String::new()
+        }
+    };
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let mut cmd = if let Some(path) = script.as_ref() {
+                let mut cmd = Command::new(path);
+                cmd.args(&args[2..]).env("SOC_ENV_LOADED", "1");
+                cmd
+            } else {
+                let mut cmd = Command::new(exe);
+                cmd.args(args);
+                cmd
+            };
+            let kiosk_env = parse_env_file(&contents)
+                .into_iter()
+                .filter(|(key, _)| key != "SOC_ENV_LOADED" && (key.starts_with("SOC_") || key.starts_with("AUTOSSH_")));
+            cmd.envs(kiosk_env).env("SOC_ENV_FILE", path);
+            for key in [
+                "SOC_ROOT",
+                "SOC_PANELS_FILE",
+                "SOC_WINDOW_MODE",
+                "SOC_WINDOWED",
+                "SOC_LAYOUT",
+                "SOC_WAYLAND_BACKEND",
+                "SOC_RETURN_TO_MENU",
+                "SOC_VAULT_BACKEND",
+            ] {
+                if let Some(value) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+                    cmd.env(key, value);
+                }
+            }
+            let err = cmd.exec();
+            eprintln!("[soc-wall] could not start {}: {err}", args[0]);
+        }
+        Err(err) => eprintln!("[soc-wall] could not locate executable: {err}"),
+    }
+    1
+}
+
+pub fn run_supervised() -> i32 {
+    use std::os::unix::process::CommandExt;
+    let log = |msg: &str| eprintln!("[soc-wall] {msg}");
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            log(&format!("cannot locate the wall executable: {e}"));
+            return 1;
+        }
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT, signal_hook::consts::SIGHUP] {
+        if let Err(e) = signal_hook::flag::register(signal, stop.clone()) {
+            log(&format!("cannot register shutdown signal: {e}"));
+            return 1;
+        }
+    }
+    let heartbeat = soc_sys::heartbeat::path();
+    let backend = std::env::var("SOC_WAYLAND_BACKEND").ok();
+    let child = |force_x11| {
+        let mut cmd = Command::new(&exe);
+        cmd.arg("run").env("SOC_SUPERVISED", "1").env("SOC_HEARTBEAT_FILE", &heartbeat);
+        match (force_x11, backend.as_deref()) {
+            (true, _) | (_, Some("x11")) => {
+                cmd.env("GDK_BACKEND", "x11");
+            }
+            (_, Some("auto" | "wayland")) => {
+                cmd.env("GDK_BACKEND", "wayland");
+            }
+            _ => {}
+        }
+        cmd
+    };
+    let code = supervise(&child, &heartbeat, &Policy::from_env(), stop, &log);
+    if code == EXIT_OPERATOR {
+        let e = Command::new(&exe).arg("menu").exec();
+        log(&format!("cannot return to the menu: {e}"));
+    }
+    code
 }
 
 #[cfg(test)]
@@ -295,7 +405,7 @@ mod tests {
         let parsed = parse_env_file(
             "# comment\n\nSOC_VAULT_URL=http://127.0.0.1:8222\nexport SOC_VAULT_EMAIL=\"wall@example.com\"\n\
              SOC_ITEM='SOC Wall Config'\nSOC_N=5 # five\nEVIL=$(rm -rf /)\nBACKTICK=`id`\n1BAD=x\nnot an assignment\n\
-             SPACED = padded \nEMPTY=\n",
+             SPACED = padded \nEMPTY=\nQUOTE='it'\\''s'\n",
         );
         let get = |k: &str| parsed.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
         assert_eq!(get("SOC_VAULT_URL"), Some("http://127.0.0.1:8222"));
@@ -304,11 +414,12 @@ mod tests {
         assert_eq!(get("SOC_N"), Some("5"));
         assert_eq!(get("SPACED"), Some("padded"));
         assert_eq!(get("EMPTY"), Some(""));
+        assert_eq!(get("QUOTE"), Some("it's"));
         // Shell syntax is kept as literal text — never run.
         assert_eq!(get("EVIL"), Some("$(rm -rf /)"));
         assert_eq!(get("BACKTICK"), Some("`id`"));
         assert_eq!(get("1BAD"), None);
-        assert_eq!(parsed.len(), 8);
+        assert_eq!(parsed.len(), 9);
     }
 
     #[test]

@@ -21,13 +21,9 @@
 //! on argv. The one-time sealing PIN is shown exactly once, in its own panel,
 //! and cleared when the operator acknowledges it.
 //!
-//! Simplifications against `setupgui.py` (the Rust backend differs):
-//! no preset browser / appearance page (the appearance editor is its own tool),
-//! no vault connection test / login-form auto-detect / destructive vault reset
-//! (the `doctor` step and `soc-wall credcenter` cover them), no pkexec shell-out
-//! (the backend falls back to the per-user config dir when `/etc` is not
-//! writable), and `DeployPlan::Seal` is replaced by `FirstRunPlan` so the chosen
-//! master SOURCE is honoured (`DeployPlan` always seals `auto`).
+//! `FirstRunPlan` handles sealing so the selected master source is honored.
+
+mod privileged;
 
 use crate::style;
 use gtk::prelude::*;
@@ -71,17 +67,21 @@ const PAGES: [&str; 5] = ["panels", "vault", "network", "review", "run"];
 // --------------------------------------------------------------------------
 
 /// What the command line asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Opts {
     dry_run: bool,
     target: Option<Target>,
+    preset: Option<String>,
+    output: Option<std::path::PathBuf>,
+    list_presets: bool,
+    non_interactive: bool,
 }
 
 /// A command-line mistake.
 #[derive(Debug, PartialEq, Eq)]
 struct UsageError(String);
 
-const USAGE: &str = "usage: soc-wall setupwiz [--dry-run] [--target pi|dev]";
+const USAGE: &str = "usage: soc-wall setup-gui [--dry-run] [--target pi|dev] [--preset NAME]\n  --list-presets\n  --preset NAME --output DIR [--non-interactive]";
 
 /// `Ok(None)` means "print the usage and stop".
 fn parse_args(args: &[String]) -> Result<Option<Opts>, UsageError> {
@@ -91,6 +91,16 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, UsageError> {
         match a.as_str() {
             "-h" | "--help" => return Ok(None),
             "--dry-run" => opts.dry_run = true,
+            "--list-presets" => opts.list_presets = true,
+            "--non-interactive" => opts.non_interactive = true,
+            "--preset" => {
+                opts.preset = Some(it.next().ok_or_else(|| UsageError("--preset needs a name".into()))?.clone())
+            }
+            "--output" => {
+                opts.output = Some(it.next().ok_or_else(|| UsageError("--output needs a path".into()))?.into())
+            }
+            inline if inline.starts_with("--preset=") => opts.preset = Some(inline[9..].into()),
+            inline if inline.starts_with("--output=") => opts.output = Some(inline[9..].into()),
             "--target" => {
                 let v = it.next().ok_or_else(|| UsageError("--target needs pi or dev".into()))?;
                 opts.target =
@@ -472,7 +482,7 @@ fn seed(cfg: &Config, env: &SocEnv, paths: &SetupPaths, opts: &Opts) -> FormData
     let section = |k: &str| doc.get(k).and_then(Value::as_object).cloned().unwrap_or_else(Dict::new);
     let panel_docs: Vec<Value> = doc.get("panels").and_then(Value::as_array).cloned().unwrap_or_else(Vec::new);
     let d = &cfg.display;
-    let panels = if cfg.panels.is_empty() {
+    let panels = if cfg.panels.is_empty() && opts.preset.is_none() {
         vec![PanelForm::fresh(0, d.cols), PanelForm::fresh(1, d.cols)]
     } else {
         cfg.panels
@@ -607,7 +617,7 @@ enum Stage {
 /// already installed (the TTY `deploy` command owns install/activate).
 fn stages(v: &VaultForm) -> Vec<Stage> {
     let real = v.is_real();
-    let local = v.url.contains("127.0.0.1") || v.url.contains("localhost");
+    let local = soc_setup::host::is_local_vault(&v.url);
     let mut s = vec![Stage::Deploy(DeployStep::WriteConfig)];
     if real && local && v.target == Target::Pi {
         s.push(Stage::Deploy(DeployStep::VaultUp));
@@ -645,7 +655,41 @@ struct RunJob {
     stages: Vec<Stage>,
 }
 
+impl RunJob {
+    fn new(cfg: Config, penv: PathEnv, paths: SetupPaths, v: &VaultForm, creds: Creds) -> Self {
+        let mut existing = load_env_file(&paths.soc_env);
+        if !paths.soc_env.exists() && paths.via == "user" {
+            if let Some(system) = penv.resolve_env() {
+                existing = load_env_file(&system);
+                for key in ["SOC_ROOT", "SOC_PANELS_FILE", "SOC_SECRET_DIR", "SOC_INJECT_TMPL"] {
+                    existing.remove(key);
+                }
+            }
+        }
+        let env = build_env(&existing, &paths, v);
+        Self {
+            user: kiosk_user(&env, None),
+            creds,
+            stages: stages(v),
+            backend: v.backend.clone(),
+            email: v.email.trim().to_string(),
+            url: env.get("SOC_VAULT_URL").cloned().unwrap_or_else(|| DEFAULT_VAULT_URL.to_string()),
+            source: v.source,
+            master: Some(v.master.clone()).filter(|m| !m.is_empty()),
+            pin: Some(v.pin.trim().to_string()).filter(|p| !p.is_empty()),
+            reseal: v.reseal,
+            dry_run: v.dry_run,
+            target: v.target,
+            penv,
+            paths,
+            env,
+            cfg,
+        }
+    }
+}
+
 /// A finished step as shown in the log.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct StepLine {
     title: String,
     ok: bool,
@@ -654,6 +698,7 @@ struct StepLine {
 }
 
 /// Worker -> GTK thread.
+#[derive(serde::Serialize, serde::Deserialize)]
 enum Msg {
     Step(StepLine),
     /// The one-time PIN (real runs only).
@@ -667,7 +712,7 @@ fn send(tx: &mpsc::Sender<Msg>, m: Msg) -> bool {
 }
 
 /// Drive the backend plans, reporting every step. Runs off the GTK thread.
-fn execute(job: RunJob, tx: &mpsc::Sender<Msg>) -> bool {
+fn execute(job: RunJob, emit: impl Fn(Msg)) -> bool {
     let sys = SystemHost::from_env();
     let host = sys.host();
     let mut plan = DeployPlan::new(job.target, job.penv.clone(), job.paths.clone());
@@ -692,16 +737,16 @@ fn execute(job: RunJob, tx: &mpsc::Sender<Msg>) -> bool {
                 let p = planned.iter().find(|p| p.step == step);
                 let title = p.map_or_else(|| step.as_str().to_string(), |p| p.title.clone());
                 if let Some(p) = p.filter(|p| !p.needed) {
-                    send(
-                        tx,
-                        Msg::Step(StepLine {
-                            title, ok: true, detail: format!("skipped — {}", p.why), lines: vec![]
-                        }),
-                    );
+                    emit(Msg::Step(StepLine {
+                        title,
+                        ok: true,
+                        detail: format!("skipped — {}", p.why),
+                        lines: vec![],
+                    }));
                     continue;
                 }
                 let r = plan.run_step(step, &host, &mut st);
-                send(tx, Msg::Step(StepLine { title, ok: r.ok, detail: r.detail.clone(), lines: r.lines.clone() }));
+                emit(Msg::Step(StepLine { title, ok: r.ok, detail: r.detail.clone(), lines: r.lines.clone() }));
                 if !r.ok {
                     ok = false;
                     // A failed health check is reported but does not stop the marker.
@@ -730,10 +775,7 @@ fn execute(job: RunJob, tx: &mpsc::Sender<Msg>) -> bool {
                     } else {
                         r.detail.clone()
                     };
-                    send(
-                        tx,
-                        Msg::Step(StepLine { title: format!("seal: {}", step.as_str()), ok: r.ok, detail, lines }),
-                    );
+                    emit(Msg::Step(StepLine { title: format!("seal: {}", step.as_str()), ok: r.ok, detail, lines }));
                 });
                 pin = out.pin;
                 if !out.ok {
@@ -745,7 +787,7 @@ fn execute(job: RunJob, tx: &mpsc::Sender<Msg>) -> bool {
     }
     if !job.dry_run {
         if let Some(p) = pin {
-            send(tx, Msg::Pin(p));
+            emit(Msg::Pin(p));
         }
     }
     ok
@@ -1042,6 +1084,14 @@ impl<T: Clone + 'static> Editor<T> {
         self.flush();
         self.items.borrow().clone()
     }
+
+    fn replace(&self, items: Vec<T>) {
+        self.current.set(None);
+        let next = (!items.is_empty()).then_some(0);
+        *self.items.borrow_mut() = items;
+        self.rebuild();
+        self.focus(next);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -1055,7 +1105,7 @@ struct DisplayUi {
     cols: gtk::SpinButton,
     rows: gtk::SpinButton,
     gap: gtk::SpinButton,
-    base: Dict,
+    base: RefCell<Dict>,
 }
 
 impl DisplayUi {
@@ -1067,27 +1117,32 @@ impl DisplayUi {
             cols: spin(1, 8),
             rows: spin(1, 8),
             gap: spin(0, 200),
-            base: f.base.clone(),
+            base: RefCell::new(f.base.clone()),
         };
-        u.auto.set_active(f.auto);
-        u.width.set_value(f64::from(f.width));
-        u.height.set_value(f64::from(f.height));
-        u.cols.set_value(f64::from(f.cols));
-        u.rows.set_value(f64::from(f.rows));
-        u.gap.set_value(f64::from(f.gap));
         let (w, h) = (u.width.clone(), u.height.clone());
         u.auto.connect_toggled(move |b| {
             w.set_sensitive(!b.is_active());
             h.set_sensitive(!b.is_active());
         });
-        u.width.set_sensitive(!f.auto);
-        u.height.set_sensitive(!f.auto);
+        u.load(f);
         u
+    }
+
+    fn load(&self, f: &DisplayForm) {
+        *self.base.borrow_mut() = f.base.clone();
+        self.auto.set_active(f.auto);
+        self.width.set_value(f64::from(f.width));
+        self.height.set_value(f64::from(f.height));
+        self.cols.set_value(f64::from(f.cols));
+        self.rows.set_value(f64::from(f.rows));
+        self.gap.set_value(f64::from(f.gap));
+        self.width.set_sensitive(!f.auto);
+        self.height.set_sensitive(!f.auto);
     }
 
     fn read(&self) -> DisplayForm {
         DisplayForm {
-            base: self.base.clone(),
+            base: self.base.borrow().clone(),
             auto: self.auto.is_active(),
             width: spin_u32(&self.width),
             height: spin_u32(&self.height),
@@ -1118,6 +1173,10 @@ struct PanelUi {
     user_sel: gtk::Entry,
     pass_sel: gtk::Entry,
     submit_sel: gtk::Entry,
+    detect: gtk::Button,
+    detect_untrusted: gtk::CheckButton,
+    detect_status: gtk::Label,
+    detected_marker: RefCell<Option<String>>,
     engine: gtk::ComboBoxText,
     mode: gtk::ComboBoxText,
     col: gtk::SpinButton,
@@ -1142,6 +1201,10 @@ impl PanelUi {
             user_sel: entry(),
             pass_sel: entry(),
             submit_sel: entry(),
+            detect: gtk::Button::with_label("Detect login form"),
+            detect_untrusted: gtk::CheckButton::with_label("Allow untrusted TLS for discovery"),
+            detect_status: label_row("", "soc-config-sub"),
+            detected_marker: RefCell::new(None),
             engine: combo(&ENGINES),
             mode: combo(&["direct", "tunnel"]),
             col: spin(0, 15),
@@ -1159,6 +1222,9 @@ impl PanelUi {
         g.add("Grid row", &u.row);
         g.add("Mode", &u.mode);
         g.add("URL (direct)", &u.url);
+        g.add("", &u.detect);
+        g.add("", &u.detect_untrusted);
+        g.add("", &u.detect_status);
         g.add("Local port (tunnel)", &u.local_port);
         g.add("Remote host (tunnel)", &u.remote_host);
         g.add("Remote port (tunnel)", &u.remote_port);
@@ -1171,14 +1237,69 @@ impl PanelUi {
         g.add("Login username (optional)", &u.username);
         g.add("Login password (optional)", &u.password);
         let u = Rc::new(u);
-        let ui = Rc::clone(&u);
-        u.mode.connect_changed(move |_| ui.sync_mode());
+        let weak = Rc::downgrade(&u);
+        u.mode.connect_changed(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.sync_mode();
+            }
+        });
+        let weak = Rc::downgrade(&u);
+        u.detect.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.detect_form();
+            }
+        });
         u
+    }
+
+    fn detect_form(self: &Rc<Self>) {
+        let (id, url) = (text_of(&self.id), text_of(&self.url));
+        self.detect.set_sensitive(false);
+        self.detect_status.set_text("Reading the login page…");
+        let allow_untrusted = self.detect_untrusted.is_active();
+        let (tx, rx) = mpsc::channel();
+        let target = url.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(soc_setup::discovery::probe(&target, allow_untrusted)); // audit-allow: harmless if the wizard closed
+        });
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            let Some(ui) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let result = match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(soc_setup::discovery::ProbeError::Failed("The probe stopped".into()))
+                }
+                Ok(result) => result,
+            };
+            ui.sync_mode();
+            if text_of(&ui.id) != id || text_of(&ui.url) != url || combo_index(&ui.mode) == Some(1) {
+                return glib::ControlFlow::Break;
+            }
+            match result {
+                Ok(Some(form)) => {
+                    ui.user_sel.set_text(&form.user);
+                    ui.pass_sel.set_text(&form.password);
+                    ui.submit_sel.set_text(&form.submit);
+                    *ui.detected_marker.borrow_mut() = Some(form.password);
+                    let product = form.product.unwrap_or("login form");
+                    ui.detect_status.set_text(&format!(
+                        "{} {product}. Review the suggested selectors.",
+                        if form.guessed { "Recognized" } else { "Detected" }
+                    ));
+                }
+                Ok(None) => ui.detect_status.set_text("No HTML login form found. Enter its selectors below."),
+                Err(e) => ui.detect_status.set_text(&e.to_string()),
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     fn sync_mode(&self) {
         let tunnel = combo_index(&self.mode) == Some(1);
         self.url.set_sensitive(!tunnel);
+        self.detect.set_sensitive(!tunnel);
+        self.detect_untrusted.set_sensitive(!tunnel);
         for w in [&self.local_port, &self.remote_host, &self.remote_port, &self.path] {
             w.set_sensitive(tunnel);
         }
@@ -1186,6 +1307,8 @@ impl PanelUi {
     }
 
     fn load(&self, p: &PanelForm) {
+        self.detect_status.set_text("");
+        self.detected_marker.borrow_mut().take();
         self.id.set_text(&p.id);
         self.url.set_text(&p.url);
         self.vault_item.set_text(&p.vault_item);
@@ -1215,6 +1338,9 @@ impl PanelUi {
         p.user_sel = text_of(&self.user_sel);
         p.pass_sel = text_of(&self.pass_sel);
         p.submit_sel = text_of(&self.submit_sel);
+        if let Some(marker) = self.detected_marker.borrow().as_ref() {
+            p.base.insert("login_marker".into(), json!(marker));
+        }
         p.engine = combo_value(&self.engine, &ENGINES);
         p.tunnel_mode = combo_index(&self.mode) == Some(1);
         p.col = spin_u32(&self.col);
@@ -1236,6 +1362,8 @@ struct VpnUi {
     port: gtk::Entry,
     vault_item: gtk::Entry,
     trusted_cert: gtk::Entry,
+    config_from_vault: gtk::CheckButton,
+    extra: Vec<(&'static str, gtk::Entry)>,
     grid: gtk::Grid,
 }
 
@@ -1251,6 +1379,8 @@ impl VpnUi {
             port: entry(),
             vault_item: entry(),
             trusted_cert: entry(),
+            config_from_vault: gtk::CheckButton::with_label("Read the VPN configuration from the vault item"),
+            extra: ["config", "realm", "domain", "ready_probe"].into_iter().map(|key| (key, entry())).collect(),
             grid: g.grid.clone(),
         };
         g.add("Name", &u.name);
@@ -1261,6 +1391,15 @@ impl VpnUi {
         g.add("Port", &u.port);
         g.add("Vault item", &u.vault_item);
         g.add("Trusted cert (sha256)", &u.trusted_cert);
+        g.add("", &u.config_from_vault);
+        for ((_, value), name) in u.extra.iter().zip([
+            "Profile file or interface",
+            "FortiGate realm",
+            "iNode domain",
+            "Readiness probe (host:port)",
+        ]) {
+            g.add(name, value);
+        }
         Rc::new(u)
     }
 
@@ -1273,6 +1412,10 @@ impl VpnUi {
         self.port.set_text(&v.port);
         self.vault_item.set_text(&v.vault_item);
         self.trusted_cert.set_text(&v.trusted_cert);
+        self.config_from_vault.set_active(v.base.truthy("config_from_vault"));
+        for (key, entry) in &self.extra {
+            entry.set_text(&v.base.text(key));
+        }
     }
 
     fn store(&self, v: &mut VpnForm) {
@@ -1284,6 +1427,10 @@ impl VpnUi {
         v.port = text_of(&self.port);
         v.vault_item = text_of(&self.vault_item);
         v.trusted_cert = text_of(&self.trusted_cert);
+        v.base.insert("config_from_vault".into(), json!(self.config_from_vault.is_active()));
+        for (key, entry) in &self.extra {
+            set_or_remove(&mut v.base, key, &text_of(entry));
+        }
     }
 }
 
@@ -1363,21 +1510,165 @@ impl VaultUi {
         g.add("Confirm master", &self.confirm);
         g.add("Sealing PIN (optional)", &self.pin);
         g.add("", &self.create_account);
+        self.vault_actions(&g);
         g.add("", &self.reseal);
         g.add("", &self.dry_run);
         g.grid
     }
+
+    fn vault_actions(&self, grid: &FormGrid) {
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let detect = gtk::Button::with_label("Find local Vaultwarden");
+        let verify = gtk::Button::with_label("Test vault login");
+        let reset = gtk::Button::with_label("Reset local account…");
+        let status = label_row("", "soc-config-sub");
+        for b in [&detect, &verify, &reset] {
+            buttons.pack_start(b, false, false, 0);
+        }
+        grid.add("", &buttons);
+        grid.add("", &status);
+        let (url, output) = (self.url.clone(), status.clone());
+        detect.connect_clicked(move |b| {
+            let previous = text_of(&url);
+            let url = url.clone();
+            vault_job(
+                b,
+                &output,
+                move || {
+                    use soc_setup::host::{Probe, SystemProbe};
+                    [previous.as_str(), DEFAULT_VAULT_URL, "http://localhost:8222", "https://127.0.0.1:8222"]
+                        .into_iter()
+                        .find(|value| soc_core::guard::valid_http_url(value, false) && SystemProbe.alive(value))
+                        .map(str::to_string)
+                        .ok_or_else(|| "Vaultwarden did not answer on the configured URL or local defaults.".into())
+                },
+                move |found| {
+                    url.set_text(&found);
+                    format!("Found Vaultwarden at {found}")
+                },
+            );
+        });
+        let (url, email, master, output) = (self.url.clone(), self.email.clone(), self.master.clone(), status.clone());
+        verify.connect_clicked(move |b| {
+            let (url, email, master) = (text_of(&url), text_of(&email), Zeroizing::new(text_of(&master)));
+            if url.is_empty() || email.is_empty() || master.is_empty() {
+                output.set_text("Enter the vault URL, email and master password.");
+                return;
+            }
+            vault_job(
+                b,
+                &output,
+                move || {
+                    soc_vault::Session::login(&url, &email, &master, &soc_vault::SessionOptions::from_env())
+                        .and_then(|s| s.list_logins())
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                },
+                |()| "Vaultwarden login and decryption succeeded.".into(),
+            );
+        });
+        let (email, url) = (self.email.clone(), self.url.clone());
+        reset.connect_clicked(move |b| {
+            let address = text_of(&email);
+            if address.is_empty()
+                || !soc_core::url::Url::split(&text_of(&url)).is_ok_and(|u| {
+                    u.port == Some(8222) && matches!(u.host.as_deref(), Some("localhost" | "127.0.0.1" | "::1"))
+                })
+            {
+                status.set_text("Enter the email and URL for the local Vaultwarden service before resetting.");
+                return;
+            }
+            if !confirm_vault_reset(b, &address) {
+                return;
+            }
+            vault_job(
+                b,
+                &status,
+                move || {
+                    use soc_sys::run::{Runner, SystemRunner, argv};
+                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                    let mut args =
+                        argv(&[&exe.to_string_lossy(), "setup", "vault-reset", "--email", &address, "--yes"]);
+                    if soc_sys::fsutil::euid() != 0 {
+                        args.insert(0, "pkexec".into());
+                    }
+                    let out = SystemRunner.run(&args, Duration::from_secs(180)).map_err(|e| e.to_string())?;
+                    if out.success() { Ok(out.stdout) } else { Err(out.stderr) }
+                },
+                |message| format!("{} Create and seal the replacement account with the new master.", message.trim()),
+            );
+        });
+    }
+}
+
+fn vault_job<T: Send + 'static>(
+    button: &gtk::Button,
+    status: &gtk::Label,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static, // audit-allow: error text is shown directly in the wizard
+    display: impl FnOnce(T) -> String + 'static,
+) {
+    button.set_sensitive(false);
+    status.set_text("Contacting Vaultwarden…");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work()); // audit-allow: the wizard may close while the request completes
+    }); // audit-allow: the wizard may close while the request completes
+    let (button, status) = (button.downgrade(), status.downgrade());
+    let mut display = Some(display);
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let Some((button, status)) = button.upgrade().zip(status.upgrade()) else { return glib::ControlFlow::Break };
+        let text = match rx.try_recv() {
+            Ok(Ok(value)) => display.take().map_or_else(String::new, |show| show(value)),
+            Ok(Err(error)) => error,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => "Vault operation stopped.".into(),
+        };
+        button.set_sensitive(true);
+        status.set_text(&text);
+        glib::ControlFlow::Break
+    });
+}
+
+fn confirm_vault_reset(button: &gtk::Button, address: &str) -> bool {
+    let parent = button.toplevel().and_then(|w| w.downcast::<gtk::Window>().ok());
+    let dialog = gtk::Dialog::with_buttons(
+        Some("Reset local Vaultwarden account"),
+        parent.as_ref(),
+        gtk::DialogFlags::MODAL,
+        &[("Cancel", gtk::ResponseType::Cancel), ("Delete account", gtk::ResponseType::Accept)],
+    );
+    let label = label_row(
+        &format!(
+            "This deletes the account and its credentials after creating a local database backup. Type {address} to continue."
+        ),
+        "soc-config-sub",
+    );
+    let confirmation = entry();
+    dialog.content_area().pack_start(&label, false, false, 8);
+    dialog.content_area().pack_start(&confirmation, false, false, 8);
+    dialog.set_response_sensitive(gtk::ResponseType::Accept, false);
+    let weak = dialog.downgrade();
+    let address = address.to_string();
+    confirmation.connect_changed(move |value| {
+        if let Some(dialog) = weak.upgrade() {
+            dialog.set_response_sensitive(gtk::ResponseType::Accept, value.text() == address.as_str());
+        }
+    });
+    dialog.show_all();
+    let confirmed = dialog.run() == gtk::ResponseType::Accept;
+    dialog.close();
+    confirmed
 }
 
 struct NetUi {
     tunnel_enabled: gtk::CheckButton,
     jump_host: gtk::Entry,
     identity: gtk::Entry,
-    tunnel_base: Dict,
+    tunnel_base: RefCell<Dict>,
     proxy_enabled: gtk::CheckButton,
     proxy_url: gtk::Entry,
     proxy_item: gtk::Entry,
-    proxy_base: Dict,
+    proxy_base: RefCell<Dict>,
 }
 
 impl NetUi {
@@ -1386,24 +1677,30 @@ impl NetUi {
             tunnel_enabled: gtk::CheckButton::with_label("SSH tunnel enabled"),
             jump_host: entry(),
             identity: entry(),
-            tunnel_base: t.base.clone(),
+            tunnel_base: RefCell::new(Dict::new()),
             proxy_enabled: gtk::CheckButton::with_label("Outbound proxy enabled"),
             proxy_url: entry(),
             proxy_item: entry(),
-            proxy_base: p.base.clone(),
+            proxy_base: RefCell::new(Dict::new()),
         };
-        u.tunnel_enabled.set_active(t.enabled);
-        u.jump_host.set_text(&t.jump_host);
-        u.identity.set_text(&t.identity);
-        u.proxy_enabled.set_active(p.enabled);
-        u.proxy_url.set_text(&p.url);
-        u.proxy_item.set_text(&p.vault_item);
+        u.load(t, p);
         u
+    }
+
+    fn load(&self, tunnel: &TunnelForm, proxy: &ProxyForm) {
+        *self.tunnel_base.borrow_mut() = tunnel.base.clone();
+        *self.proxy_base.borrow_mut() = proxy.base.clone();
+        self.tunnel_enabled.set_active(tunnel.enabled);
+        self.jump_host.set_text(&tunnel.jump_host);
+        self.identity.set_text(&tunnel.identity);
+        self.proxy_enabled.set_active(proxy.enabled);
+        self.proxy_url.set_text(&proxy.url);
+        self.proxy_item.set_text(&proxy.vault_item);
     }
 
     fn tunnel(&self) -> TunnelForm {
         TunnelForm {
-            base: self.tunnel_base.clone(),
+            base: self.tunnel_base.borrow().clone(),
             enabled: self.tunnel_enabled.is_active(),
             jump_host: text_of(&self.jump_host),
             identity: text_of(&self.identity),
@@ -1412,7 +1709,7 @@ impl NetUi {
 
     fn proxy(&self) -> ProxyForm {
         ProxyForm {
-            base: self.proxy_base.clone(),
+            base: self.proxy_base.borrow().clone(),
             enabled: self.proxy_enabled.is_active(),
             url: text_of(&self.proxy_url),
             vault_item: text_of(&self.proxy_item),
@@ -1439,9 +1736,10 @@ struct Wizard {
     vault: VaultUi,
     vpns: Rc<Editor<VpnForm>>,
     net: NetUi,
-    security: Option<Value>,
+    security: RefCell<Option<Value>>,
     review: gtk::TextBuffer,
     review_note: gtk::Label,
+    system_config: gtk::CheckButton,
     log: gtk::TextBuffer,
     run_state: gtk::Label,
     pin_box: gtk::Box,
@@ -1450,6 +1748,38 @@ struct Wizard {
 }
 
 impl Wizard {
+    fn apply_preset(&self, name: &str, path: &std::path::Path) {
+        let cfg = match soc_core::load(path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                self.say(&error_text(&e), true);
+                return;
+            }
+        };
+        let confirm = gtk::MessageDialog::new(
+            Some(&self.window),
+            gtk::DialogFlags::MODAL,
+            gtk::MessageType::Question,
+            gtk::ButtonsType::OkCancel,
+            "Replace this draft’s display, panels and network settings with the preset?",
+        );
+        let accepted = confirm.run() == gtk::ResponseType::Ok;
+        confirm.close();
+        if !accepted {
+            return;
+        }
+        let target = self.vault.read().target;
+        let paths = SetupPaths::resolve(target, &self.penv, false);
+        let draft = seed(&cfg, &SocEnv::new(), &paths, &Opts { preset: Some(name.to_string()), ..Opts::default() });
+        self.display.load(&draft.display);
+        self.net.load(&draft.tunnel, &draft.proxy);
+        self.panels.replace(draft.panels);
+        self.vpns.replace(draft.vpns);
+        *self.security.borrow_mut() = draft.security;
+        self.go(0);
+        self.say(&format!("Loaded {name}"), false);
+    }
+
     fn snapshot(&self) -> FormData {
         FormData {
             display: self.display.read(),
@@ -1457,7 +1787,7 @@ impl Wizard {
             vpns: self.vpns.snapshot(),
             tunnel: self.net.tunnel(),
             proxy: self.net.proxy(),
-            security: self.security.clone(),
+            security: self.security.borrow().clone(),
             vault: self.vault.read(),
         }
     }
@@ -1521,14 +1851,18 @@ impl Wizard {
         match assemble(&data) {
             Err(e) => self.say(&error_text(&e), true),
             Ok(cfg) => {
-                let paths = SetupPaths::resolve(data.vault.target, &self.penv, false);
-                let env = build_env(&load_env_file(&paths.soc_env), &paths, &data.vault);
-                let user = kiosk_user(&env, std::env::var("USER").ok().as_deref());
-                self.review.set_text(&review_text(&cfg, &env, &paths, &user, data.vault.dry_run));
-                let note = if cfg.warnings.is_empty() {
+                self.system_config.set_visible(privileged::available(&self.penv, &data.vault).is_some());
+                let paths = SetupPaths::resolve(
+                    data.vault.target,
+                    &self.penv,
+                    self.system_config.is_visible() && self.system_config.is_active(),
+                );
+                let job = RunJob::new(cfg, self.penv.clone(), paths, &data.vault, Creds::new());
+                self.review.set_text(&review_text(&job.cfg, &job.env, &job.paths, &job.user, job.dry_run));
+                let note = if job.cfg.warnings.is_empty() {
                     "Nothing is written until you press Install.".to_string()
                 } else {
-                    format!("Warnings:\n  - {}", cfg.warnings.join("\n  - "))
+                    format!("Warnings:\n  - {}", job.cfg.warnings.join("\n  - "))
                 };
                 self.review_note.set_text(&note);
                 self.say("", false);
@@ -1547,26 +1881,9 @@ impl Wizard {
             }
         };
         let v = &data.vault;
-        let paths = SetupPaths::resolve(v.target, &self.penv, false);
-        let env = build_env(&load_env_file(&paths.soc_env), &paths, v);
-        let job = RunJob {
-            user: kiosk_user(&env, std::env::var("USER").ok().as_deref()),
-            creds: creds_of(&data.panels),
-            stages: stages(v),
-            backend: v.backend.clone(),
-            email: v.email.trim().to_string(),
-            url: env.get("SOC_VAULT_URL").cloned().unwrap_or_else(|| DEFAULT_VAULT_URL.to_string()),
-            source: v.source,
-            master: Some(v.master.clone()).filter(|m| !m.is_empty()),
-            pin: Some(v.pin.trim().to_string()).filter(|p| !p.is_empty()),
-            reseal: v.reseal,
-            dry_run: v.dry_run,
-            target: v.target,
-            penv: self.penv.clone(),
-            paths,
-            env,
-            cfg,
-        };
+        let pkexec = self.system_config.is_active().then(|| privileged::available(&self.penv, v)).flatten();
+        let paths = SetupPaths::resolve(v.target, &self.penv, v.dry_run && pkexec.is_some());
+        let job = RunJob::new(cfg, self.penv.clone(), paths, v, creds_of(&data.panels));
         let dry = job.dry_run;
         // The master now lives only in the job; drop it from the widgets.
         self.vault.clear_secrets();
@@ -1577,7 +1894,33 @@ impl Wizard {
         self.go(4);
         let (tx, rx) = mpsc::channel::<Msg>();
         let spawned = std::thread::Builder::new().name("soc-setupwiz".into()).spawn(move || {
-            let ok = execute(job, &tx);
+            let emit = |msg| {
+                send(&tx, msg);
+            };
+            let ok = match pkexec.filter(|_| !dry) {
+                Some(program) => match privileged::execute(&program, &job, &emit) {
+                    Ok(Some(ok)) => ok,
+                    Ok(None) => {
+                        emit(Msg::Step(StepLine {
+                            title: "System configuration".into(),
+                            ok: true,
+                            detail: "Authorization unavailable. Saving for this login.".into(),
+                            lines: vec![],
+                        }));
+                        execute(job, emit)
+                    }
+                    Err(detail) => {
+                        emit(Msg::Step(StepLine {
+                            title: "System configuration".into(),
+                            ok: false,
+                            detail,
+                            lines: vec![],
+                        }));
+                        false
+                    }
+                },
+                None => execute(job, emit),
+            };
             send(&tx, Msg::Done(ok));
         });
         if let Err(e) = spawned {
@@ -1689,12 +2032,13 @@ fn build_pages(
     [scrolled(&p0).upcast(), scrolled(&p1).upcast(), scrolled(&p2).upcast()]
 }
 
-fn build_wizard(opts: &Opts) -> Rc<Wizard> {
+fn build_wizard(opts: &Opts, preset: Option<Config>) -> Rc<Wizard> {
     let penv = PathEnv::from_process();
     let target = opts.target.unwrap_or_else(|| Target::default_for(soc_sys::fsutil::euid() == 0, &penv));
     let paths = SetupPaths::resolve(target, &penv, false);
-    let env = load_env_file(&paths.soc_env);
-    let cfg = previous_config(&paths.panels_installed);
+    let env = load_env_file(&penv.resolve_env().unwrap_or_else(|| paths.soc_env.clone()));
+    let cfg = preset
+        .unwrap_or_else(|| previous_config(&penv.resolve_panels().unwrap_or_else(|| paths.panels_installed.clone())));
     let data = seed(&cfg, &env, &paths, opts);
 
     let display = DisplayUi::new(&data.display);
@@ -1726,8 +2070,11 @@ fn build_wizard(opts: &Opts) -> Rc<Wizard> {
     let p3 =
         page_shell("Review", "These are exactly the files the backend will render. Check them, then press Install.");
     let review_note = label_row("", "soc-config-sub");
+    let system_config = gtk::CheckButton::with_label("Save as system configuration (administrator authorization)");
+    system_config.set_no_show_all(true);
     let (review, review_scroll) = log_view();
     p3.pack_start(&review_note, false, false, 0);
+    p3.pack_start(&system_config, false, false, 0);
     p3.pack_start(&review_scroll, true, true, 0);
 
     // Run page.
@@ -1780,6 +2127,22 @@ fn build_wizard(opts: &Opts) -> Rc<Wizard> {
     nav.pack_end(&back, false, false, 0);
     nav.pack_start(&cancel, false, false, 0);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let tools = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    tools.set_margin_start(24);
+    tools.set_margin_end(24);
+    let templates = presets(&penv.repo_root());
+    let choices = gtk::ComboBoxText::new();
+    for name in templates.keys() {
+        choices.append(Some(name), name);
+    }
+    choices.set_active(Some(0));
+    let load = gtk::Button::with_label("Load preset");
+    load.set_sensitive(!templates.is_empty());
+    let appearance = gtk::Button::with_label("Appearance");
+    tools.pack_start(&choices, false, false, 0);
+    tools.pack_start(&load, false, false, 0);
+    tools.pack_end(&appearance, false, false, 0);
+    root.pack_start(&tools, false, false, 0);
     root.pack_start(&stack, true, true, 0);
     root.pack_start(&status, false, false, 0);
     root.pack_start(&nav, false, false, 0);
@@ -1800,19 +2163,46 @@ fn build_wizard(opts: &Opts) -> Rc<Wizard> {
         vault,
         vpns,
         net,
-        security: data.security.clone(),
+        security: RefCell::new(data.security),
         review,
         review_note,
+        system_config,
         log,
         run_state,
         pin_box,
         pin_label,
         pin_ack,
     });
+    let weak = Rc::downgrade(&wiz);
+    load.connect_clicked(move |_| {
+        if let Some((wizard, name)) = weak.upgrade().zip(choices.active_id()) {
+            if !wizard.running.get() && !wizard.pin_box.is_visible() {
+                if let Some(path) = templates.get(name.as_str()) {
+                    wizard.apply_preset(name.as_str(), path);
+                }
+            }
+        }
+    });
+    let weak = Rc::downgrade(&wiz);
+    appearance.connect_clicked(move |_| {
+        let result = std::env::current_exe()
+            .and_then(|exe| std::process::Command::new(exe).arg("appearance").env_remove("SOC_RETURN_TO_MENU").spawn());
+        if let Err(e) = result {
+            if let Some(wizard) = weak.upgrade() {
+                wizard.say(&format!("Could not open Appearance: {e}"), true);
+            }
+        }
+    });
     let w = Rc::clone(&wiz);
     wiz.next.connect_clicked(move |_| w.on_next());
     let w = Rc::clone(&wiz);
     wiz.back.connect_clicked(move |_| w.on_back());
+    let weak = Rc::downgrade(&wiz);
+    wiz.system_config.connect_toggled(move |_| {
+        if let Some(wizard) = weak.upgrade().filter(|w| w.page.get() == 3) {
+            wizard.show_review();
+        }
+    });
     let w = Rc::clone(&wiz);
     wiz.cancel.connect_clicked(move |_| w.window.close());
     let w = Rc::clone(&wiz);
@@ -1821,8 +2211,53 @@ fn build_wizard(opts: &Opts) -> Rc<Wizard> {
     wiz
 }
 
+fn presets(root: &std::path::Path) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    std::fs::read_dir(root.join("config/presets"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension()? != "yaml" || !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            Some((path.file_stem()?.to_str()?.to_string(), path))
+        })
+        .collect()
+}
+
+fn write_preset(cfg: &Config, output: &std::path::Path, penv: &PathEnv, dry: bool) -> std::io::Result<()> {
+    let output = std::path::absolute(output)?;
+    let paths = SetupPaths::resolve(Target::Dev, penv, false);
+    let env: SocEnv = [
+        ("SOC_VAULT_BACKEND", "dev".to_string()),
+        ("SOC_MASTER_SOURCE", "auto".to_string()),
+        ("SOC_ROOT", paths.soc_root.display().to_string()),
+        ("SOC_PANELS_FILE", output.join("panels.yaml").display().to_string()),
+        ("SOC_SECRET_DIR", paths.secret_dir.display().to_string()),
+        ("SOC_INJECT_TMPL", paths.inject_tmpl.display().to_string()),
+        ("SOC_CONFIG_VAULT_ITEM", paths.config_vault_item),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect();
+    let panels = render_panels_yaml(cfg);
+    let env = render_soc_env(&env);
+    if dry {
+        println!("{panels}\n{env}");
+    } else {
+        std::fs::create_dir_all(&output)?;
+        soc_sys::fsutil::write_atomic(&output.join("panels.yaml"), panels.as_bytes(), 0o644)?;
+        soc_sys::fsutil::write_atomic(&output.join("soc.env"), env.as_bytes(), 0o600)?;
+    }
+    Ok(())
+}
+
 /// Run the wizard. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
+    if matches!(args, [arg] if arg == "--apply-system") {
+        return privileged::apply();
+    }
     let opts = match parse_args(args) {
         Ok(Some(o)) => o,
         Ok(None) => {
@@ -1834,11 +2269,50 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let penv = PathEnv::from_process();
+    let presets = presets(&penv.repo_root());
+    if opts.list_presets {
+        for (name, path) in presets {
+            let text = soc_sys::fsutil::read_capped(&path, 4 << 20).unwrap_or_else(|_| String::new());
+            let header = |prefix: &str| {
+                text.lines().take_while(|l| l.starts_with('#')).find_map(|l| l.strip_prefix(prefix)).map(str::trim)
+            };
+            println!("{name}\t{}\t{}", header("# name:").unwrap_or(&name), header("# desc:").unwrap_or(""));
+        }
+        return 0;
+    }
+    let preset = match &opts.preset {
+        Some(name) => match presets.get(name).map(|path| soc_core::load(path)) {
+            Some(Ok(cfg)) => Some(cfg),
+            Some(Err(e)) => {
+                eprintln!("setup-gui: {e}");
+                return 2;
+            }
+            None => {
+                eprintln!("setup-gui: unknown preset {name:?}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    if let (Some(output), Some(cfg)) = (opts.output.as_ref(), preset.as_ref()) {
+        return match write_preset(cfg, output, &penv, opts.dry_run) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("setup-gui: could not write {}: {e}", output.display());
+                1
+            }
+        };
+    }
+    if opts.output.is_some() || opts.non_interactive {
+        eprintln!("setup-gui: headless rendering needs --preset NAME and --output DIR");
+        return 2;
+    }
     if !style::init() {
         eprintln!("[soc-wall] the setup wizard needs a display (GTK could not start); use `soc-wall setup` instead");
         return 1;
     }
-    let wiz = build_wizard(&opts);
+    let wiz = build_wizard(&opts, preset);
     wiz.window.show_all();
     wiz.pin_box.hide();
     wiz.go(0);
@@ -1880,7 +2354,10 @@ mod tests {
     #[test]
     fn args_parse() {
         let a = |v: &[&str]| parse_args(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
-        assert_eq!(a(&["--dry-run", "--target", "dev"]), Ok(Some(Opts { dry_run: true, target: Some(Target::Dev) })));
+        assert_eq!(
+            a(&["--dry-run", "--target", "dev"]),
+            Ok(Some(Opts { dry_run: true, target: Some(Target::Dev), ..Opts::default() }))
+        );
         assert_eq!(a(&["--help"]), Ok(None));
         assert!(a(&["--target", "mars"]).is_err());
         assert!(a(&["--nope"]).is_err());

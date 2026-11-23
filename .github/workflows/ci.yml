@@ -1,14 +1,11 @@
 # SOC video-wall kiosk (p2soc) — continuous integration.
-# Pure-Python + shell payload with system-package deps (PyGObject/WebKitGTK,
-# autossh, openfortivpn, ...) — NOTHING is compiled. CI just lints, runs the
-# unit tests, enforces the aarch64 "no-compile-on-Pi" gate, and scans for
-# accidentally-committed secrets. Runs on stock ubuntu-latest (amd64); the
-# interpreted payload needs no cross-compilation.
+# Verify the native runtime and compatibility implementation before promoting
+# a commit to the stable appliance update channel.
 name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'rust-v*']
   pull_request:
     branches: [main]
 
@@ -23,7 +20,7 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # lint — bash -n + py_compile (via `make lint`, which also runs the arm gate).
+  # lint — bash -n + py_compile.
   # ---------------------------------------------------------------------------
   lint:
     runs-on: ubuntu-latest
@@ -42,7 +39,7 @@ jobs:
       # future change makes lint import them — kept commented to stay light.
       #   sudo apt-get update
       #   sudo apt-get install -y python3-gi gir1.2-webkit2-4.1
-      - name: Lint (shell + python syntax) and arm gate
+      - name: Lint shell and Python
         env:
           # make lint -> .venv builds a system-site-packages venv; on the CI
           # runner there is no system PyGObject, but lint never imports it.
@@ -79,21 +76,27 @@ jobs:
           xvfb-run -a python3 -m pytest tests/ -q
 
   # ---------------------------------------------------------------------------
-  # arm-gate — assert no compile-on-Pi / wrong-arch regression. Skips cleanly
-  # if dev/verify-arm.sh is ever removed.
+  # Verify the native runtime on the two primary architectures.
   # ---------------------------------------------------------------------------
-  arm-gate:
-    runs-on: ubuntu-latest
+  native:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
-
-      - name: aarch64 no-compile-on-Pi gate
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install native GUI dependencies
         run: |
-          if [ -f dev/verify-arm.sh ]; then
-            bash dev/verify-arm.sh
-          else
-            echo "dev/verify-arm.sh absent — skipping arm gate."
-          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+      - name: Test native runtime
+        working-directory: rust
+        run: xvfb-run -a cargo test --workspace --locked
 
   # ---------------------------------------------------------------------------
   # secrets — fail the build if a real secret (.env/vaultwarden.env or a private
@@ -172,7 +175,7 @@ jobs:
   # ---------------------------------------------------------------------------
   promote:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [lint, test, secrets]
+    needs: [lint, test, native, secrets]
     runs-on: ubuntu-latest
     permissions:
       contents: write

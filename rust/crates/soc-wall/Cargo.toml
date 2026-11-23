@@ -19,23 +19,24 @@ path = "src/main.rs"
 default = ["gui"]
 # The GTK/WebKit wall itself. Without it the binary still provides every
 # headless tool (config check, VPN supervisor, vault client, tunnel args...).
-gui = ["dep:gtk", "dep:gdk", "dep:glib", "dep:gio", "dep:webkit2gtk", "dep:javascriptcore"]
+gui = ["dep:soc-gui", "dep:soc-web", "dep:gtk", "dep:gdk", "dep:glib", "dep:gio", "dep:webkit2gtk", "dep:javascriptcore"]
 
 [dependencies]
 soc-brand.workspace = true
 soc-core.workspace = true
 soc-seal.workspace = true
-soc-gui.workspace = true
+soc-gui = { workspace = true, optional = true }
 soc-inode.workspace = true
 soc-setup.workspace = true
 soc-state.workspace = true
 soc-sys.workspace = true
 soc-vpn.workspace = true
 soc-vault.workspace = true
-soc-web.workspace = true
+soc-web = { workspace = true, optional = true }
 serde_json.workspace = true
 zeroize.workspace = true
 libc.workspace = true
+signal-hook = { version = "0.3", default-features = false }
 gtk = { version = "0.18", optional = true }
 gdk = { version = "0.18", optional = true }
 glib = { version = "0.18", optional = true }

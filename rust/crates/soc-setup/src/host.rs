@@ -243,6 +243,58 @@ impl RealVault {
     fn opts(&self) -> SessionOptions {
         self.opts.clone().unwrap_or_else(SessionOptions::from_env)
     }
+
+    fn register(
+        &self,
+        url: &str,
+        email: &str,
+        master: &str,
+    ) -> std::result::Result<soc_vault::register::Registered, soc_vault::VaultError> {
+        soc_vault::register::ensure_account(url, email, master, soc_vault::register::DEFAULT_ACCOUNT_NAME, &self.opts())
+    }
+
+    fn local_registration(&self, url: &str, email: &str, master: &str) -> TextResult<soc_vault::register::Registered> {
+        let runtime = Path::new("/run/systemd/system");
+        let _lock = fsutil::exclusive_lock(&runtime.join("soc-vault-signups.lock")).map_err(|e| e.to_string())?; // audit-allow: hold the lock for this scope
+        let dir = runtime.join("vaultwarden.service.d");
+        fsutil::ensure_dir(&dir, 0o755).map_err(|e| e.to_string())?;
+        let drop_in = dir.join("soc-signups.conf");
+        fsutil::write_atomic(
+            &drop_in,
+            b"[Service]\nEnvironment=SIGNUPS_ALLOWED=true\nEnvironment=SOC_VW_SIGNUPS=true\n",
+            0o644,
+        )
+        .map_err(|e| e.to_string())?;
+        let restart = || -> TextResult<()> {
+            use soc_sys::run::argv;
+            for args in [&["systemctl", "daemon-reload"][..], &["systemctl", "restart", "vaultwarden.service"][..]] {
+                let out = SystemRunner.run(&argv(args), Duration::from_secs(60)).map_err(|e| e.to_string())?;
+                if !out.success() {
+                    return Err(format!("{} failed: {}", args.join(" "), out.stderr.trim()));
+                }
+            }
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(20) {
+                if SystemProbe.alive(url) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Err("Vaultwarden did not answer after restart".into())
+        };
+        let result = restart().and_then(|()| {
+            self.register(url, email, master).map_err(|e| {
+                if matches!(e, soc_vault::VaultError::SignupsDisabled(_)) {
+                    format!("registration was refused for {email}; verify the existing account and master password")
+                } else {
+                    e.to_string()
+                }
+            })
+        });
+        std::fs::remove_file(&drop_in).map_err(|e| format!("could not close local Vaultwarden signups: {e}"))?;
+        restart().map_err(|e| format!("could not restore Vaultwarden after temporary registration: {e}"))?;
+        result
+    }
 }
 
 struct SessionWriter(Session);
@@ -275,19 +327,28 @@ impl VaultConnect for RealVault {
     }
 
     fn ensure_account(&self, url: &str, email: &str, master: &str) -> TextResult<Account> {
-        match soc_vault::register::ensure_account(
-            url,
-            email,
-            master,
-            soc_vault::register::DEFAULT_ACCOUNT_NAME,
-            &self.opts(),
-        )
-        .map_err(|e| e.to_string())?
-        {
+        let registered = match self.register(url, email, master) {
+            Err(soc_vault::VaultError::SignupsDisabled(_))
+                if is_local_vault(url) && SystemProbe.is_root() && SystemProbe.systemd_running() =>
+            {
+                self.local_registration(url, email, master)?
+            }
+            other => other.map_err(|e| e.to_string())?,
+        };
+        match registered {
             soc_vault::register::Registered::Created => Ok(Account::Created),
             soc_vault::register::Registered::Exists => Ok(Account::Exists),
         }
     }
+}
+
+/// Does this URL point at the Vaultwarden listener installed by p2soc?
+pub fn is_local_vault(url: &str) -> bool {
+    soc_core::url::Url::split(url).is_ok_and(|u| {
+        u.userinfo.is_none()
+            && u.port == Some(8222)
+            && matches!(u.host.as_deref(), Some("127.0.0.1" | "::1" | "localhost"))
+    })
 }
 
 /// Everything a step may touch, borrowed.

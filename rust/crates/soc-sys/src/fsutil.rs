@@ -14,6 +14,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Take an exclusive advisory lock without following an existing link or FIFO.
+/// Keep the returned file open for the whole operation.
+pub fn exclusive_lock(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "lock must be a regular file"));
+    }
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    Ok(file)
+}
+
 /// A fully written, fsynced temp file waiting to be renamed over its target.
 /// Dropping it without [`Staged::commit`] removes the temp file, so a failure
 /// part-way through a multi-file update leaves the previous files intact.

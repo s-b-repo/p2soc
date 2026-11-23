@@ -1,5 +1,7 @@
 # Production-Readiness Goal — p2soc SOC Video Wall
 
+> This checklist records the original Python production-readiness review. For the Rust release, use [Deploy](DEPLOY.md) for bring-up and [Performance](PERFORMANCE.md) for measured results and remaining device tests.
+
 **Owner:** Claude (working goal) · **Status:** in progress · **Created:** 2026-06-23
 
 > **Status correction (2026-11).** An earlier version of this page marked SEC-1...SEC-4

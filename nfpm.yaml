@@ -2,16 +2,15 @@
 # nfpm v2 packaging config for p2soc — the SOC video-wall kiosk.
 #
 # One YAML builds deb + rpm + apk via nfpm (https://nfpm.goreleaser.com).
-# The payload is pure Python + shell (interpreted) — nothing is compiled — so
-# the *arch* is parameterized and CI loops it; there is no cross-compile step.
+# CI supplies the native executable built for the package architecture and libc.
 #
 #   PKG_ARCH      target arch in nfpm/Go form (amd64, arm64, ...). CI sets this.
 #   PKG_VERSION   release version WITHOUT a leading 'v' (e.g. 1.4.0). From the tag.
+#   ./native/soc-wall   staged executable for this architecture and libc.
 #
 # Build (per arch, per packager):
+#   install -D -m 0755 rust/target/release/soc-wall native/soc-wall
 #   PKG_ARCH=arm64 PKG_VERSION=1.4.0 nfpm package -f nfpm.yaml -p deb -t dist/
-#   PKG_ARCH=arm64 PKG_VERSION=1.4.0 nfpm package -f nfpm.yaml -p rpm -t dist/
-#   PKG_ARCH=arm64 PKG_VERSION=1.4.0 nfpm package -f nfpm.yaml -p apk -t dist/
 #
 # Package layout (PROD files ONLY — dev/, tests/, .github/, .claude/, .venv/,
 # secrets are excluded; see the `contents` globs + `overrides.*` below):
@@ -39,7 +38,7 @@ description: |
   SOC video-wall kiosk for the Raspberry Pi 5.
   Boots into a 2x2 grid of browser panels (Wazuh, Zabbix, ...), auto-logs in
   from a local Vaultwarden, self-heals crashed panels and reconnects VPN/tunnels.
-  Pure Python + shell on PyGObject/WebKitGTK; secrets stay in Vaultwarden and the
+  Native Rust with GTK and WebKitGTK; secrets stay in Vaultwarden and the
   master password is sealed host-bound (never in .env).
 
 # --------------------------------------------------------------------------- #
@@ -51,6 +50,12 @@ description: |
 # enter the package even though the repo keeps them for CI.
 # --------------------------------------------------------------------------- #
 contents:
+  - src: ./native/soc-wall
+    dst: /opt/soc-display/bin/soc-wall
+    file_info: { mode: 0755 }
+  - src: soc-wall
+    dst: /opt/soc-display/bin/soc-vpn-pinentry
+    type: symlink
   # ---- prod tree -> /opt/soc-display (manifest.package_includes) ----
   - src: ./install.sh
     dst: /opt/soc-display/install.sh
@@ -71,6 +76,8 @@ contents:
     dst: /opt/soc-display/Makefile
   - src: ./README.md
     dst: /opt/soc-display/README.md
+  - src: ./VERSION
+    dst: /opt/soc-display/VERSION
   - src: ./CHANGELOG.md
     dst: /opt/soc-display/CHANGELOG.md
   - src: ./LICENSE
@@ -163,20 +170,13 @@ scripts:
 
 # --------------------------------------------------------------------------- #
 # Per-packager Depends (manifest.depends). nfpm core `depends` is left empty so
-# each packager gets exactly its own native package names + version syntax
-# (deb supports the "a | b" alternative for the webkit2 4.1/4.0 split).
+# each packager gets its own native package names and version syntax.
 # --------------------------------------------------------------------------- #
 overrides:
   deb:
     depends:
-      - python3
-      - python3-venv
-      - python3-gi
-      - gir1.2-gtk-3.0
-      - gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0
-      - python3-cryptography
-      - python3-yaml
-      - python3-websocket
+      - libgtk-3-0
+      - libwebkit2gtk-4.1-0
       - autossh
       # VPN clients — one per vpn.type (fortinet/openvpn/wireguard); ppp is the
       # PPP backend openfortivpn drives. tesseract-ocr solves the iNode SSL-VPN
@@ -197,13 +197,8 @@ overrides:
       - ca-certificates
   rpm:
     depends:
-      - python3
-      - python3-gobject
       - gtk3
       - webkit2gtk4.1
-      - python3-cryptography
-      - python3-pyyaml
-      - python3-websocket-client
       - autossh
       # VPN clients — one per vpn.type (fortinet/openvpn/wireguard); ppp is the
       # PPP backend openfortivpn drives. tesseract solves the iNode SSL-VPN
@@ -223,13 +218,8 @@ overrides:
       - ca-certificates
   apk:
     depends:
-      - python3
-      - py3-gobject3
       - gtk+3.0
       - webkit2gtk-4.1
-      - py3-cryptography
-      - py3-yaml
-      - py3-websocket-client
       - autossh
       # VPN clients — one per vpn.type (fortinet/openvpn/wireguard); ppp is the
       # PPP backend openfortivpn drives. tesseract-ocr solves the iNode SSL-VPN
@@ -247,3 +237,4 @@ overrides:
       - pinentry
       - curl
       - ca-certificates
+      - bash

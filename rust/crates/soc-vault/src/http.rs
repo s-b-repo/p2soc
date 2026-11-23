@@ -117,7 +117,7 @@ fn is_loopback(host: &str) -> bool {
 /// bundled root set — a private CA installed on the box is honoured exactly as
 /// the Python client honoured it.
 #[cfg(feature = "tls")]
-mod tls {
+pub(crate) mod tls {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -157,7 +157,7 @@ mod tls {
         ))
     }
 
-    pub(super) fn config(ca_file: Option<&Path>) -> Result<TlsConfig, VaultError> {
+    pub(crate) fn config(ca_file: Option<&Path>) -> Result<TlsConfig, VaultError> {
         Ok(TlsConfig::builder()
             .root_certs(RootCerts::Specific(Arc::new(load_roots(ca_file)?)))
             .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))

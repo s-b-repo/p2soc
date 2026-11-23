@@ -16,8 +16,9 @@ soc-seal.workspace = true
 soc-vault.workspace = true
 soc-state.workspace = true
 soc-setup.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-zeroize.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
 gtk = { version = "0.18" }
 gdk = { version = "0.18" }
 glib = { version = "0.18" }

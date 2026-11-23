@@ -27,6 +27,18 @@ pub fn resolver() -> SetupResult<MasterResolver> {
     MasterResolver::from_env().map_err(|e| e.to_string())
 }
 
+pub fn env_settings() -> VaultEnv {
+    let mut env = VaultEnv::from_process();
+    if env.backend.as_deref() == Some("rbw") && env.pinentry.is_none() {
+        let root = soc_sys::paths::PathEnv::from_process().repo_root();
+        let helper = root.join("scripts/pinentry-vault.sh");
+        if helper.is_file() {
+            env.pinentry = Some(helper.display().to_string());
+        }
+    }
+    env
+}
+
 /// Build a vault whose master comes from the sealed store. Does not open it.
 pub fn build_vault(env: &VaultEnv) -> SetupResult<(Arc<Vault>, MasterResolver)> {
     let resolver = resolver()?;

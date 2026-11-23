@@ -20,7 +20,7 @@
 //! screen uses another value so the updater can tell "alive but not showing
 //! panels" apart.
 
-use crate::fsutil::{self, access_writable, read_capped};
+use crate::fsutil::{self, access_writable};
 use crate::manifest::read_commit_marker;
 use serde_json::{Value, json};
 use soc_core::Dict;
@@ -157,8 +157,13 @@ pub fn write(dest: &Path, beat: &Beat) -> bool {
 
 /// The last heartbeat, or `None` if there is none or it is unreadable.
 pub fn read(src: &Path) -> Option<Dict> {
-    let text = read_capped(src, 64 * 1024).ok()?;
-    serde_json::from_str::<Value>(&text).ok()?.as_object().cloned()
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fsutil::open_regular(src).ok()?.take(4097).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&bytes).ok()?.as_object().cloned()
 }
 
 /// Seconds since a heartbeat was written; infinity when there is none or it

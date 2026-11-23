@@ -1,5 +1,5 @@
 # SOC video-wall kiosk — maintenance entrypoints.
-# Install on the Pi:                 sudo python3 setup.py   (or: make install)
+# Install on the Pi:                 make install
 # Run / configure / repair the wall: ./launch.sh
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
@@ -20,7 +20,11 @@ help:  ## show this help
 venv: .venv  ## alias for creating the venv
 
 .PHONY: test
-test: .venv  ## run unit tests (no display needed)
+test:  ## run Rust tests, including WebKit and Settings under Xvfb
+	cd rust && xvfb-run -a cargo test --workspace --locked
+
+.PHONY: test-python
+test-python: .venv  ## run the Python compatibility tests
 	cd kiosk-host && ../$(PY) -m pytest tests/ -q
 
 .PHONY: lint
@@ -32,8 +36,12 @@ lint: .venv  ## syntax-check shell + python
 	@$(PY) -m py_compile setup.py provision.py kiosk-host/host/*.py scripts/*.py && echo "python: ok"
 
 .PHONY: install
-install:  ## install on the Pi (run as root)
+install: rust-release  ## build and install the wall on the Pi
 	sudo bash install.sh
+
+.PHONY: rust-release
+rust-release:  ## build the native wall and tools
+	cd rust && cargo build --release --locked --bin soc-wall
 
 .PHONY: secrets-scan
 secrets-scan:  ## run .githooks/pre-commit against the staged set
@@ -48,8 +56,7 @@ refresh-manifest:  ## re-hash /opt/soc-display so the boot drift warning clears
 	  if [ -n "$$sha" ]; then \
 	    printf '%s\n' "$$sha" | sudo tee /opt/soc-display/.commit >/dev/null; \
 	  fi
-	@PYTHONPATH=/opt/soc-display/kiosk-host sudo \
-	    /opt/soc-display/.venv/bin/python -m host.manifest 2>&1
+	@sudo /opt/soc-display/bin/soc-wall manifest
 
 .PHONY: uninstall
 uninstall:  ## uninstall from the Pi (root; keeps operator data unless ARGS=--purge)

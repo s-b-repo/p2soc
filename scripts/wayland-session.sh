@@ -18,24 +18,38 @@ else
   ROOT="${SOC_ROOT:-/opt/soc-display}"
 fi
 [ -d "$ROOT/kiosk-host" ] || { echo "wayland-session.sh: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
+. "$ROOT/scripts/soc-native.sh"
+NATIVE="$(soc_native_path "$ROOT" || true)"
 ENV_FILE="${SOC_ENV_FILE:-/etc/soc-display/soc.env}"
-if [ -f "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
+if [ "${SOC_ENV_LOADED:-0}" != 1 ]; then
+  if [ -n "$NATIVE" ]; then
+    export SOC_ROOT="$ROOT"
+    exec "$NATIVE" with-env --script wayland-session.sh "$@"
+  elif [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  fi
 fi
 export SOC_PANELS_FILE="${SOC_PANELS_FILE:-/etc/soc-display/panels.yaml}"
 
-PYBIN="$ROOT/.venv/bin/python"
-[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+if [ -n "$NATIVE" ]; then
+  SESSION_INFO=("$NATIVE" session-info)
+  WM_RULES=("$NATIVE" wm-rc labwc)
+else
+  PYBIN="$ROOT/.venv/bin/python"
+  [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+  SESSION_INFO=("$PYBIN" "$ROOT/scripts/session-info.py")
+  WM_RULES=("$PYBIN" "$ROOT/scripts/gen-labwc-rc.py")
+fi
 LAUNCHER="$ROOT/scripts/launcher.sh"
 
 log(){ echo "[wayland-session] $*" >&2; }
 
 # What does the wall need? (layout=..., all_webkit=...)
 layout=windows; all_webkit=0
-eval "$("$PYBIN" "$ROOT/scripts/session-info.py" 2>/dev/null)" || true
+eval "$("${SESSION_INFO[@]}" 2>/dev/null)" || true
 
 start_cage(){
   # host draws the whole grid in one fullscreen window — no WM needed
@@ -47,7 +61,7 @@ start_cage(){
 start_labwc(){
   CFGDIR="${XDG_CONFIG_HOME:-$HOME/.config}/labwc"
   mkdir -p "$CFGDIR"
-  if ! "$PYBIN" "$ROOT/scripts/gen-labwc-rc.py" --panels "$SOC_PANELS_FILE" \
+  if ! "${WM_RULES[@]}" --panels "$SOC_PANELS_FILE" \
        --template "$ROOT/labwc/rc.xml.tmpl" --out "$CFGDIR/rc.xml"; then
     log "WARNING could not generate labwc rc.xml — windows will not be tiled"
   fi

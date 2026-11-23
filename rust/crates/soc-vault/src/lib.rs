@@ -24,6 +24,8 @@ pub mod cli;
 pub mod config;
 pub mod crypto;
 mod error;
+#[cfg(all(feature = "tls", feature = "backup"))]
+pub mod fetch;
 mod fsutil;
 mod http;
 pub mod master;

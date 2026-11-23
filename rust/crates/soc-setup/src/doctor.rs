@@ -251,18 +251,23 @@ pub fn check_config(i: &DoctorInputs, probe: &dyn Probe) -> Vec<CheckResult> {
         let kind = vpn_kind(vpn);
         let nm = Some(vpn.text("name")).filter(|n| !n.is_empty()).unwrap_or_else(|| "vpn".to_string());
         if kind == VpnKind::Inode {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
-            let script = inode_script(vpn, &i.paths.soc_root, home.as_deref());
-            let label = format!("iNode client (svpn-connect.sh) [{nm}]");
-            out.push(if probe.is_exec_file(&script) {
-                CheckResult::ok(label, script.display().to_string())
+            let binary = i.paths.soc_root.join("bin/soc-wall");
+            if probe.is_exec_file(&binary) && !i.soc_env.get("SOC_INODE_NATIVE").is_some_and(|v| v == "0") {
+                out.push(CheckResult::ok(format!("iNode client [{nm}]"), "native iNode client"));
             } else {
-                CheckResult::fail(
-                    label,
-                    format!("missing/not executable: {}", script.display()),
-                    "ship vendor/iNode-VPN-Client or set vpn.config",
-                )
-            });
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                let script = inode_script(vpn, &i.paths.soc_root, home.as_deref());
+                let label = format!("iNode client (svpn-connect.sh) [{nm}]");
+                out.push(if probe.is_exec_file(&script) {
+                    CheckResult::ok(label, script.display().to_string())
+                } else {
+                    CheckResult::fail(
+                        label,
+                        format!("missing/not executable: {}", script.display()),
+                        "install soc-wall or set vpn.config to an executable client",
+                    )
+                });
+            }
             let label = format!("tesseract (iNode login CAPTCHA) [{nm}]");
             out.push(if probe.have("tesseract") {
                 CheckResult::ok(label, "on PATH")

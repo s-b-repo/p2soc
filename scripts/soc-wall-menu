@@ -13,6 +13,11 @@ ROOT="${SOC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$SELF")/.." 2>/dev/null && pwd)
 [ -d "$ROOT/kiosk-host" ] || { echo "SOC Wall: cannot find installation root (no kiosk-host/). Set SOC_ROOT=/path/to/repo" >&2; exit 1; }
 
 export SOC_ROOT="$ROOT"
+. "$ROOT/scripts/soc-native.sh"
+if NATIVE="$(soc_native_path "$ROOT")"; then
+  export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+  exec "$NATIVE" menu "$@"
+fi
 export PYTHONPATH="$ROOT/kiosk-host${PYTHONPATH:+:$PYTHONPATH}"
 
 # Cap GLib/GTK per-thread malloc arenas (default 8*ncpu) — the single biggest RSS
