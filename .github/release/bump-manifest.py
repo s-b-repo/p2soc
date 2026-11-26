@@ -77,8 +77,8 @@ if p.is_file():
         if isinstance(data, dict) and data.get("version") != version:
             data["version"] = version
             write(p, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    except json.JSONDecodeError:
-        pass
+    except json.JSONDecodeError as exc:
+        print(f"warning: skipping package.json due to invalid JSON: {exc}", file=sys.stderr)
 
 # --- pyproject.toml -------------------------------------------------------
 p = Path("pyproject.toml")
