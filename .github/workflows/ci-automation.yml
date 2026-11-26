@@ -1,0 +1,31 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-venv python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+      - name: Install Python dependencies and tools
+        run: |
+          PATH="/usr/bin:$PATH" make venv
+          .venv/bin/python -m pip install ruff pip-audit
+      - name: Ruff lint (report-only)
+        run: .venv/bin/ruff check .
+        continue-on-error: true
+      - name: Tests
+        run: make test
+      - name: pip-audit (security, report-only)
+        run: .venv/bin/pip-audit
+        continue-on-error: true
